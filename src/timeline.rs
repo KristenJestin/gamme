@@ -115,11 +115,11 @@ impl Timeline {
                     TrackEventKind::Meta(MetaMessage::Tempo(micros)) => {
                         tempi.push((tick, micros.as_int().max(1)));
                     }
-                    TrackEventKind::Meta(MetaMessage::TimeSignature(num, power, _, _)) => {
-                        // A power above 15 would overflow, and no music needs it.
-                        if num > 0 && power <= 15 {
-                            signatures.push((tick, u32::from(num), 1 << power));
-                        }
+                    // A power above 15 would overflow, and no music needs it.
+                    TrackEventKind::Meta(MetaMessage::TimeSignature(num, power, _, _))
+                        if num > 0 && power <= 15 =>
+                    {
+                        signatures.push((tick, u32::from(num), 1 << power));
                     }
                     TrackEventKind::Midi {
                         channel,
