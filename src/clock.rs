@@ -12,6 +12,12 @@
 //! The position and a counter of seeks live in one atomic. The audio side reads both, renders,
 //! then advances only if no seek came between: a seek is never overwritten by a buffer that was
 //! computed before it, and the counter tells the audio side to cut the notes that were sounding.
+//!
+//! Until the audio side runs, the window moves the clock by the wall clock (`wall_clock.rs`).
+//! The hand-over is exclusive: the audio side claims the clock (`claim`) before each buffer, a
+//! bit of the same atomic, and the wall clock's `advance_unclaimed` fails once it is set. The
+//! one atomic decides between the two, so they never both move the clock. Any output that
+//! advances the clock claims it so (a MIDI-out piano too); a new output being made releases it.
 
 use std::sync::Arc;
 use std::sync::atomic::{
@@ -22,9 +28,16 @@ use std::time::Instant;
 
 use crate::timeline::Timeline;
 
-/// The position takes 40 bits, in microseconds (12 days); the counter of seeks the 24 above.
+/// The position takes 40 bits, in microseconds (12 days); the counter of seeks the 23 above;
+/// the top bit says the audio side drives the clock.
 const POSITION_BITS: u32 = 40;
 const POSITION_MASK: u64 = (1 << POSITION_BITS) - 1;
+const SEEKS_MASK: u64 = (1 << 23) - 1;
+const AUDIO_DRIVES: u64 = 1 << 63;
+
+fn seeks_of(state: u64) -> u64 {
+    (state >> POSITION_BITS) & SEEKS_MASK
+}
 
 /// How far the position read by the window runs ahead of the last one the audio thread
 /// published, when buffers are late. It keeps a cursor smooth between two buffers (5–40 ms) and
@@ -149,8 +162,8 @@ impl Clock {
     pub fn seek_ms(&self, ms: f64) {
         let target = micros(ms).min(self.0.end_us);
         let _ = self.0.state.try_update(AcqRel, Acquire, |state| {
-            let seeks = (state >> POSITION_BITS).wrapping_add(1) & ((1 << 24) - 1);
-            Some(seeks << POSITION_BITS | target)
+            let seeks = seeks_of(state).wrapping_add(1) & SEEKS_MASK;
+            Some(state & AUDIO_DRIVES | seeks << POSITION_BITS | target)
         });
         self.stamp();
     }
@@ -204,20 +217,49 @@ impl Clock {
     pub fn snapshot(&self) -> Snapshot {
         let state = self.0.state.load(Acquire);
         Snapshot {
-            seeks: (state >> POSITION_BITS) as u32,
+            seeks: seeks_of(state) as u32,
             position_us: state & POSITION_MASK,
             playing: self.playing(),
             speed: self.speed(),
         }
     }
 
+    /// Says the audio side drives the clock from now on: the wall clock no longer moves it.
+    /// Called before each buffer is rendered, before its snapshot.
+    pub fn claim(&self) {
+        self.0.state.fetch_or(AUDIO_DRIVES, AcqRel);
+    }
+
+    /// No audio side drives the clock any more (a new output is being made): the wall clock may.
+    pub fn release(&self) {
+        self.0.state.fetch_and(!AUDIO_DRIVES, AcqRel);
+    }
+
+    /// Whether the audio side drives the clock.
+    pub fn claimed(&self) -> bool {
+        self.0.state.load(Acquire) & AUDIO_DRIVES != 0
+    }
+
     /// Moves the position on by `us` of the piece's own tempo (already scaled by the speed),
     /// unless a seek came since `from`. At the end of the piece the clock stops there and
-    /// pauses. Returns whether the position moved.
+    /// pauses. Returns whether the position moved. The audio side's.
     pub fn advance(&self, from: &Snapshot, us: u64) -> bool {
+        self.advance_if(from, us, true)
+    }
+
+    /// [`Clock::advance`], for the wall clock: it fails once the audio side claimed the clock,
+    /// in the same compare-and-swap that moves the position.
+    pub fn advance_unclaimed(&self, from: &Snapshot, us: u64) -> bool {
+        self.advance_if(from, us, false)
+    }
+
+    fn advance_if(&self, from: &Snapshot, us: u64, claimed_too: bool) -> bool {
         let end = self.0.end_us;
         let moved = self.0.state.try_update(AcqRel, Acquire, |state| {
-            if (state >> POSITION_BITS) as u32 != from.seeks {
+            if seeks_of(state) as u32 != from.seeks {
+                return None;
+            }
+            if !claimed_too && state & AUDIO_DRIVES != 0 {
                 return None;
             }
             let position = ((state & POSITION_MASK) + us).min(end);
@@ -379,5 +421,44 @@ mod tests {
         let snapshot = audio.snapshot();
         audio.advance(&snapshot, 1000);
         assert!((clock.position_ms() - 1235.).abs() < 1e-9);
+    }
+
+    #[test]
+    fn once_the_audio_claims_the_clock_the_wall_clock_never_moves_it() {
+        let clock = Clock::new(10_000.);
+        clock.play();
+        let wall = clock.snapshot();
+        assert!(clock.advance_unclaimed(&wall, 100_000));
+        assert!(!clock.claimed());
+
+        // The seam: the wall clock read the clock, the audio claims it before the wall clock
+        // advances. The wall clock's advance fails; the audio's goes through.
+        let wall = clock.snapshot();
+        clock.claim();
+        let audio = clock.snapshot();
+        assert!(!clock.advance_unclaimed(&wall, 50_000));
+        assert!(clock.advance(&audio, 10_000));
+        assert_eq!(clock.snapshot().position_us, 110_000);
+
+        // A seek keeps the claim, and the counter of seeks works as before.
+        clock.seek_ms(2_000.);
+        assert!(clock.claimed());
+        let after = clock.snapshot();
+        assert_ne!(after.seeks, audio.seeks);
+        assert!(!clock.advance_unclaimed(&after, 1));
+        assert_eq!(clock.snapshot().position_us, 2_000_000);
+
+        // A new output being made gives the clock back to the wall clock.
+        clock.release();
+        let free = clock.snapshot();
+        assert!(clock.advance_unclaimed(&free, 1_000));
+        assert_eq!(clock.snapshot().position_us, 2_001_000);
+    }
+
+    #[test]
+    fn the_counter_of_seeks_wraps_under_the_claim() {
+        let state = AUDIO_DRIVES | SEEKS_MASK << POSITION_BITS | 5;
+        assert_eq!(seeks_of(state), SEEKS_MASK);
+        assert_eq!(seeks_of(state).wrapping_add(1) & SEEKS_MASK, 0);
     }
 }

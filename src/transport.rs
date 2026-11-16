@@ -39,7 +39,7 @@ impl Transport {
                 let alive = this
                     .update(cx, |this, cx| {
                         let sound = this.player.sound();
-                        this.wall.tick(&this.player.clock, sound != Sound::Ready);
+                        this.wall.tick(&this.player.clock);
                         // Idle, nothing changes: no frame to draw.
                         if this.player.wants_to_play() || sound == Sound::Preparing {
                             cx.notify();

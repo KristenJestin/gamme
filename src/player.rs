@@ -189,6 +189,9 @@ impl Player {
         // A new job: what the last one met does not apply to it.
         self.shared.progress.reset();
         self.shared.device_lost.store(false, Relaxed);
+        // An output lost or never made drives the clock no more: the wall clock does until the
+        // new one renders.
+        self.clock.release();
         let (stop, stopped) = mpsc::channel::<()>();
         self.stop = Some(stop);
         let job = Job {
