@@ -1,7 +1,9 @@
 mod desktop;
 mod home;
 mod icons;
+mod library;
 mod paths;
+mod piece_file;
 mod update;
 
 use gpui_kit::*;
@@ -73,7 +75,7 @@ fn window() {
                 app_id: Some("gamme".into()),
                 ..Default::default()
             };
-            let opened = gpui_kit::open_window(options, cx, |_, cx| cx.new(|_| home::Home));
+            let opened = gpui_kit::open_window(options, cx, |_, cx| cx.new(home::Home::new));
             if let Err(error) = opened {
                 eprintln!("gamme: the window cannot open: {error}");
                 cx.quit();

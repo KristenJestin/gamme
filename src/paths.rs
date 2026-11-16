@@ -15,6 +15,11 @@ pub fn state() -> Option<PathBuf> {
     Some(folder("XDG_STATE_HOME", ".local/state")?.join("gamme"))
 }
 
+/// `$XDG_DATA_HOME/gamme/library`: the pieces the player imported, each in a folder of its own.
+pub fn library() -> Option<PathBuf> {
+    Some(data_home()?.join("gamme").join("library"))
+}
+
 /// `$XDG_DATA_HOME`: where the launcher entry and the icon go, beside other programs' own.
 pub fn data_home() -> Option<PathBuf> {
     folder("XDG_DATA_HOME", ".local/share")

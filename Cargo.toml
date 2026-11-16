@@ -13,6 +13,10 @@ publish = false
 [dependencies]
 gpui-design-system = { git = "https://github.com/KristenJestin/gpui-design-system", tag = "v0.1.0" }
 gpui-kit = { version = "=0.8.0", default-features = false, features = ["assets", "gpui-fast"] }
+# The library reads what it imports: MIDI files (`midly`), MusicXML and MEI (`roxmltree`) and
+# the zip of a compressed MusicXML (`zip`, inflate only).
+midly = { version = "0.5", default-features = false, features = ["alloc", "std"] }
+roxmltree = "0.21"
 semver = "1.0.28"
 serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.154"
@@ -22,6 +26,10 @@ sha2 = "0.11.1"
 # and the system packages are settled before the score screen needs it. (`Toolkit::new` unpacks
 # its resources into a new temporary folder it never deletes: never call it per launch.)
 verovio = "0.3.6"
+zip = { version = "9.6.0", default-features = false, features = ["deflate-flate2-zlib-rs"] }
+
+[dev-dependencies]
+tempfile = "3"
 
 [profile.release]
 strip = true
