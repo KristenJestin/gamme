@@ -38,6 +38,10 @@ The last three are CI's `verify` job (`.github/workflows/ci.yml`), on Rust 1.95,
 - **Verovio's C++ (`verovio-sys`, through the `verovio` crate) takes ~35 minutes to compile, once
   per profile.** Never clean the `target/` folder for nothing, never build the same profile
   twice from scratch. CI caches it (`docs/releases.md`).
+- **Verovio finds its elements' classes by name only on the main thread** (its registry is
+  `thread_local`, filled at start-up), and Gamme's toolkit lives on the engraver's thread
+  (`engraver.rs`). An option that names classes, such as `svgAdditionalAttribute`, fails there
+  ("ClassId for 'note' not found"): read what a note is from `get_mei` instead.
 - **Keep `gpui-fast` at 0.1.10 in `Cargo.lock`** (`cargo update -p gpui-fast --precise 0.1.10`
   after any update): 0.1.11 breaks `gpui-base` 0.8.
 
