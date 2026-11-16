@@ -62,10 +62,11 @@ The colours are **Nocturne**, as a theme of the design system (`src/theme.rs`), 
 | Night, the dark page | `#13132A` |
 
 On the home screen, **Colours** chooses where the window's colours come from, as it does in the
-other applications on the design system: Omarchy (the desktop's theme, followed as it changes; the
-default) or Gamme (Nocturne, with a **Shade** of its own, light or dark). Off Omarchy the window
-shows Nocturne and the choice says why Omarchy is not available. The choice applies at once and
-is kept in `$XDG_STATE_HOME/gamme/appearance.json`. The settings page will take the control over.
+other applications on the design system: Gamme (Nocturne, the default, with a **Shade** of its own, light or dark;
+dark until chosen) or Omarchy (the desktop's theme, followed as it changes). Off Omarchy the
+window shows Nocturne whatever is chosen, and the control says why Omarchy is not available. The
+choice applies at once and is kept in `$XDG_STATE_HOME/gamme/appearance.json`. The settings page
+will take the control over.
 
 The style is pixel art everywhere except the score, which stays engraved; the pixel-art
 interface is its own issue.

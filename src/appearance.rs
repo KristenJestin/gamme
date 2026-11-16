@@ -27,8 +27,9 @@ const OMARCHY: &str = "omarchy";
 pub enum Colours {
     /// The Omarchy theme of the desktop, followed as it changes. Off Omarchy, or when its theme
     /// cannot be read, the kit shows Gamme's own instead.
-    #[default]
     Omarchy,
+    /// Gamme's own, Nocturne: what is shown until the user chooses Omarchy's.
+    #[default]
     Gamme,
 }
 
@@ -42,7 +43,7 @@ pub enum Shade {
 }
 
 /// The choice, as it is kept: `appearance.json` in the state folder. Absent, or a key missing:
-/// Omarchy, and the dark shade.
+/// Gamme's own colours, and the dark shade.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields, default)]
 pub struct Kept {
@@ -245,16 +246,16 @@ mod tests {
     }
 
     #[test]
-    fn nothing_kept_is_omarchy_and_dark() {
+    fn nothing_kept_is_gamme_and_dark() {
         let state = Temp::new("default");
         let kept = read(&state.0).unwrap();
         assert_eq!(kept, Kept::default());
-        assert_eq!(kept.colours, Colours::Omarchy);
+        assert_eq!(kept.colours, Colours::Gamme);
         assert_eq!(kept.shade, Shade::Dark);
         assert_eq!(
             kept.appearance(),
             Appearance {
-                source: Source::Desktop("omarchy".into()),
+                source: Source::Theme(theme::ID.into()),
                 shade: KitShade::Dark
             }
         );
@@ -276,7 +277,14 @@ mod tests {
     #[test]
     fn a_new_choice_replaces_the_last() {
         let state = Temp::new("replace");
-        save(&state.0, Kept::default()).unwrap();
+        save(
+            &state.0,
+            Kept {
+                colours: Colours::Omarchy,
+                shade: Shade::Dark,
+            },
+        )
+        .unwrap();
         let gamme = Kept {
             colours: Colours::Gamme,
             shade: Shade::Light,
@@ -322,12 +330,21 @@ mod tests {
             let why = read(&state.0).unwrap_err();
             assert!(why.starts_with("appearance.json: "), "{text}: {why}");
         }
-        std::fs::write(file(&state.0), r#"{"colours":"gamme"}"#).unwrap();
+        // A key missing is that key's default: the colours here, the shade there.
+        std::fs::write(file(&state.0), r#"{"colours":"omarchy"}"#).unwrap();
+        assert_eq!(
+            read(&state.0).unwrap(),
+            Kept {
+                colours: Colours::Omarchy,
+                shade: Shade::Dark
+            }
+        );
+        std::fs::write(file(&state.0), r#"{"shade":"light"}"#).unwrap();
         assert_eq!(
             read(&state.0).unwrap(),
             Kept {
                 colours: Colours::Gamme,
-                shade: Shade::Dark
+                shade: Shade::Light
             }
         );
     }
