@@ -85,6 +85,27 @@ and SHA-256 before anything is unpacked.
 
 `gamme play <piece> [--piano small|grand]` opens a piece with the piano of your choice.
 
+## MIDI out and the settings
+
+The piece can sound on a **MIDI output** (a piano with its own speakers) instead of the built-in
+piano: the notes the computer plays go to the port, timed by the piece's clock. Whatever sounds is
+let go on a pause, a seek, the end of the piece and when the port is changed (a note-off for each
+key, then All Notes Off). If the port is not there when the piece starts, or goes while it plays
+(a USB piano unplugged), the built-in piano takes over where the piece stood and the window says so.
+
+The **settings page** (the Settings button of the home screen) chooses:
+
+- **MIDI**: the output the piece sounds on (the built-in piano until a port is chosen) and the
+  input the keys are read from (every port, or one), as ALSA lists them, with **Look again** for a
+  piano plugged in meanwhile. A port is kept by its name, not by the numbers ALSA changes at each
+  start;
+- **Sound**: which piano the built-in one plays (the table above);
+- **Colours**: Gamme's Nocturne or Omarchy's theme (see Brand).
+
+The choices apply at once and are kept in `$XDG_CONFIG_HOME/gamme/settings.json` (`~/.config/gamme`,
+the folder `0700`, the file `0600`, written atomically), except the colours, which stay in the state
+folder. `gamme play` uses them too.
+
 ## Brand
 
 **The mark is a pixel note**, an 8-bit eighth note on a grid of 7 by 8 cells, crisp down to 16
@@ -103,12 +124,11 @@ The colours are **Nocturne**, as a theme of the design system (`src/theme.rs`), 
 | Paper, the light page | `#F6F5FB` |
 | Night, the dark page | `#13132A` |
 
-On the home screen, **Colours** chooses where the window's colours come from, as it does in the
+On the settings page, **Colours** chooses where the window's colours come from, as it does in the
 other applications on the design system: Gamme (Nocturne, the default, with a **Shade** of its own, light or dark;
 dark until chosen) or Omarchy (the desktop's theme, followed as it changes). Off Omarchy the
 window shows Nocturne whatever is chosen, and the control says why Omarchy is not available. The
-choice applies at once and is kept in `$XDG_STATE_HOME/gamme/appearance.json`. The settings page
-will take the control over.
+choice applies at once and is kept in `$XDG_STATE_HOME/gamme/appearance.json`.
 
 The style is pixel art everywhere except the score, which stays engraved; the pixel-art
 interface is its own issue.

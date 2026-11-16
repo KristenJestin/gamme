@@ -1,5 +1,6 @@
 mod appearance;
 mod clock;
+mod config;
 mod desktop;
 mod engraver;
 mod falling;
@@ -7,6 +8,7 @@ mod home;
 mod icons;
 mod keyboard;
 mod library;
+mod midi_out;
 mod paths;
 mod piano;
 mod piece_file;
@@ -16,6 +18,7 @@ mod raster;
 mod score;
 mod score_view;
 mod screens;
+mod settings;
 mod soundfont;
 mod theme;
 mod timeline;
@@ -35,7 +38,9 @@ Learn the piano: the score at the centre, falling notes as a help that fades wit
 `gamme <piece>` opens a piece (MusicXML, MEI or MIDI) without importing it: its score over its
 falling notes, or the view --view names, at --at, playing with --play.
 `gamme play` opens it as well, its built-in piano chosen: its SoundFont is downloaded the first
-time (`--piano grand` is the concert grand, 296 MiB; the default is a small upright, 6 MiB).
+time (`--piano grand` is the concert grand, 296 MiB; the default is the settings' choice, a small
+upright of 6 MiB at first). Either way the piece sounds on the MIDI output the settings choose,
+if they choose one.
 `gamme update` replaces this binary with the channel's latest build (`gamme update --help`).";
 
 /// What `--version` prints: the version, the channel and the commit (`build.rs`).
@@ -83,13 +88,13 @@ fn play_command(args: Vec<String>) -> std::process::ExitCode {
         std::process::ExitCode::from(2)
     };
     let mut file = None;
-    let mut font = soundfont::SMALL_PIANO;
+    let mut font = None;
     let mut args = args.into_iter();
     while let Some(arg) = args.next() {
         match arg.as_str() {
             "--piano" => match args.next().as_deref() {
-                Some("small") => font = soundfont::SMALL_PIANO,
-                Some("grand") => font = soundfont::CONCERT_GRAND,
+                Some("small") => font = Some(soundfont::SMALL_PIANO),
+                Some("grand") => font = Some(soundfont::CONCERT_GRAND),
                 _ => return fail("--piano is small or grand".into()),
             },
             _ if file.is_none() && !arg.starts_with('-') => file = Some(arg),

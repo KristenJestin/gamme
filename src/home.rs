@@ -11,13 +11,13 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use gpui_design_system::{
     Button, Confirm, EmptyLine, Icon, ListCard, ListRow, Listing, Menu, PageHeader, Section, Toast,
-    ToastStack, Type as _, icon, palette, space, toast,
+    Type as _, icon, palette, space, toast,
 };
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
 
+use crate::icons;
 use crate::library::{ImportError, Library, Piece};
-use crate::{appearance, icons};
 
 /// A row of the list: a piece and the menu of its "⋯" button, which keeps its state while the
 /// row stays.
@@ -29,6 +29,9 @@ struct Row {
 
 /// The home screen asks to play a piece of its library.
 pub struct Open(pub Library, pub Piece);
+
+/// The home screen asks for the settings page.
+pub struct OpenSettings;
 
 pub struct Home {
     /// `None` when there is no home folder to keep a library in.
@@ -43,10 +46,10 @@ pub struct Home {
     asking: Option<(Piece, bool)>,
     /// How many imports are under way.
     importing: usize,
-    toasts: Entity<ToastStack>,
 }
 
 impl EventEmitter<Open> for Home {}
+impl EventEmitter<OpenSettings> for Home {}
 
 impl Home {
     pub fn new(cx: &mut Context<Self>) -> Self {
@@ -61,7 +64,6 @@ impl Home {
             menus: HashMap::new(),
             asking: None,
             importing: 0,
-            toasts: cx.new(ToastStack::new),
         };
         home.refresh(cx);
         home
@@ -366,10 +368,15 @@ impl Render for Home {
                     .gap(space::XL)
                     .child(
                         PageHeader::new("home-header", "Gamme")
+                            .action("home-settings", "Settings", Some(Icon::Settings), {
+                                let home = cx.entity().downgrade();
+                                move |_, cx| {
+                                    home.update(cx, |_, cx| cx.emit(OpenSettings)).ok();
+                                }
+                            })
                             .below(div().ui_text().text_color(p.mute).child(
                                 "Learn the piano: the score first, the falling notes as a help.",
-                            ))
-                            .below(appearance::control(cx)),
+                            )),
                     )
                     .child(section)
                     .child(div().flex_1()),
@@ -391,7 +398,6 @@ impl Render for Home {
                         home.update(cx, |home, cx| home.cancel_removal(cx)).ok();
                     }),
             )
-            .child(self.toasts.clone())
     }
 }
 

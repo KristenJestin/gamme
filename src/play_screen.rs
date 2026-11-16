@@ -23,13 +23,15 @@ use gpui_design_system::{
 use gpui_kit::*;
 
 use crate::clock::Clock;
+use crate::config;
 use crate::engraver;
 use crate::falling::falling;
 use crate::icons;
 use crate::keyboard::{Keyboard, Lights};
 use crate::library::{Library, Piece};
+use crate::midi_out;
 use crate::paths;
-use crate::player::{Builtin, Player};
+use crate::player::Player;
 use crate::score::Score;
 use crate::score_view::{Playhead, ScoreView, timing};
 use crate::soundfont::{self, Font};
@@ -78,11 +80,12 @@ pub struct Opening {
     /// Whether it plays at once.
     pub play: bool,
     pub view: View,
-    pub font: Font,
+    /// The piano `gamme play --piano` asked for; none: the settings' choice.
+    pub font: Option<Font>,
 }
 
 impl Opening {
-    /// A file, at its start, in the default view, with the small piano.
+    /// A file, at its start, in the default view, on the output the settings choose.
     pub fn file(piece: impl Into<PathBuf>) -> Self {
         Self {
             piece: piece.into(),
@@ -90,7 +93,7 @@ impl Opening {
             at: 0.,
             play: false,
             view: View::Both,
-            font: soundfont::SMALL_PIANO,
+            font: None,
         }
     }
 
@@ -298,12 +301,14 @@ impl PlayScreen {
                 .collect()
         });
         let keyboard = Keyboard::for_timeline(&loaded.timeline);
+        // What the settings choose: the MIDI output if there is one, else the built-in piano.
+        let (audio, font) = config::load().audio(Arc::new(midi_out::Alsa));
         let player = Player::new(
             loaded.timeline,
             data,
-            self.opening.font,
+            self.opening.font.unwrap_or(font),
             Arc::new(soundfont::Curl::new()),
-            Arc::new(Builtin),
+            audio,
         );
         let (clock, timeline) = (player.clock.clone(), player.timeline.clone());
         clock.seek_ms(at);
