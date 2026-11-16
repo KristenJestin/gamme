@@ -47,14 +47,18 @@ The last three are CI's `verify` job (`.github/workflows/ci.yml`), on Rust 1.95,
 | File | What it is |
 |---|---|
 | `main.rs` | The entry: arguments (`--help`, `--version`, `update`), the window and its theme |
-| `home.rs` | The home screen |
+| `home.rs` | The home screen: the library's pieces, import (picker, drop) and removal |
+| `library.rs` | The library in `$XDG_DATA_HOME/gamme/library`: import, list, remove |
+| `piece_file.rs` | What an imported file is: MusicXML, MEI or MIDI, its title and composer, why it is refused |
 | `icons.rs` | The icons Gamme adds to the kit's (Lucide) |
 | `update.rs` | `gamme update`: the channel's latest build, its sum checked, the binary replaced |
 | `desktop.rs` | The launcher entry and the icon, written by `update` as `install.sh` writes them |
-| `paths.rs` | `$XDG_STATE_HOME/gamme` and `$XDG_DATA_HOME` |
+| `paths.rs` | `$XDG_STATE_HOME/gamme`, `$XDG_DATA_HOME` and the library's folder |
 
 Besides `src/`:
 
+- `tests/fixtures/`: the small scores the library's tests import (written by hand, free to
+  redistribute): one of each kind, and broken ones.
 - `build.rs`: the version `gamme --version` prints (`docs/releases.md`, "The version").
 - `packaging/linux/`: the desktop entry and the icon (**a placeholder**: the brand is decided
   with the owner, never invented by an agent), installed by `install.sh` and packaged by
@@ -78,6 +82,7 @@ Besides `src/`:
   module of `src/` that says it is waiting to be, as Rature's `kit.rs`), never drawn by hand.
 - **Slow work stays off the main thread**; the main thread only puts the result in place.
 - **Gamme's state goes only to `$XDG_STATE_HOME/gamme`**, the folder `0700`, its files `0600`.
+  The library of pieces is data, not state: `$XDG_DATA_HOME/gamme/library`.
 - **Linux only.**
 - Code, identifiers, comments and docs are in English. Rust 2024. A comment says why, not what.
 - Touch only what the task needs; match the existing style.

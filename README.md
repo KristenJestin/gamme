@@ -7,9 +7,18 @@ score stays at the centre; falling notes over a keyboard are an aid that goes aw
 piece, because apps that only show falling notes teach to follow, not to read.
 
 **Status: the skeleton.** What exists today is one window with the shared design system's look
-(it follows the Omarchy theme), an empty home screen, and the machinery to publish, install and
-update the app. The play screen, the game layer, the practice method, the fingering and the
-pieces come next (issues 2 to 6).
+(it follows the Omarchy theme), a home screen that lists your pieces, and the machinery to
+publish, install and update the app. The play screen, the game layer, the practice method and the
+fingering come next.
+
+## The library
+
+Import a piece with the **Import** button, or drop the file on the window: MusicXML (`.mxl`,
+`.musicxml`) and MEI are engraved, MIDI (`.mid`, `.midi`) has falling notes only. The file is
+copied, with its title and composer, into `$XDG_DATA_HOME/gamme/library` (`~/.local/share/gamme/library`
+by default). The home screen lists the pieces, the last played first; a piece is removed from the
+"⋯" menu of its row, which leaves the original file alone. A file that is not a score is refused
+with a sentence that says why.
 
 ## Install
 
