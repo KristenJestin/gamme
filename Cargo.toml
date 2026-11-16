@@ -11,18 +11,26 @@ readme = "README.md"
 publish = false
 
 [dependencies]
+# The built-in piano: a SoundFont synthesizer (`rustysynth`) on the default output (`cpal`).
+cpal = "0.18.2"
 gpui-design-system = { git = "https://github.com/KristenJestin/gpui-design-system", tag = "v0.1.0" }
 gpui-kit = { version = "=0.8.0", default-features = false, features = ["assets", "gpui-fast"] }
 # Already built for GPUI, which takes the window icon as one of its images, and the frames of
 # GPUI's images (the score's pages); only the PNG decoder.
 image = { version = "0.25.10", default-features = false, features = ["png"] }
+libc = "0.2"
 # The library reads what it imports: MIDI files (`midly`), MusicXML and MEI (`roxmltree`) and
-# the zip of a compressed MusicXML (`zip`, inflate only).
-midly = { version = "0.5", default-features = false, features = ["alloc", "std"] }
+# the zip of a compressed MusicXML (`zip`, inflate only). `midly` also reads the timeline the
+# piano plays; already built for `verovio`, without its `rayon` default.
+midly = { version = "0.5.3", default-features = false, features = ["alloc", "std"] }
 roxmltree = "0.21"
+rustysynth = "1.3.8"
 semver = "1.0.28"
 serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.154"
+# Unpacks the small piano's `.7z`, BZip2-compressed (the other SoundFont's `.tar.xz` goes through
+# the user's `tar`). Pure Rust.
+sevenz-rust2 = { version = "0.25.0", default-features = false, features = ["bzip2", "util"] }
 sha2 = "0.11.1"
 # Engraves the score. Its C++ (`verovio-sys`) takes ~35 min to compile once: CI caches it
 # (docs/releases.md). `verovio::Toolkit::new` unpacks its resources into a new temporary folder
