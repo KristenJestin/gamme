@@ -7,8 +7,11 @@ use gpui_design_system::{Icon, Icons};
 use gpui_kit::{AssetSource, Result, SharedString};
 
 pub const MUSIC: Icon = Icon::Lucide("music");
+pub const PAUSE: Icon = Icon::Lucide("pause");
+pub const SKIP_BACK: Icon = Icon::Lucide("skip-back");
+pub const SKIP_FORWARD: Icon = Icon::Lucide("skip-forward");
 
-gpui_kit::assets::icon_assets!(Lucide, [Music]);
+gpui_kit::assets::icon_assets!(Lucide, [Music, Pause, SkipBack, SkipForward]);
 
 /// Gamme's icons, then the kit's.
 pub struct Assets;
