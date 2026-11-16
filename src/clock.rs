@@ -14,7 +14,10 @@
 //! computed before it, and the counter tells the audio side to cut the notes that were sounding.
 
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering::Relaxed};
+use std::sync::atomic::{
+    AtomicBool, AtomicU32, AtomicU64,
+    Ordering::{AcqRel, Acquire, Relaxed, Release},
+};
 use std::time::Instant;
 
 use crate::timeline::Timeline;
@@ -71,8 +74,12 @@ struct Shared {
     speed: AtomicU32,
     end_us: u64,
     origin: Instant,
-    /// When the position was last set or advanced, in nanoseconds since `origin`.
+    /// When the position was last set or advanced, in nanoseconds since `origin`: written after
+    /// the position (Release), read before it (Acquire).
     stamp_ns: AtomicU64,
+    /// The speed (percent) the position had advanced at then: the window runs ahead of it at
+    /// that speed, so that a change of speed shows from the next buffer on, never as a jump.
+    stamp_speed: AtomicU32,
 }
 
 fn micros(ms: f64) -> u64 {
@@ -90,14 +97,23 @@ impl Clock {
             end_us: micros(duration_ms).min(POSITION_MASK),
             origin: Instant::now(),
             stamp_ns: AtomicU64::new(0),
+            stamp_speed: AtomicU32::new(Speed::FULL.percent()),
         }));
         clock.stamp();
         clock
     }
 
+    /// Notes that the position was just set (by the window): it stands at the current speed.
     fn stamp(&self) {
+        self.0
+            .stamp_speed
+            .store(self.0.speed.load(Relaxed), Relaxed);
+        self.stamp_now();
+    }
+
+    fn stamp_now(&self) {
         let ns = self.0.origin.elapsed().as_nanos().min(u128::from(u64::MAX)) as u64;
-        self.0.stamp_ns.store(ns, Relaxed);
+        self.0.stamp_ns.store(ns, Release);
     }
 
     // ---- The window drives it.
@@ -124,15 +140,15 @@ impl Clock {
         Speed::new(self.0.speed.load(Relaxed))
     }
 
+    /// Takes effect with the next buffer the audio side renders.
     pub fn set_speed(&self, speed: Speed) {
         self.0.speed.store(speed.percent(), Relaxed);
-        self.stamp();
     }
 
     /// Moves to `ms`, held between 0 and the end of the piece.
     pub fn seek_ms(&self, ms: f64) {
         let target = micros(ms).min(self.0.end_us);
-        let _ = self.0.state.try_update(Relaxed, Relaxed, |state| {
+        let _ = self.0.state.try_update(AcqRel, Acquire, |state| {
             let seeks = (state >> POSITION_BITS).wrapping_add(1) & ((1 << 24) - 1);
             Some(seeks << POSITION_BITS | target)
         });
@@ -159,11 +175,12 @@ impl Clock {
         let shared = &self.0;
         // The audio thread writes the position, then its stamp: read the stamp on both sides of
         // the position, and again if it moved (a few tries, then the last read does).
-        let (mut position, mut stamp) = (0, 0);
+        let (mut position, mut stamp, mut speed) = (0, 0, Speed::FULL.percent());
         for _ in 0..4 {
-            let before = shared.stamp_ns.load(Relaxed);
-            position = shared.state.load(Relaxed) & POSITION_MASK;
-            stamp = shared.stamp_ns.load(Relaxed);
+            let before = shared.stamp_ns.load(Acquire);
+            position = shared.state.load(Acquire) & POSITION_MASK;
+            speed = shared.stamp_speed.load(Relaxed);
+            stamp = shared.stamp_ns.load(Acquire);
             if before == stamp {
                 break;
             }
@@ -172,7 +189,7 @@ impl Clock {
         if self.playing() && position < shared.end_us {
             let now = shared.origin.elapsed().as_nanos().min(u128::from(u64::MAX)) as u64;
             let ahead = now.saturating_sub(stamp).min(EXTRAPOLATION_LIMIT_NS);
-            ms += ahead as f64 / 1e6 * self.speed().factor();
+            ms += ahead as f64 / 1e6 * Speed::new(speed).factor();
         }
         ms.min(shared.end_us as f64 / 1e3)
     }
@@ -185,7 +202,7 @@ impl Clock {
     // ---- The audio side advances it.
 
     pub fn snapshot(&self) -> Snapshot {
-        let state = self.0.state.load(Relaxed);
+        let state = self.0.state.load(Acquire);
         Snapshot {
             seeks: (state >> POSITION_BITS) as u32,
             position_us: state & POSITION_MASK,
@@ -199,7 +216,7 @@ impl Clock {
     /// pauses. Returns whether the position moved.
     pub fn advance(&self, from: &Snapshot, us: u64) -> bool {
         let end = self.0.end_us;
-        let moved = self.0.state.try_update(Relaxed, Relaxed, |state| {
+        let moved = self.0.state.try_update(AcqRel, Acquire, |state| {
             if (state >> POSITION_BITS) as u32 != from.seeks {
                 return None;
             }
@@ -207,7 +224,8 @@ impl Clock {
             Some(state & !POSITION_MASK | position)
         });
         let Ok(before) = moved else { return false };
-        self.stamp();
+        self.0.stamp_speed.store(from.speed.percent(), Relaxed);
+        self.stamp_now();
         if (before & POSITION_MASK) + us >= end {
             self.0.playing.store(false, Relaxed);
         }
@@ -337,6 +355,18 @@ mod tests {
         clock.play();
         assert!(clock.playing());
         assert_eq!(clock.snapshot().position_us, 0);
+    }
+
+    #[test]
+    fn a_change_of_speed_does_not_make_the_position_the_window_reads_jump() {
+        let clock = Clock::new(10_000.);
+        clock.play();
+        std::thread::sleep(Duration::from_millis(30));
+        let before = clock.position_ms();
+        assert!(before >= 29., "{before}");
+        clock.set_speed(Speed::new(25));
+        let after = clock.position_ms();
+        assert!((after - before).abs() < 5., "{before} then {after}");
     }
 
     #[test]
