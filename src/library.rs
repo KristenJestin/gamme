@@ -16,6 +16,7 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest as _, Sha256};
 
 use crate::piece_file::{self, Kind};
+use crate::timeline::PartHand;
 
 const METADATA: &str = "piece.json";
 
@@ -33,6 +34,10 @@ pub struct Piece {
     pub imported_at: u64,
     /// When it was last played: `None` for a piece never played.
     pub last_played: Option<u64>,
+    /// The hand of each part of a MIDI file (`timeline.rs`), in order, as the player corrected
+    /// them: `None` until they do, and the timeline's guess holds.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub hands: Option<Vec<PartHand>>,
 }
 
 /// Why a file was not imported, as a sentence the player can read.
@@ -129,6 +134,7 @@ impl Library {
             file: format!("score.{}", found.extension),
             imported_at: now(),
             last_played: None,
+            hands: None,
         };
         self.keep(&piece, &bytes)
             .map_err(|error| refuse(format!("could not be kept in the library ({error})")))?;
@@ -177,8 +183,22 @@ impl Library {
     }
 
     /// Says a piece was played, at `at` seconds since the epoch: the home screen lists it first.
-    #[allow(dead_code)] // The play screen calls it; the library is complete without waiting for it.
     pub fn mark_played(&self, id: &str, at: u64) -> io::Result<()> {
+        self.change(id, |piece| piece.last_played = Some(at))
+    }
+
+    /// Keeps the hands the player gave the parts of a piece.
+    pub fn set_hands(&self, id: &str, hands: &[PartHand]) -> io::Result<()> {
+        self.change(id, |piece| piece.hands = Some(hands.to_vec()))
+    }
+
+    /// The score's file of a piece.
+    pub fn file(&self, piece: &Piece) -> PathBuf {
+        self.root.join(&piece.id).join(&piece.file)
+    }
+
+    /// Reads a piece's metadata, changes it and writes it again.
+    fn change(&self, id: &str, change: impl FnOnce(&mut Piece)) -> io::Result<()> {
         if !is_id(id) {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
@@ -188,7 +208,7 @@ impl Library {
         let folder = self.root.join(id);
         let mut piece = read_piece(&folder)
             .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "no such piece"))?;
-        piece.last_played = Some(at);
+        change(&mut piece);
         write_metadata(&folder, &piece)
     }
 }
@@ -383,6 +403,27 @@ mod tests {
         library.mark_played(&tune.id, 3_000).unwrap();
         let first = library.list().remove(0);
         assert_eq!((first.id, first.last_played), (tune.id, Some(3_000)));
+    }
+
+    #[test]
+    fn the_hands_the_player_gave_are_kept_and_read_again() {
+        let (home, library) = library();
+        let tune = library.import(&fixture("a-tune.mid")).unwrap();
+        assert_eq!(tune.hands, None);
+        // A piece kept before hands existed reads as one with none.
+        let json = fs::read_to_string(library.root.join(&tune.id).join(METADATA)).unwrap();
+        assert!(!json.contains("hands"), "{json}");
+
+        let hands = [PartHand::Left, PartHand::Right, PartHand::Split];
+        library.set_hands(&tune.id, &hands).unwrap();
+        let again = Library::at(home.path().join("data/gamme/library")).list();
+        assert_eq!(again[0].hands.as_deref(), Some(&hands[..]));
+        assert_eq!(again[0].title, tune.title, "the rest stays");
+        assert_eq!(
+            library.file(&again[0]),
+            library.root.join(&tune.id).join("score.mid")
+        );
+        assert!(library.set_hands("../keep", &hands).is_err());
     }
 
     #[test]
