@@ -192,7 +192,7 @@ impl Timeline {
 
         // The piece ends with its last note, not with a track's trailing silence.
         let last_note_tick = raw.iter().map(|note| note.end).max().unwrap_or(0);
-        let measures = measure_ticks(ticks_per_beat, signatures, last_note_tick.max(1))
+        let measures = measure_ticks(ticks_per_beat, signatures, last_note_tick.max(1))?
             .into_iter()
             .map(|tick| map.ms(tick))
             .collect();
@@ -240,9 +240,17 @@ impl TempoMap {
     }
 }
 
+/// More measures than any piece has: a file that asks for more (a tiny measure over a long
+/// silence) is refused rather than filling the memory.
+const MAX_MEASURES: usize = 100_000;
+
 /// The tick each measure starts at, up to the one holding `end`. A time signature takes effect at
 /// the barline that follows it, as scores are written.
-fn measure_ticks(ticks_per_beat: u64, mut signatures: Vec<(u64, u32, u32)>, end: u64) -> Vec<u64> {
+fn measure_ticks(
+    ticks_per_beat: u64,
+    mut signatures: Vec<(u64, u32, u32)>,
+    end: u64,
+) -> Result<Vec<u64>, String> {
     signatures.sort_by_key(|&(tick, ..)| tick);
     let (mut num, mut den) = (4, 4);
     let mut next_signature = 0;
@@ -257,7 +265,10 @@ fn measure_ticks(ticks_per_beat: u64, mut signatures: Vec<(u64, u32, u32)>, end:
         }
         tick += (ticks_per_beat * 4 * u64::from(num) / u64::from(den)).max(1);
         if tick >= end {
-            return starts;
+            return Ok(starts);
+        }
+        if starts.len() >= MAX_MEASURES {
+            return Err(format!("more than {MAX_MEASURES} measures"));
         }
         starts.push(tick);
     }
@@ -422,6 +433,18 @@ pub(crate) mod tests {
         assert_eq!(timeline.measure_at(2000.), 1);
         assert_eq!(timeline.measure_at(1e9), 2);
         assert_eq!(timeline.measure_at(-5.), 0);
+    }
+
+    #[test]
+    fn a_file_with_a_hostile_number_of_measures_is_refused() {
+        // 255/32768 time: a measure of 14 ticks, over two million ticks of one note.
+        let bytes = smf(vec![vec![
+            meta(0, MetaMessage::TimeSignature(255, 15, 24, 8)),
+            note(0, 60, true),
+            note(2_000_000, 60, false),
+        ]]);
+        let error = Timeline::from_smf(&bytes).unwrap_err();
+        assert!(error.contains("measures"), "{error}");
     }
 
     #[test]
