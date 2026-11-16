@@ -1965,10 +1965,12 @@ dependencies = [
 name = "gamme"
 version = "0.1.0"
 dependencies = [
+ "cxx",
  "gpui-design-system",
  "gpui-kit",
  "image",
  "midly",
+ "resvg 0.46.0",
  "roxmltree 0.21.2",
  "semver",
  "serde",
@@ -1976,6 +1978,8 @@ dependencies = [
  "sha2 0.11.1",
  "tempfile",
  "verovio",
+ "verovio-data",
+ "verovio-sys",
  "zip",
 ]
 
