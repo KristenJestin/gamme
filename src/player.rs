@@ -384,6 +384,9 @@ mod tests {
             on_ms: 0.,
             off_ms: 500.,
             hand: Hand::Right,
+            part: 0,
+            measure: 0,
+            element: None,
         };
         Timeline::new(vec![note], vec![0., 2000.], 4000.)
     }

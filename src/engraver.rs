@@ -11,8 +11,12 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::{Mutex, OnceLock, mpsc};
 
+use base64::Engine as _;
+use resvg::usvg::roxmltree;
 use serde::Deserialize;
 use verovio_sys::ffi;
+
+use crate::timeline::Written;
 
 /// Verovio's layout: pages 2200 units wide drawn at half size, systems broken to fit, each page
 /// as tall as what it holds, and no footer of Verovio's own.
@@ -32,6 +36,14 @@ pub struct Engraved {
     pub events: Vec<Event>,
     /// Each measure's number as the score prints it (its `@n`), by the measure's id.
     pub numbers: HashMap<String, String>,
+    /// The piece as Verovio plays it, a Standard MIDI File: one track per staff (track n for
+    /// staff n), ties joined, repeats played through.
+    pub midi: Vec<u8>,
+    /// What each engraved note is written as, by its id: what the timeline finds the notes of
+    /// the MIDI by (`timeline.rs`). Read from Verovio's MEI of the piece: its SVG would say it
+    /// with `svgAdditionalAttribute`, but Verovio's names of elements are kept per thread, and
+    /// only the main thread's are filled.
+    pub written: HashMap<String, Written>,
 }
 
 /// A moment of the timemap.
@@ -181,12 +193,51 @@ impl Toolkit {
                 numbers.insert(id.clone(), number);
             }
         }
+        let midi = base64::engine::general_purpose::STANDARD
+            .decode(ffi::render_to_midi(tk.pin_mut()).trim())
+            .map_err(|error| format!("Verovio's MIDI cannot be read: {error}"))?;
+        let written = written(&ffi::get_mei(tk.pin_mut(), "{}"))?;
         Ok(Engraved {
             pages,
             events,
             numbers,
+            midi,
+            written,
         })
     }
+}
+
+/// Each note of an MEI document, by its id: the `@n` of its staff, and its `@pname` and `@oct`.
+fn written(mei: &str) -> Result<HashMap<String, Written>> {
+    const XML: &str = "http://www.w3.org/XML/1998/namespace";
+    let options = roxmltree::ParsingOptions {
+        allow_dtd: true,
+        ..roxmltree::ParsingOptions::default()
+    };
+    let document = roxmltree::Document::parse_with_options(mei, options)
+        .map_err(|error| format!("Verovio's MEI cannot be read: {error}"))?;
+    let mut written = HashMap::new();
+    for note in document
+        .descendants()
+        .filter(|node| node.tag_name().name() == "note")
+    {
+        let Some(id) = note.attribute((XML, "id")) else {
+            continue;
+        };
+        let staff = note
+            .ancestors()
+            .find(|above| above.tag_name().name() == "staff")
+            .and_then(|staff| staff.attribute("n")?.parse().ok());
+        let Some(staff) = staff else {
+            continue;
+        };
+        let key = note
+            .attribute("pname")
+            .zip(note.attribute("oct"))
+            .and_then(|(pname, oct)| Written::key(pname, oct));
+        written.insert(id.to_owned(), Written { staff, key });
+    }
+    Ok(written)
 }
 
 /// The folder of Verovio's resources for `version`, unpacked into `cache` the first time and
@@ -253,6 +304,37 @@ mod tests {
             .map(|entry| entry.unwrap().file_name())
             .collect();
         assert_eq!(entries, ["verovio-5.0.0-dev_abc"]);
+    }
+
+    #[test]
+    fn the_notes_of_an_mei_say_their_staff_and_written_pitch() {
+        let mei = r#"<mei xmlns="http://www.music-encoding.org/ns/mei"><music><body><mdiv><score><section>
+            <measure xml:id="m1"><staff n="1"><layer n="1">
+              <chord><note xml:id="n1" pname="e" oct="5"/><note xml:id="n2" pname="g" oct="5"><accid accid="s"/></note></chord>
+            </layer></staff><staff n="2"><layer n="1"><note xml:id="n3" pname="c" oct="3"/><note pname="d" oct="3"/></layer></staff></measure>
+            </section></score></mdiv></body></music></mei>"#;
+        let found = written(mei).unwrap();
+        assert_eq!(found.len(), 3);
+        assert_eq!(
+            found["n1"],
+            Written {
+                staff: 1,
+                key: Some(76)
+            }
+        );
+        assert_eq!(
+            found["n2"].key,
+            Some(79),
+            "the written pitch, without its sharp"
+        );
+        assert_eq!(
+            found["n3"],
+            Written {
+                staff: 2,
+                key: Some(48)
+            }
+        );
+        assert!(written("<mei").is_err());
     }
 
     #[test]

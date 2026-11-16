@@ -402,6 +402,9 @@ mod tests {
             on_ms,
             off_ms,
             hand,
+            part: 0,
+            measure: 0,
+            element: None,
         }
     }
 

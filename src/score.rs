@@ -518,6 +518,8 @@ mod tests {
             pages: vec![PAGE.to_owned()],
             events,
             numbers: HashMap::from([("m1".to_owned(), "1".to_owned())]),
+            midi: Vec::new(),
+            written: HashMap::new(),
         })
         .unwrap()
     }
