@@ -86,7 +86,7 @@ make_archive() {
   local version=$1 channel=$2 how=${3:-}
   local folder="$tmp/build/gamme-$version" out="$tmp/www/dl/releases/download/v$version"
   local name="gamme-$version-x86_64-linux.tar.gz"
-  mkdir -p "$folder/share/applications" "$folder/share/icons/hicolor/scalable/apps" "$out"
+  mkdir -p "$folder/share/applications" "$out"
   if [ "$how" = broken ]; then
     printf '#!/bin/sh\necho "gamme: error while loading shared libraries: libfake.so.1" >&2\nexit 127\n' >"$folder/gamme"
   else
@@ -96,8 +96,7 @@ make_archive() {
   chmod 0755 "$folder/gamme"
   cp "$root/LICENSE" "$folder/LICENSE"
   cp "$root/packaging/linux/gamme.desktop" "$folder/share/applications/"
-  cp "$root/packaging/linux/icons/hicolor/scalable/apps/gamme.svg" \
-    "$folder/share/icons/hicolor/scalable/apps/"
+  cp -r "$root/packaging/linux/icons" "$folder/share/icons"
   tar -C "$tmp/build" -czf "$out/$name" "gamme-$version"
   (cd "$out" && sha256sum "$name" >"$name.sha256")
   if [ "$how" = wrong-sum ]; then
@@ -233,7 +232,7 @@ exec_line() {
   real="$(cd "$bin" && pwd -P)/gamme"
   grep -qxF "Exec=\"$real\"" "$data/applications/gamme.desktop"
 }
-icon() { cmp -s "$data/icons/hicolor/scalable/apps/gamme.svg" "$root/packaging/linux/icons/hicolor/scalable/apps/gamme.svg"; }
+icon() { diff -r "$data/icons/hicolor" "$root/packaging/linux/icons/hicolor" >/dev/null 2>&1; }
 
 echo "# install.sh under ${shell[*]}, against $base"
 
@@ -380,7 +379,7 @@ install_sh --uninstall
 check "--uninstall: exit 0" exited 0
 check "--uninstall: gamme removed" eval '[ ! -e "$bin/gamme" ]'
 check "--uninstall: the entry and the icon removed" \
-  eval '[ ! -e "$data/applications/gamme.desktop" ] && [ ! -e "$data/icons/hicolor/scalable/apps/gamme.svg" ]'
+  eval '[ ! -e "$data/applications/gamme.desktop" ] && [ ! -e "$data/icons/hicolor/scalable/apps/gamme.svg" ] && [ ! -e "$data/icons/hicolor/48x48/apps/gamme.png" ]'
 install_sh --uninstall
 check "--uninstall again: nothing to remove, exit 0" exited 0
 api_root=api

@@ -163,7 +163,10 @@ desktop_files() {
 uninstall() {
   rm -f "$1/gamme" "$1/.gamme.new"
   removed="$1/gamme"
-  rm -f "$2/applications/gamme.desktop" "$2/icons/hicolor/scalable/apps/gamme.svg"
+  # The icon is an SVG and a PNG at each size: every folder of the theme, whichever sizes a
+  # version wrote. A pattern that matches nothing stays as it is, which `rm -f` ignores.
+  rm -f "$2/applications/gamme.desktop" "$2"/icons/hicolor/*/apps/gamme.svg \
+    "$2"/icons/hicolor/*/apps/gamme.png
   if [ -d "$2/icons/hicolor" ]; then touch "$2/icons/hicolor"; fi
   if command -v update-desktop-database >/dev/null 2>&1 && [ -d "$2/applications" ]; then
     update-desktop-database "$2/applications" 2>/dev/null || true

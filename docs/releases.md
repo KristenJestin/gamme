@@ -169,8 +169,8 @@ last line, so a download cut short runs nothing. It follows Flottille's `install
   system library missing) stays installed, and that is said. It also says when `~/.local/bin` is
   not in `PATH`.
 - **`--uninstall`** needs no clone, no archive and no network: it removes `gamme`,
-  `applications/gamme.desktop` and `icons/hicolor/scalable/apps/gamme.svg`,
-  and keeps the config and the state.
+  `applications/gamme.desktop` and the icon (`icons/hicolor/*/apps/gamme.svg` and `.png`), and
+  keeps the config and the state.
 
 `GAMME_RELEASES` names another root of the API than
 `https://api.github.com/repos/KristenJestin/gamme`, for tests: `tools/test-install.sh` serves
@@ -187,11 +187,12 @@ data folder (`$XDG_DATA_HOME`, `~/.local/share` by default):
   when the launcher's `PATH` lacks `~/.local/bin`; a path with a space is quoted), with
   `Terminal=false` and `StartupWMClass=gamme`, the window's app id, which is how the desktop
   finds the entry's icon for the window.
-- `icons/hicolor/scalable/apps/gamme.svg`.
+- `icons/hicolor/scalable/apps/gamme.svg`, and `icons/hicolor/<n>x<n>/apps/gamme.png` for n =
+  16, 32, 48, 64, 128, 256 and 512: the pixel note on a violet tile (README, "Brand"). Both are
+  written by `tools/brand.py` from one pixel grid, never by hand.
 
-The package holds them under `share/`, from `packaging/linux/`. **The icon is a placeholder**: the
-real brand is decided with the owner, and replacing `gamme.svg` is all it takes (a PNG set can be
-added then, if the desktop wants one). The entry of the package says `Exec=gamme`; `install.sh`
+The package holds them under `share/`, from `packaging/linux/`: every file of its `icons`
+folder, so a size added there is packaged, installed and updated with no other change. The entry of the package says `Exec=gamme`; `install.sh`
 and `gamme update` write it with the binary's real path (symbolic links resolved, so that the two
 write the same line whatever the way the home is reached). **Refusing some characters is Gamme's
 choice**: the format allows a `"`, a backtick, `$`, `\` or `%` in an `Exec` line, escaped, but
