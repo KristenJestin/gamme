@@ -1,0 +1,10 @@
+[Desktop Entry]
+Type=Application
+Name=Gamme
+GenericName=Piano trainer
+Comment=Learn the piano with the score and falling notes
+Exec=gamme
+Icon=gamme
+Terminal=false
+Categories=AudioVideo;Audio;Music;Education;
+StartupWMClass=gamme

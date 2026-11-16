@@ -1,0 +1,13 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64" width="64" height="64">
+  <!-- PLACEHOLDER: the real mark is decided with the owner (README, "Brand"). Replace this file. -->
+  <rect width="64" height="64" rx="15" fill="#2b2f36"/>
+  <g fill="#e8e6e1">
+    <rect x="12" y="14" width="10" height="36" rx="2"/>
+    <rect x="25" y="14" width="10" height="36" rx="2"/>
+    <rect x="38" y="14" width="10" height="36" rx="2"/>
+  </g>
+  <g fill="#2b2f36">
+    <rect x="19" y="14" width="6" height="22" rx="1.5"/>
+    <rect x="32" y="14" width="6" height="22" rx="1.5"/>
+  </g>
+</svg>
