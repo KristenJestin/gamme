@@ -10,7 +10,7 @@
 //! and a device, so that it is tested without either. [`start`] puts it on the output.
 
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU8, Ordering::Relaxed};
+use std::sync::atomic::{AtomicBool, AtomicU8, Ordering::Relaxed};
 
 use cpal::traits::{DeviceTrait as _, HostTrait as _, StreamTrait as _};
 use rustysynth::{SoundFont, Synthesizer, SynthesizerSettings};
@@ -89,6 +89,8 @@ impl Sink for Synthesizer {
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct Event {
     at_us: u64,
+    /// The note it belongs to: its place in the timeline.
+    note: u32,
     key: u8,
     velocity: u8,
     hand: Hand,
@@ -101,16 +103,19 @@ pub fn events(timeline: &Timeline) -> Arc<[Event]> {
     let mut events: Vec<Event> = timeline
         .notes()
         .iter()
-        .flat_map(|note| {
+        .enumerate()
+        .flat_map(|(id, note)| {
             [
                 Event {
                     at_us: micros(note.on_ms),
+                    note: id as u32,
                     key: note.key,
                     velocity: note.velocity.max(1),
                     hand: note.hand,
                 },
                 Event {
                     at_us: micros(note.off_ms),
+                    note: id as u32,
                     key: note.key,
                     velocity: 0,
                     hand: note.hand,
@@ -138,6 +143,12 @@ pub struct Renderer<S: Sink> {
     /// What is left, in microseconds, of the buffers rendered so far once their whole
     /// microseconds went to the clock: without it a speed that does not divide the rate drifts.
     carry: f64,
+    /// How many times each key was struck and not released yet: a release cuts the sound only
+    /// when the last note on its key ends, and a note the computer did not play has none.
+    held: [u8; 128],
+    /// Which notes were struck by the computer and not ended yet: the end of one the computer
+    /// did not strike (a hand that is the player's) is none of its business. Made here, once.
+    struck: Vec<bool>,
 }
 
 impl<S: Sink> Renderer<S> {
@@ -149,6 +160,11 @@ impl<S: Sink> Renderer<S> {
         sample_rate: u32,
     ) -> Self {
         let seeks = clock.snapshot().seeks;
+        let notes = events
+            .iter()
+            .map(|e| e.note as usize + 1)
+            .max()
+            .unwrap_or(0);
         Self {
             sink,
             events,
@@ -159,6 +175,8 @@ impl<S: Sink> Renderer<S> {
             seeks,
             was_playing: false,
             carry: 0.,
+            held: [0; 128],
+            struck: vec![false; notes],
         }
         .following()
     }
@@ -170,6 +188,12 @@ impl<S: Sink> Renderer<S> {
         self
     }
 
+    fn release_all(&mut self) {
+        self.held = [0; 128];
+        self.struck.fill(false);
+        self.sink.release_all();
+    }
+
     /// Fills `left` and `right` (the same length) with the next frames of sound.
     pub fn render(&mut self, left: &mut [f32], right: &mut [f32]) {
         debug_assert_eq!(left.len(), right.len());
@@ -178,13 +202,13 @@ impl<S: Sink> Renderer<S> {
             // The position jumped: what sounded belongs to the old one.
             self.seeks = snapshot.seeks;
             self.carry = 0.;
-            self.sink.release_all();
+            self.release_all();
             self.next = self
                 .events
                 .partition_point(|event| event.at_us < snapshot.position_us);
         }
         if self.was_playing && !snapshot.playing {
-            self.sink.release_all();
+            self.release_all();
         }
         self.was_playing = snapshot.playing;
 
@@ -208,9 +232,18 @@ impl<S: Sink> Renderer<S> {
                     .render(&mut left[rendered..frame], &mut right[rendered..frame]);
                 rendered = frame;
             }
+            let held = &mut self.held[usize::from(event.key & 127)];
+            let struck = &mut self.struck[event.note as usize];
             if event.velocity == 0 {
-                self.sink.note_off(event.key);
+                if std::mem::take(struck) {
+                    *held = held.saturating_sub(1);
+                    if *held == 0 {
+                        self.sink.note_off(event.key);
+                    }
+                }
             } else if self.hands.plays(event.hand) {
+                *struck = true;
+                *held = held.saturating_add(1);
                 self.sink.note_on(event.key, event.velocity);
             }
             self.next += 1;
@@ -237,6 +270,7 @@ pub fn start(
     timeline: &Timeline,
     clock: &Clock,
     hands: &Hands,
+    lost: &Arc<AtomicBool>,
 ) -> Result<Output, String> {
     let device = cpal::default_host()
         .default_output_device()
@@ -263,9 +297,9 @@ pub fn start(
         sample_rate,
     );
     let stream = match supported.sample_format() {
-        cpal::SampleFormat::F32 => build::<f32>(&device, config, channels, renderer),
-        cpal::SampleFormat::I16 => build::<i16>(&device, config, channels, renderer),
-        cpal::SampleFormat::U16 => build::<u16>(&device, config, channels, renderer),
+        cpal::SampleFormat::F32 => build::<f32>(&device, config, channels, renderer, lost),
+        cpal::SampleFormat::I16 => build::<i16>(&device, config, channels, renderer, lost),
+        cpal::SampleFormat::U16 => build::<u16>(&device, config, channels, renderer, lost),
         other => {
             return Err(format!(
                 "the audio output's sample format ({other}) is not supported"
@@ -284,6 +318,7 @@ fn build<T>(
     config: cpal::StreamConfig,
     channels: usize,
     mut renderer: Renderer<Synthesizer>,
+    lost: &Arc<AtomicBool>,
 ) -> Result<cpal::Stream, cpal::Error>
 where
     T: cpal::SizedSample + cpal::FromSample<f32>,
@@ -291,6 +326,7 @@ where
     // The callback owns its buffers: nothing is made in it.
     let mut left = vec![0f32; MAX_FRAMES];
     let mut right = vec![0f32; MAX_FRAMES];
+    let lost = lost.clone();
     device.build_output_stream::<T, _, _>(
         config,
         move |data, _| {
@@ -311,7 +347,12 @@ where
                 }
             }
         },
-        |error| eprintln!("gamme: audio: {error}"),
+        // The device went (unplugged, a sound server restarted): the player says so and stops
+        // the clock, rather than let the piece run on in silence.
+        move |error| {
+            eprintln!("gamme: audio: {error}");
+            lost.store(true, Relaxed);
+        },
         None,
     )
 }
@@ -460,7 +501,8 @@ mod tests {
         assert_eq!(clock.snapshot().position_us, 100_000);
         clock.play();
         run(&mut renderer, 9, 100);
-        assert_eq!(renderer.sink.calls[2..], [Call::Off(60, 600 + 800)]);
+        // The note was released by the pause: its end, when it comes, cuts nothing again.
+        assert_eq!(renderer.sink.calls[2..], []);
     }
 
     #[test]
@@ -479,6 +521,33 @@ mod tests {
             .filter(|call| matches!(call, Call::On(..)))
             .collect();
         assert_eq!(struck, [&Call::On(48, 0)]);
+    }
+
+    #[test]
+    fn a_key_is_released_only_when_its_last_note_ends() {
+        let (mut renderer, clock, _) = rig(vec![
+            note(60, 0., 300., Hand::Right),
+            note(60, 100., 500., Hand::Left),
+        ]);
+        clock.play();
+        run(&mut renderer, 1, 600);
+        assert_eq!(
+            renderer.sink.calls,
+            [Call::On(60, 0), Call::On(60, 100), Call::Off(60, 500)]
+        );
+    }
+
+    #[test]
+    fn the_end_of_a_note_the_computer_did_not_play_leaves_the_others_alone() {
+        let (mut renderer, clock, hands) = rig(vec![
+            note(60, 0., 300., Hand::Right),
+            note(60, 100., 500., Hand::Left),
+        ]);
+        // Only the left hand is the computer's: the right hand's note 60 ends at 300 ms.
+        hands.set(false, true);
+        clock.play();
+        run(&mut renderer, 1, 600);
+        assert_eq!(renderer.sink.calls, [Call::On(60, 100), Call::Off(60, 500)]);
     }
 
     #[test]

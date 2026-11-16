@@ -35,13 +35,14 @@ pub enum Sound {
 /// What opens the sound once the SoundFont is there; the real one is [`Builtin`].
 pub trait Audio: Send + Sync {
     /// The open output, which must stay alive for as long as the piece may sound. It stays on
-    /// the thread that made it.
+    /// the thread that made it. `lost` is set when the output stops working (a device unplugged).
     fn open(
         &self,
         soundfont: &Path,
         timeline: &Timeline,
         clock: &Clock,
         hands: &Hands,
+        lost: &Arc<AtomicBool>,
     ) -> Result<Box<dyn Any>, String>;
 }
 
@@ -55,11 +56,12 @@ impl Audio for Builtin {
         timeline: &Timeline,
         clock: &Clock,
         hands: &Hands,
+        lost: &Arc<AtomicBool>,
     ) -> Result<Box<dyn Any>, String> {
         let file = File::open(soundfont).map_err(|e| format!("cannot open the SoundFont: {e}"))?;
         let font = RustySoundFont::new(&mut BufReader::new(file))
             .map_err(|e| format!("cannot read the SoundFont: {e}"))?;
-        let output = piano::start(&Arc::new(font), timeline, clock, hands)?;
+        let output = piano::start(&Arc::new(font), timeline, clock, hands, lost)?;
         Ok(Box::new(output))
     }
 }
@@ -68,6 +70,8 @@ struct Shared {
     sound: Mutex<Sound>,
     /// The player pressed play and the clock has not started yet.
     play_when_ready: AtomicBool,
+    /// Set by the output's error callback (an atomic: nothing else is allowed there).
+    device_lost: Arc<AtomicBool>,
     progress: Progress,
 }
 
@@ -104,6 +108,7 @@ impl Player {
             shared: Arc::new(Shared {
                 sound: Mutex::new(Sound::Off),
                 play_when_ready: AtomicBool::new(false),
+                device_lost: Arc::new(AtomicBool::new(false)),
                 progress: Progress::default(),
             }),
             stop: None,
@@ -111,7 +116,14 @@ impl Player {
     }
 
     pub fn sound(&self) -> Sound {
-        self.shared.sound.lock().expect("the sound's lock").clone()
+        let mut sound = self.shared.sound.lock().expect("the sound's lock");
+        if *sound == Sound::Ready && self.shared.device_lost.load(Relaxed) {
+            // The piece would run on in silence: stop it and say why.
+            *sound = Sound::Failed("the audio output was lost".into());
+            self.shared.play_when_ready.store(false, Relaxed);
+            self.clock.pause();
+        }
+        sound.clone()
     }
 
     pub fn progress(&self) -> &Progress {
@@ -128,17 +140,25 @@ impl Player {
     }
 
     pub fn play(&mut self) {
-        match self.sound() {
+        // Looks first, so that a lost output is seen as lost.
+        self.sound();
+        // The state and the wish to play change together, under the lock the thread that makes
+        // the piano ready takes to say it is: a play is never lost between the two.
+        let mut sound = self.shared.sound.lock().expect("the sound's lock");
+        match &*sound {
             Sound::Ready => self.clock.play(),
             Sound::Preparing => self.shared.play_when_ready.store(true, Relaxed),
             Sound::Off | Sound::Failed(_) => {
                 self.shared.play_when_ready.store(true, Relaxed);
+                *sound = Sound::Preparing;
+                drop(sound);
                 self.prepare();
             }
         }
     }
 
     pub fn pause(&mut self) {
+        let _sound = self.shared.sound.lock().expect("the sound's lock");
         self.shared.play_when_ready.store(false, Relaxed);
         self.clock.pause();
     }
@@ -164,16 +184,11 @@ impl Player {
         self.shared.progress.cancel();
     }
 
+    /// Starts the thread that makes the piano ready; the state is `Preparing` already.
     fn prepare(&mut self) {
-        {
-            let mut sound = self.shared.sound.lock().expect("the sound's lock");
-            if *sound == Sound::Preparing {
-                return;
-            }
-            *sound = Sound::Preparing;
-        }
-        // A new job: the last one's cancellation does not apply to it.
+        // A new job: what the last one met does not apply to it.
         self.shared.progress.reset();
+        self.shared.device_lost.store(false, Relaxed);
         let (stop, stopped) = mpsc::channel::<()>();
         self.stop = Some(stop);
         let job = Job {
@@ -229,12 +244,19 @@ impl Job {
         )
         .map_err(|e| e.to_string())
         .and_then(|path| {
-            self.audio
-                .open(&path, &self.timeline, &self.clock, &self.hands)
+            self.audio.open(
+                &path,
+                &self.timeline,
+                &self.clock,
+                &self.hands,
+                &self.shared.device_lost,
+            )
         });
         match opened {
             Ok(output) => {
-                *self.shared.sound.lock().expect("the sound's lock") = Sound::Ready;
+                // Ready and the start of a piece asked for meanwhile, in one go.
+                let mut sound = self.shared.sound.lock().expect("the sound's lock");
+                *sound = Sound::Ready;
                 if self.shared.play_when_ready.swap(false, Relaxed) {
                     self.clock.play();
                 }
@@ -284,7 +306,21 @@ mod tests {
         }
     }
 
-    struct Opened(Mutex<Vec<PathBuf>>);
+    /// An output that records what it was opened on, and keeps the flag it would set when the
+    /// device is lost.
+    struct Opened {
+        paths: Mutex<Vec<PathBuf>>,
+        lost: Mutex<Option<Arc<AtomicBool>>>,
+    }
+
+    impl Opened {
+        fn new() -> Arc<Self> {
+            Arc::new(Self {
+                paths: Mutex::new(Vec::new()),
+                lost: Mutex::new(None),
+            })
+        }
+    }
 
     impl Audio for Opened {
         fn open(
@@ -293,8 +329,10 @@ mod tests {
             _: &Timeline,
             _: &Clock,
             _: &Hands,
+            lost: &Arc<AtomicBool>,
         ) -> Result<Box<dyn Any>, String> {
-            self.0.lock().unwrap().push(path.to_owned());
+            self.paths.lock().unwrap().push(path.to_owned());
+            *self.lost.lock().unwrap() = Some(lost.clone());
             Ok(Box::new(()))
         }
     }
@@ -371,7 +409,7 @@ mod tests {
     fn the_first_play_fetches_the_soundfont_then_sounds() {
         let data = temp("player-first");
         let gate = Arc::new(AtomicBool::new(false));
-        let audio = Arc::new(Opened(Mutex::new(Vec::new())));
+        let audio = Opened::new();
         let mut player = Player::new(
             timeline(),
             data.clone(),
@@ -390,7 +428,10 @@ mod tests {
         gate.store(true, Relaxed);
         until("the piano", || player.sound() == Sound::Ready);
         assert!(player.clock.playing());
-        assert_eq!(*audio.0.lock().unwrap(), [data.join("soundfonts/fake.sf2")]);
+        assert_eq!(
+            *audio.paths.lock().unwrap(),
+            [data.join("soundfonts/fake.sf2")]
+        );
 
         // The second play of the session needs nothing.
         player.pause();
@@ -398,6 +439,44 @@ mod tests {
         player.play();
         assert!(player.clock.playing());
         drop(player);
+        let _ = std::fs::remove_dir_all(data);
+    }
+
+    #[test]
+    fn a_lost_output_stops_the_clock_and_is_said() {
+        let data = temp("player-lost");
+        let audio = Opened::new();
+        let mut player = Player::new(
+            timeline(),
+            data.clone(),
+            font(),
+            Arc::new(Serves(Arc::new(AtomicBool::new(true)))),
+            audio.clone(),
+        );
+        player.play();
+        until("the piano", || player.sound() == Sound::Ready);
+        assert!(player.clock.playing());
+
+        // What the stream's error callback does.
+        audio
+            .lost
+            .lock()
+            .unwrap()
+            .as_ref()
+            .unwrap()
+            .store(true, Relaxed);
+        assert_eq!(
+            player.sound(),
+            Sound::Failed("the audio output was lost".into())
+        );
+        assert!(!player.clock.playing());
+        assert!(!player.wants_to_play());
+
+        // A new play opens the output again.
+        player.play();
+        until("the piano again", || player.sound() == Sound::Ready);
+        assert!(player.clock.playing());
+        assert_eq!(audio.paths.lock().unwrap().len(), 2);
         let _ = std::fs::remove_dir_all(data);
     }
 
@@ -410,7 +489,7 @@ mod tests {
             data.clone(),
             font(),
             Arc::new(Serves(gate.clone())),
-            Arc::new(Opened(Mutex::new(Vec::new()))),
+            Opened::new(),
         );
         player.play();
         player.pause();
@@ -435,14 +514,13 @@ mod tests {
             data.clone(),
             font(),
             gate.clone(),
-            Arc::new(Opened(Mutex::new(Vec::new()))),
+            Opened::new(),
         );
         released.store(true, Relaxed);
         player.play();
         until("the failure", || matches!(player.sound(), Sound::Failed(_)));
         assert!(!player.wants_to_play());
         player.play();
-        assert_eq!(player.sound(), Sound::Preparing);
         until("the second failure", || {
             matches!(player.sound(), Sound::Failed(_))
         });
@@ -457,7 +535,7 @@ mod tests {
             temp("player-seek"),
             font(),
             Arc::new(Serves(Arc::new(AtomicBool::new(true)))),
-            Arc::new(Opened(Mutex::new(Vec::new()))),
+            Opened::new(),
         );
         assert!(player.seek_measure(1));
         assert_eq!(player.clock.snapshot().position_us, 2_000_000);
