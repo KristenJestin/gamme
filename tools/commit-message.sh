@@ -10,6 +10,7 @@ TYPES='feat|fix|refactor|test|docs|chore|build|ci|perf'
 AGENTS="$(dirname "${BASH_SOURCE[0]}")/../AGENTS.md"
 SCOPES=$(awk '/^- Scopes:/ {on=1; print; next} on && /^  / {print; next} {on=0}' "$AGENTS" | grep -o '`[a-z0-9-]*`' | tr -d '`' | paste -sd'|')
 [ -n "$SCOPES" ] || { echo "no scopes found in $AGENTS (its \"- Scopes:\" line)" >&2; exit 1; }
+SQUASHED='^(.*) \(#[0-9]+\)$'
 PATTERN="^($TYPES)\(($SCOPES)\)!?: ([^A-Z.]|[^A-Z].*[^.])$"
 
 check() { # <subject> <where>
@@ -19,7 +20,10 @@ check() { # <subject> <where>
     echo "$where: \"$subject\" is not <type>(<scope>): <subject> (types: ${TYPES//|/, }; scopes: ${SCOPES//|/, }; scope required; lowercase start; no final period)" >&2
     return 1
   fi
-  if [ "${#subject}" -gt 72 ]; then
+  # GitHub adds ` (#n)` to a squashed pull request's title: the title was judged without it.
+  local bare=$subject
+  [[ $bare =~ $SQUASHED ]] && bare=${BASH_REMATCH[1]}
+  if [ "${#bare}" -gt 72 ]; then
     echo "$where: subject is ${#subject} characters, 72 at most" >&2
     return 1
   fi

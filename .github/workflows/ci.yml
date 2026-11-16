@@ -69,6 +69,8 @@ jobs:
           rustup default "$RUST_TOOLCHAIN"
       - uses: Swatinem/rust-cache@v2
         with:
+          # Saved even when a check fails: otherwise a red run throws Verovio's 35 minutes away.
+          cache-on-failure: true
           # The key does not follow Cargo.toml: bump this one when a profile changes, or the
           # cache keeps the artefacts of the old profiles and never saves the new ones.
           # Verovio's C++ (`verovio-sys`) takes ~35 minutes to compile: this cache is what keeps
@@ -166,6 +168,7 @@ jobs:
       - if: steps.version.outputs.skip != 'true'
         uses: Swatinem/rust-cache@v2
         with:
+          cache-on-failure: true
           prefix-key: v1-rust-release
       - name: Build
         if: steps.version.outputs.skip != 'true'
