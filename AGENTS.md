@@ -46,20 +46,26 @@ The last three are CI's `verify` job (`.github/workflows/ci.yml`), on Rust 1.95,
 
 | File | What it is |
 |---|---|
-| `main.rs` | The entry: arguments (`--help`, `--version`, `update`, a piece), the window and its theme |
+| `main.rs` | The entry: arguments (`--help`, `--version`, `update`, `play`, a piece), the window and its theme |
 | `home.rs` | The home screen: the library's pieces, import (picker, drop) and removal |
 | `library.rs` | The library in `$XDG_DATA_HOME/gamme/library`: import, list, remove |
 | `piece_file.rs` | What an imported file is: MusicXML, MEI or MIDI, its title and composer, why it is refused |
 | `icons.rs` | The icons Gamme adds to the kit's (Lucide) |
 | `update.rs` | `gamme update`: the channel's latest build, its sum checked, the binary replaced |
 | `desktop.rs` | The launcher entry and the icon, written by `update` as `install.sh` writes them |
-| `paths.rs` | `$XDG_STATE_HOME/gamme`, `$XDG_CACHE_HOME/gamme`, `$XDG_DATA_HOME` and the library's folder |
+| `paths.rs` | `$XDG_STATE_HOME/gamme`, `$XDG_CACHE_HOME/gamme`, `$XDG_DATA_HOME`, `$XDG_DATA_HOME/gamme` and the library's folder |
 | `theme.rs` | Gamme's palette, "Nocturne", light and dark, on the kit's tokens |
 | `appearance.rs` | Omarchy's colours or Gamme's: the choice, kept in the state folder, and its control |
 | `engraver.rs` | The one Verovio toolkit of the process, on its own thread; its resources unpacked once into the cache |
 | `score.rs` | A piece engraved: its pages, where its measures and notes sit, the cursor at each moment |
 | `raster.rs` | The pages rasterized (resvg), off the main thread |
 | `score_view.rs` | The score on screen, the cursor and the sounding notes drawn over it every frame; the `Playhead` the clock feeds |
+| `timeline.rs` | The notes of a piece in time, per hand, and where its measures start (read from a MIDI file) |
+| `clock.rs` | The play position shared with the audio thread (atomics): play, pause, seek, speed |
+| `soundfont.rs` | The SoundFonts of the built-in piano and their resumable, checked download |
+| `piano.rs` | The built-in piano: the audio callback's logic (`Renderer`) and the `cpal` output |
+| `player.rs` | A piece being played: timeline, clock, and the piano made ready on its own thread |
+| `transport.rs` | The transport view (play, seek by measure, speed, SoundFont progress) |
 
 Besides `src/`:
 
@@ -92,8 +98,12 @@ Besides `src/`:
   version of one of them is a defect: when something is missing, it is added to the kit (or to a
   module of `src/` that says it is waiting to be, as Rature's `kit.rs`), never drawn by hand.
 - **Slow work stays off the main thread**; the main thread only puts the result in place.
+- **The audio callback never blocks, locks or allocates** (`piano.rs`): it talks to the window
+  through atomics (`clock.rs`) and owns its buffers.
 - **Gamme's state goes only to `$XDG_STATE_HOME/gamme`**, the folder `0700`, its files `0600`.
   The library of pieces is data, not state: `$XDG_DATA_HOME/gamme/library`.
+  What it downloads or keeps (the library, the SoundFonts) goes only to `$XDG_DATA_HOME/gamme`,
+  with the same modes; its configuration to `$XDG_CONFIG_HOME/gamme`.
 - **Linux only.**
 - Code, identifiers, comments and docs are in English. Rust 2024. A comment says why, not what.
 - Touch only what the task needs; match the existing style.

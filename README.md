@@ -48,6 +48,22 @@ The first piece opened unpacks Verovio's music fonts (about 12 MB) into `$XDG_CA
 Releases, channels, `install.sh` and `gamme update` are described in
 [`docs/releases.md`](docs/releases.md).
 
+## The built-in piano
+
+Gamme plays the piece itself, with a SoundFont synthesizer on the default audio output. The
+SoundFont is **not bundled**: it is downloaded the first time you play, into
+`$XDG_DATA_HOME/gamme/soundfonts` (`~/.local/share/gamme/soundfonts`), with its progress shown. The
+download is resumable (HTTP `Range` on a `.part` file, using your `curl`), and checked by its size
+and SHA-256 before anything is unpacked.
+
+| Piano | Download | On disk | Licence |
+|---|---|---|---|
+| Upright piano, small (the default) | 5.8 MiB (`.7z`) | 9 MiB | CC0 1.0 |
+| Concert grand (Salamander Grand Piano) | 296 MiB (`.tar.xz`, unpacked by your `tar`) | 1.2 GiB, all of it in memory once played | CC BY 3.0 |
+
+Until the play screen exists, `gamme play <piece.mid> [--piano small|grand]` plays a MIDI file
+with the transport (play, pause, seek by measure, speed 25–100 %).
+
 ## Brand
 
 **The mark is a pixel note**, an 8-bit eighth note on a grid of 7 by 8 cells, crisp down to 16
@@ -88,4 +104,7 @@ whose C++ takes about 35 minutes to compile the first time. `AGENTS.md` says how
 ## Licence
 
 AGPL-3.0-only (see `LICENSE`). The bundled Geist and Geist Mono fonts, from the design system,
-are under the SIL Open Font License (`assets/fonts/OFL.txt`). Verovio is LGPL-3.0-or-later.
+are under the SIL Open Font License (`assets/fonts/OFL.txt`). Verovio is LGPL-3.0-or-later. The
+SoundFonts are downloaded, not distributed with Gamme: the small upright is the FreePats project's
+*Upright Piano KW* (CC0 1.0), the concert grand is Alexander Holm's *Salamander Grand Piano*,
+packed by FreePats (CC BY 3.0: credit to Alexander Holm).
