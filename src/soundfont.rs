@@ -5,11 +5,17 @@
 //! holds, is checked (size, then SHA-256) before anything is unpacked, and a corrupt file is
 //! thrown away and fetched once more from the start. The network is behind [`Fetcher`] (the real
 //! one runs the user's `curl`, as `update.rs` does), so the logic is tested with a fake.
+//!
+//! The folders are `0700` and the files `0600`, and an install holds a lock on a file of its own,
+//! so that two Gammes never resume the same `.part`. The children it runs (`curl`, `tar`) die
+//! with the thread that started them, and stop when the install is cancelled.
 
 use std::fs::{self, File};
-use std::io::Read as _;
+use std::io::{self, Read as _, Write as _};
+use std::os::unix::fs::{DirBuilderExt as _, OpenOptionsExt as _, PermissionsExt as _};
+use std::os::unix::process::CommandExt as _;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
+use std::process::{Child, Command, ExitStatus, Stdio};
 use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering::Relaxed};
 use std::time::Duration;
 
@@ -88,6 +94,10 @@ impl Font {
 
     fn partial(&self, data: &Path) -> PathBuf {
         Self::folder(data).join(format!("{}.part", self.id))
+    }
+
+    fn unpacked(&self, data: &Path) -> PathBuf {
+        Self::folder(data).join(format!("{}.unpack", self.id))
     }
 
     /// Whether the SoundFont is there, whole.
@@ -195,13 +205,101 @@ pub trait Fetcher: Send + Sync {
 }
 
 /// The user's `curl`, as `update.rs` uses it: `-C -` continues a file, by `Range`.
-pub struct Curl;
+pub struct Curl {
+    /// What `--proto` and `--proto-redir` allow: only HTTPS, outside the tests.
+    protocols: &'static str,
+    /// Tests: a folder that stands for the home, so that the user's `~/.curlrc` and proxy
+    /// variables do not reach `curl`.
+    isolated: Option<PathBuf>,
+}
+
+impl Curl {
+    pub fn new() -> Self {
+        Self {
+            protocols: "=https",
+            isolated: None,
+        }
+    }
+}
+
+impl Default for Curl {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// Makes `command`'s child die when the thread that starts it does (the app closing, a crash):
+/// a download or an unpacking must not outlive Gamme.
+fn die_with_parent(command: &mut Command) {
+    // SAFETY: `prctl` is async-signal-safe and touches no memory of this process.
+    unsafe {
+        command.pre_exec(|| {
+            if libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGKILL) == -1 {
+                return Err(io::Error::last_os_error());
+            }
+            Ok(())
+        });
+    }
+}
+
+/// Waits for `child`, a hundred milliseconds at a time: it is killed when the install is
+/// cancelled, and when it cannot be waited for. `partial` is a file whose growth is the
+/// progress.
+fn wait(
+    child: &mut Child,
+    progress: &Progress,
+    partial: Option<&Path>,
+) -> Result<ExitStatus, Error> {
+    loop {
+        if let Some(partial) = partial {
+            progress.set_downloaded(fs::metadata(partial).map_or(0, |meta| meta.len()));
+        }
+        if progress.cancelled() {
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err(Error::Cancelled);
+        }
+        match child.try_wait() {
+            Ok(Some(status)) => return Ok(status),
+            Ok(None) => std::thread::sleep(Duration::from_millis(100)),
+            Err(error) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err(error.into());
+            }
+        }
+    }
+}
+
+/// What the child wrote on its error output.
+fn said_by(child: &mut Child) -> String {
+    let mut message = String::new();
+    if let Some(mut stderr) = child.stderr.take() {
+        let _ = stderr.read_to_string(&mut message);
+    }
+    let lines: Vec<_> = message
+        .lines()
+        .map(str::trim)
+        .filter(|l| !l.is_empty())
+        .collect();
+    lines.join(" / ").chars().take(300).collect()
+}
 
 impl Fetcher for Curl {
     fn fetch(&self, url: &str, partial: &Path, progress: &Progress) -> Result<(), Error> {
         for attempt in 0..2 {
-            let mut child = Command::new("curl")
+            let mut command = Command::new("curl");
+            if let Some(home) = &self.isolated {
+                command
+                    .arg("-q")
+                    .env("HOME", home)
+                    .env("CURL_HOME", home)
+                    .env("NO_PROXY", "*")
+                    .env("no_proxy", "*");
+            }
+            command
                 .args(["--silent", "--show-error", "--location", "--fail"])
+                .args(["--proto", self.protocols, "--proto-redir", self.protocols])
                 .args([
                     "--connect-timeout",
                     "20",
@@ -217,21 +315,12 @@ impl Fetcher for Curl {
                 .args(["--", url])
                 .stdin(Stdio::null())
                 .stdout(Stdio::null())
-                .stderr(Stdio::piped())
+                .stderr(Stdio::piped());
+            die_with_parent(&mut command);
+            let mut child = command
                 .spawn()
                 .map_err(|e| failed(format!("cannot run curl: {e}")))?;
-            let status = loop {
-                progress.set_downloaded(fs::metadata(partial).map_or(0, |meta| meta.len()));
-                if progress.cancelled() {
-                    let _ = child.kill();
-                    let _ = child.wait();
-                    return Err(Error::Cancelled);
-                }
-                match child.try_wait()? {
-                    Some(status) => break status,
-                    None => std::thread::sleep(Duration::from_millis(100)),
-                }
-            };
+            let status = wait(&mut child, progress, Some(partial))?;
             progress.set_downloaded(fs::metadata(partial).map_or(0, |meta| meta.len()));
             if status.success() {
                 return Ok(());
@@ -241,13 +330,14 @@ impl Fetcher for Curl {
                 let _ = fs::remove_file(partial);
                 continue;
             }
-            let mut message = String::new();
-            if let Some(mut stderr) = child.stderr.take() {
-                let _ = stderr.read_to_string(&mut message);
-            }
+            let message = said_by(&mut child);
             return Err(failed(format!(
                 "cannot download {url}: {}",
-                message.trim().lines().last().unwrap_or("curl failed")
+                if message.is_empty() {
+                    "curl failed"
+                } else {
+                    &message
+                }
             )));
         }
         unreachable!("the second attempt returns");
@@ -284,7 +374,28 @@ pub fn install(
     progress: &Progress,
 ) -> Result<PathBuf, Error> {
     let target = font.path(data);
+    let folder = Font::folder(data);
+    // 0700, as everything Gamme keeps.
+    fs::DirBuilder::new()
+        .recursive(true)
+        .mode(0o700)
+        .create(&folder)?;
+    // One install of a font at a time, across processes: the lock goes when the file closes.
+    let lock = private_file(&folder.join(format!("{}.lock", font.id)))?;
+    match lock.try_lock() {
+        Ok(()) => {}
+        Err(fs::TryLockError::WouldBlock) => {
+            return Err(failed(format!(
+                "the {} is already being downloaded by another Gamme",
+                font.name
+            )));
+        }
+        Err(fs::TryLockError::Error(error)) => return Err(error.into()),
+    }
     if font.installed(data) {
+        // What an earlier install left beside it is of no use.
+        let _ = fs::remove_file(font.partial(data));
+        let _ = fs::remove_dir_all(font.unpacked(data));
         progress.set_stage(Stage::Ready);
         return Ok(target);
     }
@@ -303,8 +414,6 @@ fn install_inner(
     fetcher: &dyn Fetcher,
     progress: &Progress,
 ) -> Result<PathBuf, Error> {
-    let folder = Font::folder(data);
-    fs::create_dir_all(&folder)?;
     let (target, partial) = (font.path(data), font.partial(data));
     progress.total.store(font.archive_bytes, Relaxed);
 
@@ -313,6 +422,8 @@ fn install_inner(
         fs::remove_file(&partial)?;
     }
     for attempt in 0..2 {
+        // The part is made here, `0600`, rather than by the fetcher with the umask's modes.
+        private_file(&partial)?;
         let have = fs::metadata(&partial).map_or(0, |meta| meta.len());
         progress.set_downloaded(have);
         if have < font.archive_bytes {
@@ -337,18 +448,22 @@ fn install_inner(
     }
 
     progress.set_stage(Stage::Unpacking);
-    let unpacked = folder.join(format!("{}.unpack", font.id));
+    let unpacked = font.unpacked(data);
     let _ = fs::remove_dir_all(&unpacked);
-    fs::create_dir_all(&unpacked)?;
-    let result = unpack(font, &partial, &unpacked).and_then(|()| {
-        let member = unpacked.join(font.member);
-        if fs::metadata(&member).map_or(0, |meta| meta.len()) != font.bytes {
+    fs::DirBuilder::new().mode(0o700).create(&unpacked)?;
+    let result = unpack(font, &partial, &unpacked, progress).and_then(|member| {
+        // Only a plain file of the right size, whatever the archive held (a link, say).
+        let is_font = fs::symlink_metadata(&member)
+            .is_ok_and(|meta| meta.is_file() && meta.len() == font.bytes);
+        if !is_font {
             return Err(failed(format!(
                 "the {} archive is not what was expected",
                 font.name
             )));
         }
-        // The rename is what makes the font "installed": never half of one under its name.
+        fs::set_permissions(&member, fs::Permissions::from_mode(0o600))?;
+        // On disk before it has its name: never half of a font under it, even after a crash.
+        File::open(&member)?.sync_all()?;
         fs::rename(&member, &target)?;
         Ok(())
     });
@@ -358,32 +473,89 @@ fn install_inner(
     Ok(target)
 }
 
-fn unpack(font: &Font, archive: &Path, into: &Path) -> Result<(), Error> {
+/// A file of this program's own, `0600`, made if it is not there.
+fn private_file(path: &Path) -> io::Result<File> {
+    fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .mode(0o600)
+        .open(path)
+}
+
+/// Takes the font out of `archive` into `into`, and nothing else; the path it is at.
+fn unpack(font: &Font, archive: &Path, into: &Path, progress: &Progress) -> Result<PathBuf, Error> {
     match font.archive {
-        Archive::SevenZip => sevenz_rust2::decompress_file(archive, into)
-            .map_err(|e| failed(format!("cannot unpack {}: {e}", font.name))),
+        Archive::SevenZip => {
+            // A fixed name, never the archive's, and never more bytes than the font has.
+            let out = into.join("font.sf2");
+            let mut found = false;
+            let mut cancelled = false;
+            let result =
+                sevenz_rust2::decompress_file_with_extract_fn(archive, into, |entry, reader, _| {
+                    if entry.is_directory() || entry.name() != font.member {
+                        return Ok(true);
+                    }
+                    let mut file = private_file(&out)?;
+                    let mut buffer = vec![0; 1 << 20];
+                    let mut copied = 0u64;
+                    loop {
+                        if progress.cancelled() {
+                            cancelled = true;
+                            return Err(io::Error::other("cancelled").into());
+                        }
+                        let read = reader.read(&mut buffer)?;
+                        if read == 0 {
+                            break;
+                        }
+                        copied += read as u64;
+                        if copied > font.bytes {
+                            return Err(io::Error::other("the font is bigger than expected").into());
+                        }
+                        file.write_all(&buffer[..read])?;
+                    }
+                    found = true;
+                    Ok(false)
+                });
+            if cancelled {
+                return Err(Error::Cancelled);
+            }
+            result.map_err(|e| failed(format!("cannot unpack {}: {e}", font.name)))?;
+            if !found {
+                return Err(failed(format!("the {} archive holds no font", font.name)));
+            }
+            Ok(out)
+        }
         Archive::Tar => {
-            let status = Command::new("tar")
-                .arg("-xf")
+            let mut command = Command::new("tar");
+            command
+                .args(["--no-same-owner", "-xf"])
                 .arg(archive)
                 .arg("-C")
                 .arg(into)
                 .arg(font.member)
                 .stdin(Stdio::null())
-                .status()
+                .stdout(Stdio::null())
+                .stderr(Stdio::piped());
+            die_with_parent(&mut command);
+            let mut child = command
+                .spawn()
                 .map_err(|e| failed(format!("cannot run tar: {e}")))?;
-            if status.success() {
-                Ok(())
-            } else {
-                Err(failed(format!("cannot unpack {} (tar failed)", font.name)))
+            let status = wait(&mut child, progress, None)?;
+            if !status.success() {
+                return Err(failed(format!(
+                    "cannot unpack {}: tar says {}",
+                    font.name,
+                    said_by(&mut child)
+                )));
             }
+            Ok(into.join(font.member))
         }
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use std::io::{BufRead as _, BufReader, Write as _};
+    use std::io::{BufRead as _, BufReader};
     use std::net::TcpListener;
     use std::sync::Mutex;
 
@@ -535,11 +707,13 @@ mod tests {
         assert_eq!(progress.stage(), Stage::Ready);
         assert_eq!(progress.bytes().0, progress.bytes().1);
         // Nothing is left beside it.
-        let left: Vec<_> = fs::read_dir(data.join("soundfonts"))
+        // The lock file stays: it costs nothing and is what keeps two installs apart.
+        let mut left: Vec<_> = fs::read_dir(data.join("soundfonts"))
             .unwrap()
             .map(|e| e.unwrap().file_name())
             .collect();
-        assert_eq!(left, ["fake.sf2"]);
+        left.sort();
+        assert_eq!(left, ["fake.lock", "fake.sf2"]);
 
         // The second use does not touch the network.
         let again = Fake::new(Vec::new());
@@ -644,6 +818,98 @@ mod tests {
         assert_eq!(progress.stage(), Stage::Idle);
     }
 
+    #[test]
+    fn two_installs_of_one_font_never_share_a_part() {
+        let temp = Temp::new("lock");
+        let content = vec![3u8; 2000];
+        let archive = tar_of(&temp.0, "fake/fake.sf2", &content);
+        let font = font_of(&archive, &content);
+        let data = temp.0.join("data");
+        fs::create_dir_all(data.join("soundfonts")).unwrap();
+        // Another process, as far as the lock can tell: its own open file.
+        let other = private_file(&data.join("soundfonts/fake.lock")).unwrap();
+        other.lock().unwrap();
+
+        let fake = Fake::new(archive);
+        let error = install(&font, &data, &fake, &Progress::default()).unwrap_err();
+        assert!(matches!(error, Error::Failed(m) if m.contains("another Gamme")));
+        assert!(fake.ranges.lock().unwrap().is_empty());
+        drop(other);
+        install(&font, &data, &fake, &Progress::default()).unwrap();
+    }
+
+    #[test]
+    fn what_is_kept_is_private() {
+        let temp = Temp::new("modes");
+        let content = vec![3u8; 2000];
+        let archive = tar_of(&temp.0, "fake/fake.sf2", &content);
+        let font = font_of(&archive, &content);
+        let data = temp.0.join("data");
+        let path = install(&font, &data, &Fake::new(archive), &Progress::default()).unwrap();
+        let mode = |path: &Path| fs::metadata(path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode(&path), 0o600);
+        assert_eq!(mode(&data), 0o700);
+        assert_eq!(mode(&data.join("soundfonts")), 0o700);
+    }
+
+    #[test]
+    fn what_an_earlier_install_left_is_removed_once_the_font_is_there() {
+        let temp = Temp::new("stale");
+        let content = vec![3u8; 2000];
+        let archive = tar_of(&temp.0, "fake/fake.sf2", &content);
+        let font = font_of(&archive, &content);
+        let data = temp.0.join("data");
+        install(&font, &data, &Fake::new(archive), &Progress::default()).unwrap();
+        let folder = data.join("soundfonts");
+        fs::write(folder.join("fake.part"), b"old").unwrap();
+        fs::create_dir(folder.join("fake.unpack")).unwrap();
+        install(&font, &data, &Fake::new(Vec::new()), &Progress::default()).unwrap();
+        assert!(!folder.join("fake.part").exists());
+        assert!(!folder.join("fake.unpack").exists());
+    }
+
+    #[test]
+    fn a_member_that_is_a_link_is_refused() {
+        let temp = Temp::new("link");
+        let tree = temp.0.join("tree/fake");
+        fs::create_dir_all(&tree).unwrap();
+        fs::write(temp.0.join("secret"), vec![3u8; 2000]).unwrap();
+        std::os::unix::fs::symlink(temp.0.join("secret"), tree.join("fake.sf2")).unwrap();
+        let archive = temp.0.join("link.tar");
+        let status = Command::new("tar")
+            .arg("-cf")
+            .arg(&archive)
+            .arg("-C")
+            .arg(temp.0.join("tree"))
+            .arg("fake/fake.sf2")
+            .status()
+            .unwrap();
+        assert!(status.success());
+        let archive = fs::read(archive).unwrap();
+        // Same size as the real font would have: only its kind is wrong.
+        let font = font_of(&archive, &vec![3u8; 2000]);
+        let data = temp.0.join("data");
+        let error = install(&font, &data, &Fake::new(archive), &Progress::default()).unwrap_err();
+        assert!(matches!(error, Error::Failed(m) if m.contains("not what was expected")));
+        assert!(!font.installed(&data));
+    }
+
+    #[test]
+    fn a_failing_tar_says_why() {
+        let temp = Temp::new("tar-fails");
+        let content = vec![3u8; 2000];
+        let archive = tar_of(&temp.0, "fake/fake.sf2", &content);
+        let mut font = font_of(&archive, &content);
+        // A member the archive does not hold.
+        font.member = "fake/other.sf2";
+        let data = temp.0.join("data");
+        let error = install(&font, &data, &Fake::new(archive), &Progress::default()).unwrap_err();
+        assert!(
+            matches!(&error, Error::Failed(m) if m.contains("tar says") && m.contains("other.sf2")),
+            "{error}"
+        );
+    }
+
     /// A 7z of the same shape as the small piano's (made with `bsdtar --format 7zip`): it holds
     /// `fake/fake.sf2`, "RIFF 7z stand-in".
     const SEVEN_ZIP: &[u8] = include_bytes!("../tests/fixtures/fake.7z");
@@ -663,6 +929,23 @@ mod tests {
         )
         .unwrap();
         assert_eq!(fs::read(path).unwrap(), content);
+    }
+
+    #[test]
+    fn a_7z_member_bigger_than_the_font_is_refused() {
+        let temp = Temp::new("7z-big");
+        let mut font = font_of(SEVEN_ZIP, b"RIFF");
+        font.archive = Archive::SevenZip;
+        let data = temp.0.join("data");
+        let error = install(
+            &font,
+            &data,
+            &Fake::new(SEVEN_ZIP.to_vec()),
+            &Progress::default(),
+        )
+        .unwrap_err();
+        assert!(matches!(error, Error::Failed(m) if m.contains("bigger than expected")));
+        assert!(!font.installed(&data));
     }
 
     /// The real `Curl` against a server on the loopback that takes ranges.
@@ -720,7 +1003,12 @@ mod tests {
         let partial = temp.0.join("body.part");
         fs::write(&partial, &body[..50_000]).unwrap();
         let progress = Progress::default();
-        Curl.fetch(
+        // Neither the user's `~/.curlrc` nor their proxy variables reach this one.
+        let curl = Curl {
+            protocols: "=http",
+            isolated: Some(temp.0.clone()),
+        };
+        curl.fetch(
             &format!("http://127.0.0.1:{port}/body"),
             &partial,
             &progress,

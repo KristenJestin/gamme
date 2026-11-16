@@ -113,7 +113,7 @@ fn play_command(args: Vec<String>) -> std::process::ExitCode {
         timeline,
         data,
         font,
-        Arc::new(soundfont::Curl),
+        Arc::new(soundfont::Curl::new()),
         Arc::new(player::Builtin),
     );
     window(Screen::Play(title, Box::new(player)));
