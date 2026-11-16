@@ -194,19 +194,23 @@ stable by the release workflow; `install.sh` and `gamme update`. See
 
 ## 10. Milestones
 
-The plan is cut into GitHub milestones; each ends on something the maintainer can use, accepted on
-his machine.
+The plan is cut into GitHub milestones. Each is a real version: several issues, released together,
+and accepted when the maintainer does on his machine what its line below says.
 
-1. **v0.1 - Foundation**: the maintainer imports a MusicXML piece, sees it engraved and falling,
-   plays it with his MIDI keyboard hands separately, with wait, slowed and looped, hearing the
-   built-in piano or his own; installed by `install.sh` and updated by `gamme update`. The brand
-   is chosen.
-2. **v0.2 - Game**: the same piece played as a game: judged notes, combo and score, an end screen
-   that sends him to the measures he missed, stars, progress kept.
-3. **v0.3 - Method**: the practice ladder and the fading aid (§4); fingerings.
-4. **v0.4 - Pieces**: pieces by level from the first launch (§7).
-5. **v0.5 - Reading**: note-reading exercises, a daily goal and a streak. An idea, nothing
-   decided.
+1. **v0.1 - First notes** (#1 releases, #10 library, #11 score, #12 falling notes, #13 clock and
+   built-in piano, #14 MIDI in, #15 hands, wait and loop, #16 MIDI out and settings, #8 brand):
+   he installs Gamme with `install.sh`, imports a MusicXML piece, sees it engraved and falling,
+   plays the right hand at 50 % with wait on his MIDI keyboard, loops measures 5–8, and hears the
+   built-in piano or his own.
+2. **v0.2 - Game** (#17 judge and latency, #18 live judgements, #19 end of run, #20 stars and
+   progress): every note judged as he plays, combo and score, an end screen that names the
+   measures he missed and reworks them in one click, stars and best scores kept after a restart.
+3. **v0.3 - Method** (#21 passages, #22 ladder, #23 fading aid, #5 fingerings, #24 help): a new
+   piece led up the ladder of its first passage to 100 %, the falling notes fading as he masters
+   it, fingerings read, and on reopening he is told where he stands.
+4. **v0.4 - Pieces and reading** (#25 PDMX research, #26 pieces by level, #27 note reading, #28
+   daily goal): pieces by level at the first launch, a note-reading exercise, a daily goal and a
+   streak. #27 and #28 are ideas, designed with him before any code.
 
 **Feedback**, beside them: the maintainer's feedback, bugs and ideas, tied to no version.
 
