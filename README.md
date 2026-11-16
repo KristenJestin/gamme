@@ -35,10 +35,15 @@ Vulkan loader with a driver.
 
 ```
 gamme --version            # the version, the channel and the commit
+gamme piece.musicxml       # engraves a piece and shows it (until the library opens pieces)
+gamme piece.mxl --at 30 --play   # its cursor from 0:30, moving at the piece's tempo
 gamme update               # the latest build of the channel you are on
 gamme update --channel beta
 gamme update --channel alpha --branch feat/2-play
 ```
+
+The first piece opened unpacks Verovio's music fonts (about 12 MB) into `$XDG_CACHE_HOME/gamme`
+(`~/.cache/gamme`), once.
 
 Releases, channels, `install.sh` and `gamme update` are described in
 [`docs/releases.md`](docs/releases.md).

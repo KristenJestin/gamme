@@ -1,20 +1,27 @@
 mod appearance;
 mod desktop;
+mod engraver;
 mod home;
 mod icons;
 mod library;
 mod paths;
 mod piece_file;
+mod raster;
+mod score;
+mod score_view;
 mod theme;
 mod update;
 
 use gpui_kit::*;
 
 const USAGE: &str = "usage: gamme
+       gamme <piece> [--at <seconds>] [--play]
        gamme update [--channel stable|beta|alpha] [--branch <name>] [--version X.Y.Z[-pre]] [--force]
        gamme --version
 
 Learn the piano: the score at the centre, falling notes as a help that fades with mastery.
+`gamme <piece>` engraves a MusicXML or MEI piece and shows it, its cursor at --at, moving at the
+piece's tempo with --play (until the library opens pieces).
 `gamme update` replaces this binary with the channel's latest build (`gamme update --help`).";
 
 /// What `--version` prints: the version, the channel and the commit (`build.rs`).
@@ -24,6 +31,7 @@ fn version() -> String {
 
 fn main() -> std::process::ExitCode {
     let mut args = std::env::args().skip(1);
+    let mut opening = None;
     match args.next().as_deref() {
         None => {}
         Some("-h" | "--help") => {
@@ -35,12 +43,21 @@ fn main() -> std::process::ExitCode {
             return std::process::ExitCode::SUCCESS;
         }
         Some("update") => return update_command(args.collect()),
+        Some(piece) if !piece.starts_with('-') => {
+            match score_view::Opening::parse(piece.to_owned(), args) {
+                Ok(piece) => opening = Some(piece),
+                Err(error) => {
+                    eprintln!("gamme: {error}");
+                    return std::process::ExitCode::from(2);
+                }
+            }
+        }
         Some(other) => {
             eprintln!("gamme: unknown argument {other} (see gamme --help)");
             return std::process::ExitCode::from(2);
         }
     }
-    window();
+    window(opening);
     std::process::ExitCode::SUCCESS
 }
 
@@ -62,7 +79,7 @@ fn update_command(args: Vec<String>) -> std::process::ExitCode {
     })
 }
 
-fn window() {
+fn window(opening: Option<score_view::Opening>) {
     gpui_kit::application()
         .with_assets(icons::Assets)
         .run(|cx| {
@@ -83,7 +100,15 @@ fn window() {
                 icon: Some(desktop::window_icon()),
                 ..Default::default()
             };
-            let opened = gpui_kit::open_window(options, cx, |_, cx| cx.new(home::Home::new));
+            let opened = match opening {
+                Some(opening) => gpui_kit::open_window(options, cx, |window, cx| {
+                    cx.new(|cx| score_view::ScoreView::new(opening, window, cx))
+                })
+                .map(drop),
+                None => {
+                    gpui_kit::open_window(options, cx, |_, cx| cx.new(home::Home::new)).map(drop)
+                }
+            };
             if let Err(error) = opened {
                 eprintln!("gamme: the window cannot open: {error}");
                 cx.quit();

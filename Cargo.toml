@@ -13,7 +13,8 @@ publish = false
 [dependencies]
 gpui-design-system = { git = "https://github.com/KristenJestin/gpui-design-system", tag = "v0.1.0" }
 gpui-kit = { version = "=0.8.0", default-features = false, features = ["assets", "gpui-fast"] }
-# Already built for GPUI, which takes the window icon as one of its images; only the PNG decoder.
+# Already built for GPUI, which takes the window icon as one of its images, and the frames of
+# GPUI's images (the score's pages); only the PNG decoder.
 image = { version = "0.25.10", default-features = false, features = ["png"] }
 # The library reads what it imports: MIDI files (`midly`), MusicXML and MEI (`roxmltree`) and
 # the zip of a compressed MusicXML (`zip`, inflate only).
@@ -24,10 +25,16 @@ serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.154"
 sha2 = "0.11.1"
 # Engraves the score. Its C++ (`verovio-sys`) takes ~35 min to compile once: CI caches it
-# (docs/releases.md). Not called yet: a dependency, its C++ is built all the same, so the cache
-# and the system packages are settled before the score screen needs it. (`Toolkit::new` unpacks
-# its resources into a new temporary folder it never deletes: never call it per launch.)
+# (docs/releases.md). `verovio::Toolkit::new` unpacks its resources into a new temporary folder
+# it never deletes, and nothing lets them be put elsewhere: `src/engraver.rs` drives the bridge
+# (`verovio-sys`, the same build) itself, with the resources (`verovio-data`) in the cache folder.
+# `verovio` stays for its MIDI reader; never call its `Toolkit::new`.
 verovio = "0.3.6"
+verovio-sys = "=0.3.6"
+verovio-data = "=0.3.6"
+cxx = "1.0"
+# Rasterizes the engraved pages, at GPUI's own version and features: nothing more is built.
+resvg = { version = "0.46.0", default-features = false, features = ["text", "system-fonts", "memmap-fonts", "raster-images"] }
 zip = { version = "9.6.0", default-features = false, features = ["deflate-flate2-zlib-rs"] }
 
 [dev-dependencies]

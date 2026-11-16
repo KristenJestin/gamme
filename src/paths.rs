@@ -20,6 +20,11 @@ pub fn library() -> Option<PathBuf> {
     Some(data_home()?.join("gamme").join("library"))
 }
 
+/// `$XDG_CACHE_HOME/gamme`: what Gamme can make again (Verovio's resources).
+pub fn cache() -> Option<PathBuf> {
+    Some(folder("XDG_CACHE_HOME", ".cache")?.join("gamme"))
+}
+
 /// `$XDG_DATA_HOME`: where the launcher entry and the icon go, beside other programs' own.
 pub fn data_home() -> Option<PathBuf> {
     folder("XDG_DATA_HOME", ".local/share")
