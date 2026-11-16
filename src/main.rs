@@ -1,7 +1,9 @@
 mod desktop;
 mod home;
 mod icons;
+mod library;
 mod paths;
+mod piece_file;
 mod update;
 
 use gpui_kit::*;
