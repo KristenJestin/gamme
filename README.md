@@ -6,9 +6,10 @@ Gamme is a native app for Linux, in Rust on GPUI, to learn the piano with a MIDI
 score stays at the centre; falling notes over a keyboard are an aid that goes away as you master a
 piece, because apps that only show falling notes teach to follow, not to read.
 
-**Status: the skeleton.** What exists today is one window with the shared design system's look
-(it follows the Omarchy theme), a home screen that lists your pieces, and the machinery to
-publish, install and update the app. The play screen, the game layer, the practice method and the
+**Status: first notes.** What exists today is one window with the shared design system's look
+(it follows the Omarchy theme), a home screen that lists your pieces, a play screen that shows a
+piece engraved and falling over a keyboard and plays it with a built-in piano, and the machinery
+to publish, install and update the app. MIDI in, the game layer, the practice method and the
 fingering come next.
 
 ## The library
@@ -16,9 +17,30 @@ fingering come next.
 Import a piece with the **Import** button, or drop the file on the window: MusicXML (`.mxl`,
 `.musicxml`) and MEI are engraved, MIDI (`.mid`, `.midi`) has falling notes only. The file is
 copied, with its title and composer, into `$XDG_DATA_HOME/gamme/library` (`~/.local/share/gamme/library`
-by default). The home screen lists the pieces, the last played first; a piece is removed from the
-"⋯" menu of its row, which leaves the original file alone. A file that is not a score is refused
-with a sentence that says why.
+by default). The home screen lists the pieces, the last played first; a click on one opens it to
+play, and a piece is removed from the "⋯" menu of its row, which leaves the original file alone.
+A file that is not a score is refused with a sentence that says why.
+
+## Playing a piece
+
+The play screen shows the piece in one of three views: **Score and notes** (the default: the
+score, its cursor and the notes that sound, over the falling notes), **Falling notes** and
+**Score**. The views share one clock: changing the view keeps the place. A MIDI piece has no
+score, so it shows the falling notes only.
+
+The notes fall toward the keys that play them, three seconds of the piece ahead, the right hand
+in violet and the left in cyan; a key lights in its hand's colour while the piece plays it.
+Repeats are played through, and the score's cursor goes back with them. The transport under the
+piece plays and pauses, moves by measure and slows the piece down to 25 %. Until the piano is
+ready (its first download), or with no audio output, the piece goes on in silence.
+
+Hands come from the score's staves: the upper staff is the right hand, the lower the left. A MIDI
+file has no staves: its tracks (or the channels of a track) are given a hand by their names, or
+else by their pitch, the higher ones the right hand. **Hands** corrects them, part by part (right,
+left, or both split at the middle C), and the choice is kept with the piece.
+
+Keys: `Space` plays and pauses, `v` changes the view, `←` and `→` move by measure, `+`, `-` and
+`0` zoom the score, `Escape` goes back to the pieces.
 
 ## Install
 
@@ -35,8 +57,8 @@ Vulkan loader with a driver.
 
 ```
 gamme --version            # the version, the channel and the commit
-gamme piece.musicxml       # engraves a piece and shows it (until the library opens pieces)
-gamme piece.mxl --at 30 --play   # its cursor from 0:30, moving at the piece's tempo
+gamme piece.musicxml       # opens a piece without importing it
+gamme piece.mxl --at 30 --play --view falling   # from 0:30, playing, falling notes only
 gamme update               # the latest build of the channel you are on
 gamme update --channel beta
 gamme update --channel alpha --branch feat/2-play
@@ -61,8 +83,7 @@ and SHA-256 before anything is unpacked.
 | Upright piano, small (the default) | 5.8 MiB (`.7z`) | 9 MiB | CC0 1.0 |
 | Concert grand (Salamander Grand Piano) | 296 MiB (`.tar.xz`, unpacked by your `tar`) | 1.2 GiB, all of it in memory once played | CC BY 3.0 |
 
-Until the play screen exists, `gamme play <piece.mid> [--piano small|grand]` plays a MIDI file
-with the transport (play, pause, seek by measure, speed 25–100 %).
+`gamme play <piece> [--piano small|grand]` opens a piece with the piano of your choice.
 
 ## Brand
 

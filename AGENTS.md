@@ -15,9 +15,10 @@ Flottille's.
 **The [README](README.md) is the reference for behaviour**; [`docs/releases.md`](docs/releases.md)
 for versions, CI, releases, install and update. This file is how to work.
 
-Today it is the skeleton: one window, the design system's identity and theme (Omarchy's, followed),
-an empty home screen, and the machinery above. The play screen, the game layer, the method, the
-fingering and the pieces come as issues of their own.
+Today it is one window, the design system's identity and theme (Omarchy's, followed), the home
+screen and its library, the play screen (the score, the falling notes and the built-in piano), and
+the machinery above. The game layer, the method, the fingering and the pieces come as issues of
+their own.
 
 ## Commands
 
@@ -47,8 +48,9 @@ The last three are CI's `verify` job (`.github/workflows/ci.yml`), on Rust 1.95,
 | File | What it is |
 |---|---|
 | `main.rs` | The entry: arguments (`--help`, `--version`, `update`, `play`, a piece), the window and its theme |
-| `home.rs` | The home screen: the library's pieces, import (picker, drop) and removal |
-| `library.rs` | The library in `$XDG_DATA_HOME/gamme/library`: import, list, remove |
+| `screens.rs` | The window's screens and the way between them: home, and a piece played |
+| `home.rs` | The home screen: the library's pieces, import (picker, drop), removal, and opening one |
+| `library.rs` | The library in `$XDG_DATA_HOME/gamme/library`: import, list, remove, mark played, the hands kept per piece |
 | `piece_file.rs` | What an imported file is: MusicXML, MEI or MIDI, its title and composer, why it is refused |
 | `icons.rs` | The icons Gamme adds to the kit's (Lucide) |
 | `update.rs` | `gamme update`: the channel's latest build, its sum checked, the binary replaced |
@@ -56,22 +58,26 @@ The last three are CI's `verify` job (`.github/workflows/ci.yml`), on Rust 1.95,
 | `paths.rs` | `$XDG_STATE_HOME/gamme`, `$XDG_CACHE_HOME/gamme`, `$XDG_DATA_HOME`, `$XDG_DATA_HOME/gamme` and the library's folder |
 | `theme.rs` | Gamme's palette, "Nocturne", light and dark, on the kit's tokens |
 | `appearance.rs` | Omarchy's colours or Gamme's: the choice, kept in the state folder, and its control |
-| `engraver.rs` | The one Verovio toolkit of the process, on its own thread; its resources unpacked once into the cache |
+| `engraver.rs` | The one Verovio toolkit of the process, on its own thread; its resources unpacked once into the cache; a piece's pages, timemap, MIDI and written notes |
 | `score.rs` | A piece engraved: its pages, where its measures and notes sit, the cursor at each moment |
 | `raster.rs` | The pages rasterized (resvg), off the main thread |
-| `score_view.rs` | The score on screen, the cursor and the sounding notes drawn over it every frame; the `Playhead` the clock feeds |
-| `timeline.rs` | The notes of a piece in time, per hand, and where its measures start (read from a MIDI file) |
+| `score_view.rs` | The score as the play screen holds it, the cursor and the sounding notes drawn over it every frame; the `Playhead` the clock feeds |
+| `timeline.rs` | The notes of a piece in time, each with its hand, its measure and its engraved note (from Verovio's MIDI, or a MIDI file's tracks), and where its measures start |
+| `play_screen.rs` | The play screen: a piece opened, its three views (score and falling notes, falling notes, score), the hands of a MIDI piece's parts |
+| `falling.rs` | The falling notes over the keyboard, painted every frame in one canvas |
+| `keyboard.rs` | The on-screen keyboard's keys and places, and the keys lit from outside (MIDI in) |
+| `wall_clock.rs` | The clock moved by the wall clock while no sound moves it (the piano not ready, no output) |
 | `clock.rs` | The play position shared with the audio thread (atomics): play, pause, seek, speed |
 | `soundfont.rs` | The SoundFonts of the built-in piano and their resumable, checked download |
 | `piano.rs` | The built-in piano: the audio callback's logic (`Renderer`) and the `cpal` output |
 | `player.rs` | A piece being played: timeline, clock, and the piano made ready on its own thread |
-| `transport.rs` | The transport view (play, seek by measure, speed, SoundFont progress) |
+| `transport.rs` | The transport bar (play, seek by measure, speed, SoundFont progress); it holds the player |
 
 Besides `src/`:
 
 - `tests/fixtures/`: the small scores the library's tests import (written by hand, free to
-  redistribute): one of each kind, and broken ones; and the pieces the score's tests engrave,
-  written for them (CC0).
+  redistribute): one of each kind, and broken ones; and the pieces the score's and the timeline's tests read (a
+  piece with repeats, a MIDI file of three tracks), written for them (CC0).
 - `build.rs`: the version `gamme --version` prints (`docs/releases.md`, "The version").
 - `assets/brand/`: the mark (the pixel note), alone, in one colour and in the accent.
 - `packaging/linux/`: the desktop entry and the icon (the pixel note on a violet tile, an SVG and
