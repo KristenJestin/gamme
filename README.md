@@ -45,9 +45,31 @@ Releases, channels, `install.sh` and `gamme update` are described in
 
 ## Brand
 
-**The icon is a placeholder** (`packaging/linux/icons/hicolor/scalable/apps/gamme.svg`): the mark,
-the icon and the colours are decided with the owner, and replacing that file is all it takes. The
-window itself takes the design system's palette, or the desktop's.
+**The mark is a pixel note**, an 8-bit eighth note on a grid of 7 by 8 cells, crisp down to 16
+pixels (`assets/brand/mark.svg`, in one colour, and `mark-accent.svg`, its head in the accent).
+The icon is that note on a violet tile (`packaging/linux/icons/`: an SVG and a PNG at 16, 32, 48,
+64, 128, 256 and 512 pixels, each cut from the pixel grid without smoothing; 16 and 48 have grids
+of their own). `python3 tools/brand.py` writes all of them, so they never drift apart.
+
+The colours are **Nocturne**, as a theme of the design system (`src/theme.rs`), light and dark:
+
+| | |
+|---|---|
+| Accent, the primary | `#7C5CFF` violet |
+| Second, the running state | `#20B2C8` cyan |
+| Hit, a note that was played | `#FF7AB6` pink (the kit has no role for it yet) |
+| Paper, the light page | `#F6F5FB` |
+| Night, the dark page | `#13132A` |
+
+On the home screen, **Colours** chooses where the window's colours come from, as it does in the
+other applications on the design system: Gamme (Nocturne, the default, with a **Shade** of its own, light or dark;
+dark until chosen) or Omarchy (the desktop's theme, followed as it changes). Off Omarchy the
+window shows Nocturne whatever is chosen, and the control says why Omarchy is not available. The
+choice applies at once and is kept in `$XDG_STATE_HOME/gamme/appearance.json`. The settings page
+will take the control over.
+
+The style is pixel art everywhere except the score, which stays engraved; the pixel-art
+interface is its own issue.
 
 ## Building
 

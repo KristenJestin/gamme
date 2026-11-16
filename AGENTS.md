@@ -54,18 +54,24 @@ The last three are CI's `verify` job (`.github/workflows/ci.yml`), on Rust 1.95,
 | `update.rs` | `gamme update`: the channel's latest build, its sum checked, the binary replaced |
 | `desktop.rs` | The launcher entry and the icon, written by `update` as `install.sh` writes them |
 | `paths.rs` | `$XDG_STATE_HOME/gamme`, `$XDG_DATA_HOME` and the library's folder |
+| `theme.rs` | Gamme's palette, "Nocturne", light and dark, on the kit's tokens |
+| `appearance.rs` | Omarchy's colours or Gamme's: the choice, kept in the state folder, and its control |
 
 Besides `src/`:
 
 - `tests/fixtures/`: the small scores the library's tests import (written by hand, free to
   redistribute): one of each kind, and broken ones.
 - `build.rs`: the version `gamme --version` prints (`docs/releases.md`, "The version").
-- `packaging/linux/`: the desktop entry and the icon (**a placeholder**: the brand is decided
-  with the owner, never invented by an agent), installed by `install.sh` and packaged by
-  `tools/package.sh`.
+- `assets/brand/`: the mark (the pixel note), alone, in one colour and in the accent.
+- `packaging/linux/`: the desktop entry and the icon (the pixel note on a violet tile, an SVG and
+  a PNG at each size), installed by `install.sh` and packaged by `tools/package.sh`. **The mark,
+  the icon and the palette are the maintainer's decision** (README, "Brand"): an agent never
+  redraws them or picks other colours.
 - `tools/`:
   - `capture.sh`: the window captured into a PNG, in a nested headless Weston; `xkeys.py` types
     keys and clicks into its display;
+  - `brand.py`: writes the mark's SVGs and the icon's SVG and PNGs from one pixel grid; edit the
+    grid there and run `python3 tools/brand.py`, never a generated file;
   - `version.sh`, `changelog.sh`, `package.sh`: the version, the notes and the archive of a
     build (`docs/releases.md`);
   - `test-install.sh`: `install.sh` and `gamme update` run against fake releases from a local

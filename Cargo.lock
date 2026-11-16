@@ -1967,6 +1967,7 @@ version = "0.1.0"
 dependencies = [
  "gpui-design-system",
  "gpui-kit",
+ "image",
  "midly",
  "roxmltree 0.21.2",
  "semver",
