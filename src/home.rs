@@ -15,8 +15,8 @@ use gpui_design_system::{
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
 
-use crate::icons;
 use crate::library::{ImportError, Library, Piece};
+use crate::{appearance, icons};
 
 /// A row of the list: a piece and the menu of its "⋯" button, which keeps its state while the
 /// row stays.
@@ -340,11 +340,13 @@ impl Render for Home {
                     .flex()
                     .flex_col()
                     .gap(space::XL)
-                    .child(PageHeader::new("home-header", "Gamme").below(
-                        div().ui_text().text_color(p.mute).child(
-                            "Learn the piano: the score first, the falling notes as a help.",
-                        ),
-                    ))
+                    .child(
+                        PageHeader::new("home-header", "Gamme")
+                            .below(div().ui_text().text_color(p.mute).child(
+                                "Learn the piano: the score first, the falling notes as a help.",
+                            ))
+                            .below(appearance::control(cx)),
+                    )
                     .child(section)
                     .child(div().flex_1()),
             )

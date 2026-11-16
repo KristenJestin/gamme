@@ -1,9 +1,11 @@
+mod appearance;
 mod desktop;
 mod home;
 mod icons;
 mod library;
 mod paths;
 mod piece_file;
+mod theme;
 mod update;
 
 use gpui_kit::*;
@@ -65,14 +67,20 @@ fn window() {
         .with_assets(icons::Assets)
         .run(|cx| {
             let desktop = gpui_design_system::omarchy::Omarchy::from_system();
-            gpui_design_system::init(
-                gpui_design_system::Identity::new("Gamme").desktop(desktop),
-                cx,
-            );
+            let identity = gpui_design_system::Identity::new("Gamme")
+                .themes([gpui_design_system::Theme::new(
+                    theme::ID,
+                    "Gamme",
+                    theme::nocturne,
+                )])
+                .desktop(desktop);
+            gpui_design_system::init(identity, cx);
+            appearance::restore(cx);
             let bounds = Bounds::centered(None, size(px(1100.), px(760.)), cx);
             let options = WindowOptions {
                 window_bounds: Some(WindowBounds::Windowed(bounds)),
                 app_id: Some("gamme".into()),
+                icon: Some(desktop::window_icon()),
                 ..Default::default()
             };
             let opened = gpui_kit::open_window(options, cx, |_, cx| cx.new(home::Home::new));

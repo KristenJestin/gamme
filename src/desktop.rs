@@ -92,6 +92,15 @@ pub fn write(data_home: &Path, share: &Path, binary: &Path) -> io::Result<()> {
     Ok(())
 }
 
+/// The window's icon: the 256 px PNG of the package, decoded. GPUI uses it on X11 only; on
+/// Wayland the desktop takes the icon from the entry the window's app id names.
+pub fn window_icon() -> std::sync::Arc<image::RgbaImage> {
+    const PNG: &[u8] = include_bytes!("../packaging/linux/icons/hicolor/256x256/apps/gamme.png");
+    let decoded = image::load_from_memory_with_format(PNG, image::ImageFormat::Png)
+        .expect("the icon committed in packaging/linux is a PNG");
+    std::sync::Arc::new(decoded.into_rgba8())
+}
+
 /// Points the entry that is there at `binary`, when it points elsewhere: the binary moved, and
 /// nothing new was unpacked to write it from.
 pub fn follow(data_home: &Path, binary: &Path) -> io::Result<()> {
@@ -111,6 +120,12 @@ pub fn follow(data_home: &Path, binary: &Path) -> io::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_window_icon_is_the_256_px_one() {
+        let icon = window_icon();
+        assert_eq!(icon.dimensions(), (256, 256));
+    }
 
     #[test]
     fn a_plain_path_is_written_as_it_is_and_one_with_a_space_in_quotes() {
