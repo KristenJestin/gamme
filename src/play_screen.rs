@@ -1,0 +1,686 @@
+//! The play screen: a piece played, its score and its falling notes in one of three views, the
+//! transport under them.
+//!
+//! - Views (design §6): the score over the falling notes (the default), the falling notes alone,
+//!   the score alone. A MIDI piece has no score: falling notes only. The views share one clock,
+//!   so switching keeps the position, and the score keeps its pages while it is not shown.
+//! - The piece is engraved and its timeline read off the main thread; the clock (`clock.rs`)
+//!   drives the cursor and the falling notes, the transport (`transport.rs`) drives the clock.
+//! - A MIDI piece's parts can be given other hands ("Hands"): the choice is kept with the piece
+//!   in the library (`library.rs`), and the piece is made again with it, at the same place.
+//! - The first play marks the piece played, so that the home screen lists it first.
+//!
+//! Keys: Space plays and pauses, `v` changes the view, Left and Right move by measure, `+`, `-`
+//! and `0` zoom the score, Escape goes back.
+
+use std::path::{Path, PathBuf};
+use std::sync::Arc;
+use std::time::{Instant, SystemTime, UNIX_EPOCH};
+
+use gpui_design_system::{
+    Button, EmptyLine, Icon, PageHeader, Segmented, Skeleton, Type as _, palette, space,
+};
+use gpui_kit::*;
+
+use crate::clock::Clock;
+use crate::engraver;
+use crate::falling::falling;
+use crate::icons;
+use crate::keyboard::{Keyboard, Lights};
+use crate::library::{Library, Piece};
+use crate::paths;
+use crate::player::{Builtin, Player};
+use crate::score::Score;
+use crate::score_view::{Playhead, ScoreView, timing};
+use crate::soundfont::{self, Font};
+use crate::timeline::{PartHand, Timeline};
+use crate::transport::Transport;
+
+/// What the play screen shows of a piece.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum View {
+    /// The score over the falling notes.
+    Both,
+    Falling,
+    Score,
+}
+
+impl View {
+    const ALL: [View; 3] = [View::Both, View::Falling, View::Score];
+
+    fn index(self) -> usize {
+        Self::ALL.iter().position(|&view| view == self).unwrap_or(0)
+    }
+
+    fn next(self) -> Self {
+        Self::ALL[(self.index() + 1) % Self::ALL.len()]
+    }
+
+    fn parse(word: &str) -> Option<Self> {
+        match word {
+            "both" => Some(View::Both),
+            "falling" => Some(View::Falling),
+            "score" => Some(View::Score),
+            _ => None,
+        }
+    }
+}
+
+/// A piece to open on the play screen.
+#[derive(Clone, Debug)]
+pub struct Opening {
+    pub piece: PathBuf,
+    /// The piece of the library it is, if it is one: its title, its hands, and where it is
+    /// marked played.
+    pub library: Option<(Library, Piece)>,
+    /// Where the clock starts, in ms.
+    pub at: f64,
+    /// Whether it plays at once.
+    pub play: bool,
+    pub view: View,
+    pub font: Font,
+}
+
+impl Opening {
+    /// A file, at its start, in the default view, with the small piano.
+    pub fn file(piece: impl Into<PathBuf>) -> Self {
+        Self {
+            piece: piece.into(),
+            library: None,
+            at: 0.,
+            play: false,
+            view: View::Both,
+            font: soundfont::SMALL_PIANO,
+        }
+    }
+
+    /// A piece of the library.
+    pub fn piece(library: Library, piece: Piece) -> Self {
+        Self {
+            library: Some((library.clone(), piece.clone())),
+            ..Self::file(library.file(&piece))
+        }
+    }
+
+    /// `gamme <piece> [--at <seconds>] [--play] [--view both|falling|score]`.
+    pub fn parse(piece: String, mut args: impl Iterator<Item = String>) -> Result<Self, String> {
+        let mut opening = Self::file(piece);
+        while let Some(arg) = args.next() {
+            match arg.as_str() {
+                "--play" => opening.play = true,
+                "--at" => {
+                    let seconds = args
+                        .next()
+                        .and_then(|s| s.parse::<f64>().ok())
+                        .filter(|s| s.is_finite() && *s >= 0.)
+                        .ok_or("--at takes a number of seconds")?;
+                    opening.at = seconds * 1e3;
+                }
+                "--view" => {
+                    opening.view = args
+                        .next()
+                        .as_deref()
+                        .and_then(View::parse)
+                        .ok_or("--view is both, falling or score")?;
+                }
+                other => return Err(format!("unknown argument {other} (see gamme --help)")),
+            }
+        }
+        Ok(opening)
+    }
+
+    /// Whether the piece has a score: MusicXML and MEI do, MIDI does not.
+    fn engraved(&self) -> bool {
+        match &self.library {
+            Some((_, piece)) => piece.kind.engraved(),
+            None => !self
+                .piece
+                .extension()
+                .and_then(|ext| ext.to_str())
+                .is_some_and(|ext| {
+                    ext.eq_ignore_ascii_case("mid") || ext.eq_ignore_ascii_case("midi")
+                }),
+        }
+    }
+
+    fn title(&self) -> String {
+        match &self.library {
+            Some((_, piece)) => piece.title.clone(),
+            None => self.piece.file_stem().map_or_else(
+                || "Piece".to_owned(),
+                |stem| stem.to_string_lossy().into_owned(),
+            ),
+        }
+    }
+}
+
+/// The play screen asks to go back to the pieces.
+pub struct Back;
+
+/// The clock as the score's playhead.
+struct ClockHead(Clock);
+
+impl Playhead for ClockHead {
+    fn position(&self) -> f64 {
+        self.0.position_ms()
+    }
+
+    fn moving(&self) -> bool {
+        self.0.playing()
+    }
+}
+
+/// What is made off the main thread.
+struct Loaded {
+    score: Option<Arc<Score>>,
+    timeline: Timeline,
+}
+
+/// Engraves the piece and reads its timeline, or reads a MIDI file with the hands kept for it.
+fn load(piece: &Path, engraved: bool, hands: Option<&[PartHand]>) -> Result<Loaded, String> {
+    if engraved {
+        let engraved = engraver::shared().engrave(piece)?;
+        let timeline =
+            Timeline::from_engraved(&engraved.midi, &engraved.events, &engraved.written)?;
+        let score = Score::place(engraved)?;
+        return Ok(Loaded {
+            score: Some(Arc::new(score)),
+            timeline,
+        });
+    }
+    let bytes =
+        std::fs::read(piece).map_err(|e| format!("cannot read {}: {e}", piece.display()))?;
+    let timeline = Timeline::from_smf(&bytes)?;
+    Ok(Loaded {
+        score: None,
+        timeline: match hands {
+            Some(hands) => timeline.with_hands(hands),
+            None => timeline,
+        },
+    })
+}
+
+struct Ready {
+    transport: Entity<Transport>,
+    clock: Clock,
+    timeline: Arc<Timeline>,
+    score: Option<Entity<ScoreView>>,
+    keyboard: Keyboard,
+    _observe: Subscription,
+}
+
+enum State {
+    Loading,
+    Failed(SharedString),
+    Ready(Ready),
+}
+
+pub struct PlayScreen {
+    opening: Opening,
+    title: SharedString,
+    state: State,
+    view: View,
+    /// The keys lit from outside the piece: the ones the player strikes (#14).
+    lights: Lights,
+    /// Whether the piece was marked played in the library.
+    marked: bool,
+    /// Whether the hands of the parts are shown, to be changed.
+    hands_open: bool,
+    focus: FocusHandle,
+}
+
+impl EventEmitter<Back> for PlayScreen {}
+
+impl PlayScreen {
+    pub fn new(opening: Opening, window: &mut Window, cx: &mut Context<Self>) -> Self {
+        let focus = cx.focus_handle();
+        window.focus(&focus, cx);
+        let (piece, engraved) = (opening.piece.clone(), opening.engraved());
+        let hands = opening
+            .library
+            .as_ref()
+            .and_then(|(_, piece)| piece.hands.clone());
+        cx.spawn(async move |this, cx| {
+            let started = Instant::now();
+            let loaded = cx
+                .background_executor()
+                .spawn(async move { load(&piece, engraved, hands.as_deref()) })
+                .await;
+            this.update(cx, |this, cx| {
+                timing(format_args!(
+                    "opened the piece in {} ms",
+                    started.elapsed().as_millis()
+                ));
+                match loaded {
+                    Ok(loaded) => this.ready(loaded, this.opening.at, this.opening.play, cx),
+                    Err(error) => this.state = State::Failed(error.into()),
+                }
+                cx.notify();
+            })
+        })
+        .detach();
+        Self {
+            title: opening.title().into(),
+            view: if engraved {
+                opening.view
+            } else {
+                View::Falling
+            },
+            opening,
+            state: State::Loading,
+            lights: Lights::default(),
+            marked: false,
+            hands_open: false,
+            focus,
+        }
+    }
+
+    /// The keys lit from outside the piece, for MIDI in (#14) to light the keys struck.
+    #[expect(
+        dead_code,
+        reason = "the keys the player strikes come with MIDI in (#14)"
+    )]
+    pub fn lights(&self) -> Lights {
+        self.lights.clone()
+    }
+
+    /// Makes the player of `loaded`, at `at`, playing or not.
+    fn ready(&mut self, loaded: Loaded, at: f64, play: bool, cx: &mut Context<Self>) {
+        let Some(data) = paths::data() else {
+            self.state = State::Failed("Gamme found no home folder to keep its piano in.".into());
+            return;
+        };
+        let names: Vec<SharedString> = loaded.score.as_ref().map_or_else(Vec::new, |score| {
+            score
+                .measures()
+                .iter()
+                .map(|m| SharedString::from(m.name.clone()))
+                .collect()
+        });
+        let keyboard = Keyboard::for_timeline(&loaded.timeline);
+        let player = Player::new(
+            loaded.timeline,
+            data,
+            self.opening.font,
+            Arc::new(soundfont::Curl::new()),
+            Arc::new(Builtin),
+        );
+        let (clock, timeline) = (player.clock.clone(), player.timeline.clone());
+        clock.seek_ms(at);
+        let transport = cx.new(|cx| Transport::new(player, names, cx));
+        let observe = cx.observe(&transport, |_, _, cx| cx.notify());
+        let score = loaded.score.map(|score| {
+            let head = Box::new(ClockHead(clock.clone()));
+            cx.new(|_| ScoreView::new(score, head))
+        });
+        if play {
+            transport.update(cx, |transport, cx| transport.toggle(cx));
+        }
+        self.state = State::Ready(Ready {
+            transport,
+            clock,
+            timeline,
+            score,
+            keyboard,
+            _observe: observe,
+        });
+    }
+
+    fn set_view(&mut self, view: View, cx: &mut Context<Self>) {
+        let State::Ready(ready) = &self.state else {
+            return;
+        };
+        if ready.score.is_none() || view == self.view {
+            return;
+        }
+        self.view = view;
+        if let Some(score) = &ready.score {
+            score.update(cx, |score, cx| score.reveal(cx));
+        }
+        cx.notify();
+    }
+
+    /// Gives part `part` to `hand`: the piece is made again at the same place, paused, and the
+    /// choice kept with the piece.
+    fn set_hand(&mut self, part: usize, hand: PartHand, cx: &mut Context<Self>) {
+        let State::Ready(ready) = &self.state else {
+            return;
+        };
+        let mut hands = ready.timeline.hands();
+        let Some(slot) = hands.get_mut(part) else {
+            return;
+        };
+        *slot = hand;
+        let timeline = ready.timeline.with_hands(&hands);
+        let at = ready.clock.position_ms();
+        ready
+            .transport
+            .update(cx, |transport, _| transport.player().clock.pause());
+        let loaded = Loaded {
+            score: None,
+            timeline,
+        };
+        self.ready(loaded, at, false, cx);
+        if let Some((library, piece)) = &self.opening.library {
+            let (library, id) = (library.clone(), piece.id.clone());
+            cx.background_executor()
+                .spawn(async move {
+                    if let Err(error) = library.set_hands(&id, &hands) {
+                        eprintln!("gamme: the hands were not kept: {error}");
+                    }
+                })
+                .detach();
+        }
+        cx.notify();
+    }
+
+    /// The first time the piece plays, the library hears of it.
+    fn mark_played(&mut self, cx: &mut Context<Self>) {
+        let Some((library, piece)) = &self.opening.library else {
+            return;
+        };
+        self.marked = true;
+        let (library, id) = (library.clone(), piece.id.clone());
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map_or(0, |since| since.as_secs());
+        cx.background_executor()
+            .spawn(async move {
+                if let Err(error) = library.mark_played(&id, now) {
+                    eprintln!("gamme: the piece was not marked played: {error}");
+                }
+            })
+            .detach();
+    }
+
+    fn on_key(&mut self, event: &KeyDownEvent, _: &mut Window, cx: &mut Context<Self>) {
+        let key = event.keystroke.key.as_str();
+        if key == "escape" {
+            cx.emit(Back);
+            return;
+        }
+        let State::Ready(ready) = &self.state else {
+            return;
+        };
+        let transport = ready.transport.clone();
+        let score = ready.score.clone();
+        match key {
+            "space" => transport.update(cx, |transport, cx| transport.toggle(cx)),
+            "left" | "right" => {
+                transport.update(cx, |transport, cx| {
+                    match key {
+                        "left" => transport.previous_measure(),
+                        _ => transport.next_measure(),
+                    }
+                    cx.notify();
+                });
+            }
+            "v" => self.set_view(self.view.next(), cx),
+            _ => {
+                if let Some(score) = score
+                    && self.view != View::Falling
+                {
+                    score.update(cx, |score, cx| score.zoom_key(key, cx));
+                }
+            }
+        }
+    }
+
+    fn header(&self, cx: &mut Context<Self>) -> PageHeader {
+        let p = palette(cx);
+        let this = cx.entity().downgrade();
+        let back = {
+            let this = this.clone();
+            Button::quiet("play-back", "Pieces")
+                .leading(Icon::Previous)
+                .tooltip("Back to the pieces (Escape)")
+                .on_click(move |_, _, cx| {
+                    this.update(cx, |_, cx| cx.emit(Back)).ok();
+                })
+        };
+        let file = self
+            .opening
+            .piece
+            .file_name()
+            .map(|name| name.to_string_lossy().into_owned())
+            .unwrap_or_default();
+        // In a row of its own, the button keeps its size rather than the header's width.
+        let mut header = PageHeader::new("play-header", self.title.clone())
+            .crumb(div().flex().child(back))
+            .path(file);
+        let status = match &self.state {
+            State::Loading if self.opening.engraved() => "Engraving…",
+            State::Loading => "Reading…",
+            State::Failed(_) => "Not opened",
+            State::Ready(ready) if ready.score.is_none() => {
+                "Falling notes only: a MIDI file has no score."
+            }
+            State::Ready(_) => "",
+        };
+        if !status.is_empty() {
+            header = header.below(div().ui_text().text_color(p.mute).child(status));
+        }
+        if let State::Ready(ready) = &self.state {
+            if ready.score.is_some() {
+                let this = this.clone();
+                header = header.below(
+                    Segmented::new(
+                        "play-view",
+                        "View (v)",
+                        [
+                            ("both", "Score and notes"),
+                            ("falling", "Falling notes"),
+                            ("score", "Score"),
+                        ],
+                        self.view.index(),
+                    )
+                    .on_choose(move |index, _, cx| {
+                        this.update(cx, |screen, cx| screen.set_view(View::ALL[index], cx))
+                            .ok();
+                    }),
+                );
+            } else {
+                let this = this.clone();
+                let open = self.hands_open;
+                header = header.action(
+                    "play-hands",
+                    if open { "Hide hands" } else { "Hands" },
+                    None,
+                    move |_, cx| {
+                        this.update(cx, |screen, cx| {
+                            screen.hands_open = !screen.hands_open;
+                            cx.notify();
+                        })
+                        .ok();
+                    },
+                );
+            }
+        }
+        header
+    }
+
+    /// One line per part of a MIDI file: its name, and the hand that plays it.
+    fn hands(&self, ready: &Ready, cx: &mut Context<Self>) -> Div {
+        let p = palette(cx);
+        let this = cx.entity().downgrade();
+        let rows = ready
+            .timeline
+            .parts()
+            .iter()
+            .enumerate()
+            .map(|(index, part)| {
+                let chosen = match part.hand {
+                    PartHand::Right => 0,
+                    PartHand::Left => 1,
+                    PartHand::Split => 2,
+                };
+                let this = this.clone();
+                div()
+                    .flex()
+                    .items_center()
+                    .gap(space::MD)
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w_0()
+                            .ui_text()
+                            .text_color(p.text)
+                            .child(part.name.clone()),
+                    )
+                    .child(
+                        Segmented::new(
+                            ElementId::Name(format!("play-hand-{index}").into()),
+                            format!("Hand of {}", part.name),
+                            [("right", "Right"), ("left", "Left"), ("split", "Both")],
+                            chosen,
+                        )
+                        .on_choose(move |choice, _, cx| {
+                            let hand = [PartHand::Right, PartHand::Left, PartHand::Split][choice];
+                            this.update(cx, |screen, cx| screen.set_hand(index, hand, cx))
+                                .ok();
+                        }),
+                    )
+            });
+        div()
+            .flex_none()
+            .px(space::XXL)
+            .py(space::LG)
+            .flex()
+            .flex_col()
+            .gap(space::SM)
+            .border_b_1()
+            .border_color(p.line)
+            .child(div().ui_text().text_color(p.mute).child(
+                "Which hand plays each part. \u{201c}Both\u{201d} splits it at the middle C.",
+            ))
+            .children(rows)
+    }
+}
+
+impl Render for PlayScreen {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let p = palette(cx);
+        if let State::Ready(ready) = &self.state {
+            let playing = ready.clock.playing();
+            if playing {
+                window.request_animation_frame();
+                if !self.marked {
+                    self.mark_played(cx);
+                }
+            }
+        }
+        let header = self.header(cx);
+        let mut hands = None;
+        let body = match &self.state {
+            State::Loading => div()
+                .flex_1()
+                .p(space::XXL)
+                .child(Skeleton::new("play-skeleton").w(px(640.)).h(px(320.)))
+                .into_any_element(),
+            State::Failed(error) => div()
+                .flex_1()
+                .p(space::XXL)
+                .child(EmptyLine::new("play-failed", icons::MUSIC, error.clone()))
+                .into_any_element(),
+            State::Ready(ready) => {
+                if self.hands_open && ready.score.is_none() {
+                    hands = Some(self.hands(ready, cx));
+                }
+                let notes = || {
+                    falling(
+                        ready.timeline.clone(),
+                        ready.keyboard,
+                        ready.clock.position_ms(),
+                        self.lights.clone(),
+                        &p,
+                    )
+                };
+                let score = ready.score.clone();
+                let body = div().flex_1().min_h_0().flex().flex_col();
+                match (self.view, score) {
+                    (View::Both, Some(score)) => {
+                        body.child(div().flex_1().min_h_0().child(score)).child(
+                            div()
+                                .flex_none()
+                                .h(relative(0.42))
+                                .border_t_1()
+                                .border_color(p.line)
+                                .child(notes()),
+                        )
+                    }
+                    (View::Score, Some(score)) => body.child(div().flex_1().min_h_0().child(score)),
+                    _ => body.child(div().flex_1().min_h_0().child(notes())),
+                }
+                .into_any_element()
+            }
+        };
+        let transport = match &self.state {
+            State::Ready(ready) => Some(ready.transport.clone()),
+            _ => None,
+        };
+        div()
+            .id("play")
+            .size_full()
+            .bg(p.bg)
+            .flex()
+            .flex_col()
+            .track_focus(&self.focus)
+            .on_key_down(cx.listener(Self::on_key))
+            .child(
+                div()
+                    .flex_none()
+                    .px(space::XXL)
+                    .pt(space::XL)
+                    .pb(space::LG)
+                    .border_b_1()
+                    .border_color(p.line)
+                    .child(header),
+            )
+            .children(hands)
+            .child(body)
+            .children(transport)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    // Not `super::*`: gpui_kit's own `test` attribute would come with it.
+    use super::{Opening, View};
+
+    fn parse(line: &str) -> Result<Opening, String> {
+        let mut words = line.split_whitespace().map(str::to_owned);
+        Opening::parse(words.next().unwrap(), words)
+    }
+
+    #[test]
+    fn a_piece_opens_at_a_position_in_a_view_still_or_playing() {
+        let still = parse("piece.musicxml").unwrap();
+        assert_eq!((still.at, still.play, still.view), (0., false, View::Both));
+        assert!(still.engraved());
+        assert_eq!(still.title(), "piece");
+        let playing = parse("piece.mxl --at 12.5 --play --view falling").unwrap();
+        assert_eq!(
+            (playing.at, playing.play, playing.view),
+            (12_500., true, View::Falling)
+        );
+        for bad in [
+            "p --at",
+            "p --at -1",
+            "p --at soon",
+            "p --loud",
+            "p --view",
+            "p --view all",
+        ] {
+            assert!(parse(bad).is_err(), "{bad}");
+        }
+        assert!(!parse("tune.MID").unwrap().engraved());
+    }
+
+    #[test]
+    fn the_views_come_round_in_order() {
+        assert_eq!(View::Both.next(), View::Falling);
+        assert_eq!(View::Falling.next(), View::Score);
+        assert_eq!(View::Score.next(), View::Both);
+        assert_eq!(View::parse("score"), Some(View::Score));
+    }
+}

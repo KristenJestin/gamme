@@ -1,17 +1,20 @@
 //! The transport of a piece: play and pause, seek by measure, speed, and what the built-in piano
-//! is doing (its SoundFont's download, with its progress). A view built from the kit's own
-//! components, for the play screen to hold (or to be, until it exists: `gamme play <file.mid>`).
+//! is doing (its SoundFont's download, with its progress). A bar built from the kit's own
+//! components, under the play screen (`play_screen.rs`).
+//!
+//! It holds the [`Player`], and moves its clock by the wall clock while the piano does not
+//! (`wall_clock.rs`): a piece played before its SoundFont is there, or with no audio output,
+//! goes on in silence.
 
 use std::time::Duration;
 
-use gpui_design_system::{
-    Button, Icon, LabelledLine, PageHeader, Section, Segmented, Type as _, palette, space,
-};
+use gpui_design_system::{Button, Icon, Segmented, Type as _, palette, space};
 use gpui_kit::*;
 
 use crate::icons;
 use crate::player::{Player, Sound};
 use crate::soundfont::Stage;
+use crate::wall_clock::WallClock;
 
 /// How often the view looks at the clock while something moves.
 const REFRESH: Duration = Duration::from_millis(33);
@@ -20,20 +23,25 @@ const REFRESH: Duration = Duration::from_millis(33);
 const SPEEDS: [u32; 3] = [25, 50, 100];
 
 pub struct Transport {
-    title: SharedString,
     player: Player,
+    /// Each measure's name as the score prints it, in the order of play; empty for a piece with
+    /// no score, whose measures are counted.
+    names: Vec<SharedString>,
+    wall: WallClock,
     _refresh: Task<()>,
 }
 
 impl Transport {
-    pub fn new(title: impl Into<SharedString>, player: Player, cx: &mut Context<Self>) -> Self {
+    pub fn new(player: Player, names: Vec<SharedString>, cx: &mut Context<Self>) -> Self {
         let refresh = cx.spawn(async move |this, cx| {
             loop {
                 cx.background_executor().timer(REFRESH).await;
                 let alive = this
                     .update(cx, |this, cx| {
+                        let sound = this.player.sound();
+                        this.wall.tick(&this.player.clock, sound != Sound::Ready);
                         // Idle, nothing changes: no frame to draw.
-                        if this.player.wants_to_play() || this.player.sound() == Sound::Preparing {
+                        if this.player.wants_to_play() || sound == Sound::Preparing {
                             cx.notify();
                         }
                     })
@@ -44,14 +52,40 @@ impl Transport {
             }
         });
         Self {
-            title: title.into(),
             player,
+            names,
+            wall: WallClock::default(),
             _refresh: refresh,
         }
     }
 
+    pub fn player(&self) -> &Player {
+        &self.player
+    }
+
+    /// Plays, or pauses. Until the piano is ready the clock starts at once and the wall clock
+    /// moves it: the piece is seen going on, and heard from when the piano can.
+    pub fn toggle(&mut self, cx: &mut Context<Self>) {
+        self.player.toggle();
+        if self.player.wants_to_play() && self.player.sound() != Sound::Ready {
+            self.player.clock.play();
+        }
+        cx.notify();
+    }
+
+    /// The measure the piece is in, as the score names it, and how many measures it plays.
+    fn measure_text(&self, index: usize) -> String {
+        let count = self.player.timeline.measure_count();
+        match self.names.get(index) {
+            Some(name) if self.names.len() == count => {
+                format!("Measure {name} ({} of {count})", index + 1)
+            }
+            _ => format!("Measure {} of {count}", index + 1),
+        }
+    }
+
     /// Back to the start of the measure, or to the one before when already there.
-    fn previous_measure(&mut self) {
+    pub fn previous_measure(&mut self) {
         let clock = &self.player.clock;
         let measure = clock.measure(&self.player.timeline);
         let start = self.player.timeline.measure_start_ms(measure).unwrap_or(0.);
@@ -63,7 +97,7 @@ impl Transport {
         self.player.seek_measure(target);
     }
 
-    fn next_measure(&mut self) {
+    pub fn next_measure(&mut self) {
         let measure = self.player.clock.measure(&self.player.timeline);
         self.player.seek_measure(measure + 1);
     }
@@ -126,14 +160,13 @@ impl Render for Transport {
             Button::round(
                 "transport-play",
                 if playing { icons::PAUSE } else { Icon::Play },
-                if playing { "Pause" } else { "Play" },
+                if playing {
+                    "Pause (Space)"
+                } else {
+                    "Play (Space)"
+                },
             )
-            .on_click(move |_, _, cx| {
-                this.update(cx, |t, cx| {
-                    t.player.toggle();
-                    cx.notify();
-                })
-            })
+            .on_click(move |_, _, cx| this.update(cx, |t, cx| t.toggle(cx)))
         };
         let previous = {
             let this = this.clone();
@@ -192,58 +225,57 @@ impl Render for Transport {
             })
         });
         let place = format!(
-            "Measure {} of {} · {} / {}",
-            measure + 1,
-            timeline.measure_count(),
+            "{}  ·  {} / {}",
+            self.measure_text(measure),
             time_text(position),
             time_text(timeline.duration_ms()),
         );
 
-        div().size_full().bg(p.bg).flex().justify_center().child(
-            div()
-                .w(space::COLUMN)
-                .max_w_full()
-                .px(space::XL)
-                .pt(space::XXXL)
-                .flex()
-                .flex_col()
-                .gap(space::XL)
-                .child(PageHeader::new("transport-header", self.title.clone()))
-                .child(
-                    Section::new("transport-playback", "Playback")
-                        .sentence("Play, pause, move by measure, and slow the piece down.")
-                        .child(
-                            div()
-                                .flex()
-                                .items_center()
-                                .gap(space::MD)
-                                .child(previous)
-                                .child(play)
-                                .child(next)
-                                .child(div().flex_1())
-                                .child(speeds),
-                        )
-                        .child(
-                            LabelledLine::new(
-                                "transport-position",
-                                icons::MUSIC,
-                                "Position",
-                                place.clone(),
-                            )
-                            .child(place),
-                        ),
-                )
-                .child(
-                    Section::new("transport-sound", "Sound").child(
+        div()
+            .id("transport")
+            .w_full()
+            .flex()
+            .flex_col()
+            .gap(space::SM)
+            .px(space::XL)
+            .py(space::MD)
+            .border_t_1()
+            .border_color(p.line)
+            .bg(p.bg)
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .gap(space::MD)
+                    .child(previous)
+                    .child(play)
+                    .child(next)
+                    .child(
                         div()
-                            .flex()
-                            .items_center()
-                            .gap(space::MD)
-                            .child(div().flex_1().ui_text().text_color(p.mute).child(sound))
-                            .children(cancel),
-                    ),
-                ),
-        )
+                            .id("transport-position")
+                            .ui_text()
+                            .text_color(p.text)
+                            .whitespace_nowrap()
+                            .child(place),
+                    )
+                    .child(div().flex_1())
+                    .child(speeds),
+            )
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .gap(space::MD)
+                    .child(
+                        div()
+                            .id("transport-sound")
+                            .flex_1()
+                            .ui_text()
+                            .text_color(p.mute)
+                            .child(sound),
+                    )
+                    .children(cancel),
+            )
     }
 }
 
