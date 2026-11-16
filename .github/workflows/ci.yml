@@ -1,0 +1,254 @@
+name: ci
+
+on:
+  pull_request:
+  push:
+    # A feature branch's pushes are verified, then published as its alpha (`publish`).
+    branches: [main, dev, "feat/**", "fix/**"]
+  workflow_dispatch:
+
+# A push makes the runs of the same ref's older pushes useless: they are cancelled, so that the
+# queue holds only what is current. Not on dev and main, whose runs publish: a run there is never
+# cancelled once it runs. One still waiting is, by GitHub, when a newer run of the ref is queued:
+# its commit gets no build, and the newer run publishes the branch's tip.
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.ref != 'refs/heads/dev' && github.ref != 'refs/heads/main' }}
+
+env:
+  # The crate's rust-version (Cargo.toml).
+  RUST_TOOLCHAIN: "1.95"
+
+jobs:
+  commit-messages:
+    # A feature branch's commits are judged on its pull request, not on its pushes.
+    if: github.event_name != 'push' || github.ref == 'refs/heads/main' || github.ref == 'refs/heads/dev'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      # The first push of a branch has no `before` (forty zeros): every commit it holds is checked.
+      # Not on `main`, nor on a pull request into it: it brings commits already judged as pull
+      # requests, squashed by GitHub with ` (#n)` added to the subject. Not on a run started by
+      # hand, which has no `before`: what it builds was judged on its push.
+      - name: Check the Angular commit convention
+        if: github.base_ref != 'main' && github.ref != 'refs/heads/main' && github.event_name != 'workflow_dispatch'
+        run: |
+          base="${{ github.event.pull_request.base.sha || github.event.before }}"
+          head="${{ github.event.pull_request.head.sha || github.sha }}"
+          if [ -z "${base//0/}" ]; then
+            tools/commit-message.sh --range "$head"
+          else
+            tools/commit-message.sh --range "$base..$head"
+          fi
+      # A pull request is squashed: its title becomes the commit subject.
+      - name: Check the title of the pull request
+        if: github.event_name == 'pull_request'
+        env:
+          TITLE: ${{ github.event.pull_request.title }}
+        run: |
+          printf '%s\n' "$TITLE" > "$RUNNER_TEMP/title"
+          tools/commit-message.sh "$RUNNER_TEMP/title"
+
+  # No test opens a window: GPUI's tests use its own test platform.
+  verify:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    env:
+      # An incremental cache is only written here, never reused by the next run.
+      CARGO_INCREMENTAL: 0
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - name: The toolchain
+        run: |
+          rustup toolchain install "$RUST_TOOLCHAIN" --profile minimal --component rustfmt,clippy
+          rustup default "$RUST_TOOLCHAIN"
+      - uses: Swatinem/rust-cache@v2
+        with:
+          # Saved even when a check fails: otherwise a red run throws Verovio's 35 minutes away.
+          cache-on-failure: true
+          # The key does not follow Cargo.toml: bump this one when a profile changes, or the
+          # cache keeps the artefacts of the old profiles and never saves the new ones.
+          # Verovio's C++ (`verovio-sys`) takes ~35 minutes to compile: this cache is what keeps
+          # every run but the first (of `dev`, the default branch the others restore from) from
+          # paying for it.
+          prefix-key: v1-rust
+      # The window links against fontconfig and freetype; GPUI loads Wayland and Vulkan at run
+      # time. ALSA's headers are for `cpal` and `midir` (sound and MIDI), which the play screen
+      # adds. Verovio's C++ needs a C++ compiler, which the runner has.
+      - name: Have the window's system libraries
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y pkg-config libfontconfig-dev libfreetype-dev libxkbcommon-dev libxkbcommon-x11-dev libwayland-dev libx11-xcb-dev libxcb1-dev libvulkan-dev libasound2-dev
+      - run: cargo fmt --check
+      - run: cargo clippy --all-targets --locked -- -D warnings
+      - run: cargo test --locked
+      # The margin left on the runner, read even when a step above failed.
+      - name: Disk left
+        if: always()
+        run: df -h /
+        # A failure to print it must not hide the verdict above.
+        continue-on-error: true
+
+  # The packages (docs/releases.md): main is stable, dev beta, a feature branch its own alpha.
+  # `build` runs the branch's code with a token that can only read; `publish`, once `verify`
+  # passed on the pushed commit, runs none of it and alone may write the releases and the tags.
+  # main is built when the `release` workflow (release.yml) starts this one on it: the ref it
+  # moved with its own token started no push run.
+  build:
+    if: github.event_name == 'push' || (github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/main')
+    # Old enough a C library (glibc 2.35) that the binary runs on current Arch and Debian stable.
+    runs-on: ubuntu-22.04
+    permissions:
+      contents: read
+    outputs:
+      skip: ${{ steps.version.outputs.skip }}
+      channel: ${{ steps.version.outputs.channel }}
+      version: ${{ steps.version.outputs.version }}
+      tag: ${{ steps.version.outputs.tag }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - name: The channel and the version
+        id: version
+        run: |
+          skip() { echo "::notice::$1: nothing is published."; echo "skip=true" >> "$GITHUB_OUTPUT"; exit 0; }
+          # The name goes into the notes' install line and the API's addresses as it is: only
+          # the characters a branch is named with here. Failing, the run publishes nothing.
+          case "$GITHUB_REF_NAME" in
+            "" | *[!A-Za-z0-9._/-]*)
+              echo "::error::The branch's name holds a character other than A-Z, a-z, 0-9, '.', '_', '/' and '-': it is not built, nothing was published (docs/releases.md)."
+              exit 1
+              ;;
+          esac
+          at=$GITHUB_SHA
+          case "$GITHUB_REF_NAME" in
+            main)
+              channel=stable
+              # A release is main moved forward to a commit of dev, which is the commit released:
+              # its version is the one its beta had, without the pre-release.
+              if ! git merge-base --is-ancestor "$GITHUB_SHA" origin/dev; then
+                echo "::error::$GITHUB_SHA is not a commit of dev: main is released by the release workflow only (docs/releases.md), nothing was published."
+                exit 1
+              fi
+              ;;
+            dev) channel=beta ;;
+            *) channel=alpha ;;
+          esac
+          status=0
+          version=$(tools/version.sh "$channel" --branch "$GITHUB_REF_NAME" --at "$at") || status=$?
+          # 3, on every channel: nothing was committed since the last stable release, whose own
+          # commit this is (its stable run again, or dev or a branch still at it).
+          [ "$status" -ne 3 ] || skip "$GITHUB_SHA is the last stable release's own commit, nothing was committed since"
+          [ "$status" -eq 0 ] || exit "$status"
+          # Every build is its own release, an alpha's too: nothing is ever replaced.
+          tag="v$version"
+          tools/changelog.sh --at "$at" > "$RUNNER_TEMP/changelog.md"
+          {
+            echo "channel=$channel"
+            echo "version=$version"
+            echo "tag=$tag"
+          } >> "$GITHUB_OUTPUT"
+      - name: The toolchain
+        if: steps.version.outputs.skip != 'true'
+        run: |
+          rustup toolchain install "$RUST_TOOLCHAIN" --profile minimal
+          rustup default "$RUST_TOOLCHAIN"
+      - name: Have the window's system libraries
+        if: steps.version.outputs.skip != 'true'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y pkg-config libfontconfig-dev libfreetype-dev libxkbcommon-dev libxkbcommon-x11-dev libwayland-dev libx11-xcb-dev libxcb1-dev libvulkan-dev libasound2-dev
+      - if: steps.version.outputs.skip != 'true'
+        uses: Swatinem/rust-cache@v2
+        with:
+          cache-on-failure: true
+          prefix-key: v1-rust-release
+      - name: Build
+        if: steps.version.outputs.skip != 'true'
+        env:
+          GAMME_BUILD_VERSION: ${{ steps.version.outputs.version }}
+          GAMME_BUILD_CHANNEL: ${{ steps.version.outputs.channel }}
+          # Checked above to hold only the characters a branch is named with here.
+          GAMME_BUILD_BRANCH: ${{ github.ref_name }}
+        run: cargo build --release --locked
+      - name: Package, with the notes
+        if: steps.version.outputs.skip != 'true'
+        env:
+          CHANNEL: ${{ steps.version.outputs.channel }}
+          VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          out="$RUNNER_TEMP/release"
+          tools/package.sh "$VERSION" target/release/gamme "$out/assets"
+          # The install.sh of this very commit.
+          install="curl -fsSL https://raw.githubusercontent.com/$GITHUB_REPOSITORY/$GITHUB_SHA/install.sh | sh -s -- --channel $CHANNEL"
+          if [ "$CHANNEL" = alpha ]; then install="$install --branch '$GITHUB_REF_NAME'"; fi
+          {
+            echo "Gamme $VERSION, $CHANNEL, built from ${GITHUB_SHA:0:12}."
+            echo
+            echo "Linux x86_64. Install: \`$install\` (see docs/releases.md)."
+            echo "The window needs the system's fontconfig, freetype, xkbcommon (and xkbcommon-x11), wayland-client or libxcb, and a Vulkan loader with a driver."
+            echo
+            cat "$RUNNER_TEMP/changelog.md"
+          } > "$out/notes.md"
+      - if: steps.version.outputs.skip != 'true'
+        uses: actions/upload-artifact@v4
+        with:
+          name: release
+          path: ${{ runner.temp }}/release
+          retention-days: 1
+
+  publish:
+    needs: [verify, build]
+    if: (github.event_name == 'push' || github.event_name == 'workflow_dispatch') && needs.build.outputs.skip != 'true'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    # Shared with alpha-cleanup.yml: a branch's alpha is never deleted while it is published.
+    concurrency:
+      group: publish-${{ github.ref_name }}
+    # This job holds the write token: it runs no git and never works inside the artifact, whose
+    # files come from the branch's code (a repository's layout there would hand its config to
+    # git). Only `gh` runs, naming the files it uploads.
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: release
+          path: release
+      - name: Publish
+        id: publish
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          CHANNEL: ${{ needs.build.outputs.channel }}
+          VERSION: ${{ needs.build.outputs.version }}
+          TAG: ${{ needs.build.outputs.tag }}
+        run: |
+          # Read right before publishing: a push over this commit publishes itself, after it, and
+          # a deleted branch publishes nothing.
+          if tip=$(gh api "repos/$GH_REPO/git/ref/heads/$GITHUB_REF_NAME" --jq .object.sha 2> "$RUNNER_TEMP/tip.err"); then
+            if [ "$tip" != "$GITHUB_SHA" ]; then echo "::notice::$GITHUB_REF_NAME moved on to $tip: nothing is published."; exit 0; fi
+          elif grep -q 'HTTP 404' "$RUNNER_TEMP/tip.err"; then
+            echo "::notice::$GITHUB_REF_NAME was deleted: nothing is published."; exit 0
+          else
+            cat "$RUNNER_TEMP/tip.err" >&2; exit 1
+          fi
+          title="Gamme v$VERSION"
+          # Nothing is replaced, ever: a version already published, of any channel, stays as it
+          # is; a draft left by a failed upload is made again.
+          if draft=$(gh release view "$TAG" --json isDraft --jq .isDraft 2> /dev/null); then
+            if [ "$draft" = true ]; then gh release delete "$TAG" --yes; else echo "::notice::$TAG is already published."; exit 0; fi
+          fi
+          # The files go with the release in this one call: an immutable release takes none after.
+          if [ "$CHANNEL" = stable ]; then
+            # On the commit released, the same on main and on dev: the next betas count from it.
+            gh release create "$TAG" release/assets/* --target "$GITHUB_SHA" --title "$title" --notes-file release/notes.md --latest
+          else
+            gh release create "$TAG" release/assets/* --target "$GITHUB_SHA" --title "$title" --notes-file release/notes.md --prerelease --latest=false
+          fi
