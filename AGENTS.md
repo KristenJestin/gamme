@@ -49,7 +49,6 @@ The last three are CI's `verify` job (`.github/workflows/ci.yml`), on Rust 1.95,
 | `main.rs` | The entry: arguments (`--help`, `--version`, `update`), the window and its theme |
 | `home.rs` | The home screen |
 | `icons.rs` | The icons Gamme adds to the kit's (Lucide) |
-| `engraver.rs` | Verovio, the score engraver; only its version is asked for now |
 | `update.rs` | `gamme update`: the channel's latest build, its sum checked, the binary replaced |
 | `desktop.rs` | The launcher entry and the icon, written by `update` as `install.sh` writes them |
 | `paths.rs` | `$XDG_STATE_HOME/gamme` and `$XDG_DATA_HOME` |

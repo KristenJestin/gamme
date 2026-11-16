@@ -1,5 +1,4 @@
 mod desktop;
-mod engraver;
 mod home;
 mod icons;
 mod paths;
@@ -74,7 +73,7 @@ fn window() {
                 app_id: Some("gamme".into()),
                 ..Default::default()
             };
-            let opened = gpui_kit::open_window(options, cx, |_, cx| cx.new(home::Home::new));
+            let opened = gpui_kit::open_window(options, cx, |_, cx| cx.new(|_| home::Home));
             if let Err(error) = opened {
                 eprintln!("gamme: the window cannot open: {error}");
                 cx.quit();

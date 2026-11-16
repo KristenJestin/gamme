@@ -18,8 +18,9 @@ serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.154"
 sha2 = "0.11.1"
 # Engraves the score. Its C++ (`verovio-sys`) takes ~35 min to compile once: CI caches it
-# (docs/releases.md). Used by `engraver::version` for now, so that it is linked and the cache and
-# the system packages are settled before the score screen needs it.
+# (docs/releases.md). Not called yet: a dependency, its C++ is built all the same, so the cache
+# and the system packages are settled before the score screen needs it. (`Toolkit::new` unpacks
+# its resources into a new temporary folder it never deletes: never call it per launch.)
 verovio = "0.3.6"
 
 [profile.release]
