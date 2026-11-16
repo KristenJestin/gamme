@@ -380,10 +380,12 @@ pub fn install(
         .recursive(true)
         .mode(0o700)
         .create(&folder)?;
-    // One install of a font at a time, across processes: the lock goes when the file closes.
+    // One install of a font at a time, across processes. The lock is let go of when the install
+    // ends, not only closed: a program spawned on another thread holds a copy of every open file
+    // between its fork and its exec, and the lock (flock) is shared by all of the file's copies.
     let lock = private_file(&folder.join(format!("{}.lock", font.id)))?;
-    match lock.try_lock() {
-        Ok(()) => {}
+    let _held = match lock.try_lock() {
+        Ok(()) => Unlock(lock),
         Err(fs::TryLockError::WouldBlock) => {
             return Err(failed(format!(
                 "the {} is already being downloaded by another Gamme",
@@ -391,7 +393,7 @@ pub fn install(
             )));
         }
         Err(fs::TryLockError::Error(error)) => return Err(error.into()),
-    }
+    };
     if font.installed(data) {
         // What an earlier install left beside it is of no use.
         let _ = fs::remove_file(font.partial(data));
@@ -406,6 +408,15 @@ pub fn install(
         Stage::Idle
     });
     result
+}
+
+/// A file locked, unlocked when it goes.
+struct Unlock(File);
+
+impl Drop for Unlock {
+    fn drop(&mut self) {
+        let _ = self.0.unlock();
+    }
 }
 
 fn install_inner(
@@ -834,6 +845,10 @@ mod tests {
         let error = install(&font, &data, &fake, &Progress::default()).unwrap_err();
         assert!(matches!(error, Error::Failed(m) if m.contains("another Gamme")));
         assert!(fake.ranges.lock().unwrap().is_empty());
+        // Unlocked, not only closed: a test spawning `tar` or `curl` on another thread holds a
+        // copy of every open file between its fork and its exec, and the lock (flock) belongs
+        // to the file as all its copies share it. Closing ours would leave it held a moment.
+        other.unlock().unwrap();
         drop(other);
         install(&font, &data, &fake, &Progress::default()).unwrap();
     }
