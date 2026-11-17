@@ -35,7 +35,8 @@
 //!   Rework's measures 3 and 7). The end of one goes on from the start of the next, the last's
 //!   from the first's, each seam a wrap as above. They live in two banks of atomics: the window
 //!   writes the one not in use, then says it is (`loop_state`); the audio side reads the one in
-//!   use, and again in the rare case a write began meanwhile, never waiting for one.
+//!   use, and again in the rare case a write began meanwhile, never waiting for one: past a
+//!   bound of tries, the last loop it read whole.
 //!
 //! The one that moves the clock asks first where a step goes ([`Clock::step`]), plays what it
 //! goes through, then commits it ([`Clock::commit`]): what is played and where the clock goes
@@ -124,6 +125,14 @@ impl Loop {
     fn after(&self, span: usize) -> Option<(u64, u64)> {
         self.get((span + 1) % self.len.max(1))
     }
+}
+
+thread_local! {
+    /// The last loop this thread read whole, and the clock it is of (its shared state's
+    /// address): what a read that never finds one whole falls back on ([`Clock::looped`]). A
+    /// `Copy` value made at compile time: no allocation, no destructor, on the audio thread too.
+    static LAST_WHOLE: std::cell::Cell<(usize, Spans)> =
+        const { std::cell::Cell::new((0, Spans::NONE)) };
 }
 
 /// The bank of spans in use at `state`'s generation (see [`Shared::loop_state`]).
@@ -282,6 +291,19 @@ impl Step {
     pub fn position_us(&self) -> u64 {
         self.wrapped.map_or(self.to_us, |(_, to)| to)
     }
+}
+
+/// Where the piece stood at an instant ([`Clock::placed_at`]).
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Placed {
+    /// The counter of seeks it is read against.
+    pub seeks: u32,
+    /// Where the piece stood, in ms of its own tempo.
+    pub ms: f64,
+    /// The position published last it was read from, in ms. Never at the end of a span of the
+    /// loop, where `ms` may stand, held there until the wrap: which span the clock plays is read
+    /// from it.
+    pub published_ms: f64,
 }
 
 /// What the audio side reads before it renders a buffer.
@@ -500,8 +522,30 @@ impl Clock {
 
     /// The loop's spans of measures; none when there is no loop.
     pub fn looped(&self) -> Spans {
-        // A write takes nanoseconds and they come at the player's pace: a second try is already
-        // rare. Bounded all the same, the audio side never spins: past them, no loop for a read.
+        self.whole_or_last(self.read_whole())
+    }
+
+    /// What a read of the loop gives: `read` when it is whole, kept as this thread's last; else
+    /// the last whole one this thread read of this clock, none if it read none. Bounded tries
+    /// and a thread's own copy: the audio side never spins nor waits, and never plays a loop half
+    /// of one and half of another.
+    fn whole_or_last(&self, read: Option<Spans>) -> Spans {
+        let clock = Arc::as_ptr(&self.0) as usize;
+        LAST_WHOLE.with(|last| match read {
+            Some(spans) => {
+                last.set((clock, spans));
+                spans
+            }
+            None => match last.get() {
+                (of, spans) if of == clock => spans,
+                _ => Spans::NONE,
+            },
+        })
+    }
+
+    /// The loop read whole: a write takes nanoseconds and they come at the player's pace, so a
+    /// second try is already rare; none past 64 of them.
+    fn read_whole(&self) -> Option<Spans> {
         for _ in 0..64 {
             let mut spans = Spans::NONE;
             let before = self.0.loop_state.load(Acquire);
@@ -517,10 +561,10 @@ impl Clock {
             spans.len = len;
             let after = self.0.loop_state.load(Acquire);
             if (after >> 8).wrapping_sub(before >> 8) <= 1 {
-                return spans;
+                return Some(spans);
             }
         }
-        Spans::NONE
+        None
     }
 
     /// The loop's spans in µs, those of no length left out. No lock, no allocation.
@@ -674,6 +718,12 @@ impl Clock {
     /// before the loop's start: on the same line as the pass before, which is what the judge
     /// (`judge.rs`) needs.
     pub fn position_at(&self, at: Instant) -> (u32, f64) {
+        let placed = self.placed_at(at);
+        (placed.seeks, placed.ms)
+    }
+
+    /// [`Clock::position_at`], with the position published last it was read from.
+    pub fn placed_at(&self, at: Instant) -> Placed {
         let shared = &self.0;
         let (mut state, mut stamp, mut speed, mut set) = (0, 0, Speed::FULL.percent(), 0);
         for _ in 0..4 {
@@ -710,7 +760,11 @@ impl Clock {
             let stop = self.hold_us(position, limit, seeks).unwrap_or(limit);
             ms = ms.min(stop as f64 / 1e3);
         }
-        (seeks, ms.min(shared.end_us as f64 / 1e3))
+        Placed {
+            seeks,
+            ms: ms.min(shared.end_us as f64 / 1e3),
+            published_ms: position as f64 / 1e3,
+        }
     }
 
     /// The measure the position falls in (0 is the first).
@@ -766,8 +820,11 @@ impl Clock {
             .and_then(|span| looped.after(span));
         match wrap {
             Some((start, end)) => {
-                // A step longer than the next span (one shorter than a buffer) goes round in it,
-                // never past its end into what the loop leaves out.
+                // A step longer than the next span goes round in it (`%`), never past its end into
+                // what the loop leaves out. Only a span shorter than one step does that: a buffer
+                // is 5 to 40 ms, a measure far longer, so the audio never meets it. A step that
+                // long otherwise (a stall) stays in the next span instead of going on to the
+                // ones after it: harmless.
                 let length = end - start;
                 let pass = from.seeks.wrapping_add(1) & SEEKS_MASK as u32;
                 let to = held(start, end, pass, start + (target - limit) % length);
@@ -1203,10 +1260,11 @@ mod tests {
         assert_eq!(clock.snapshot().position_us, 1_100_000);
         assert_eq!(clock.snapshot().seeks, before.seeks + 2);
         assert!(clock.playing());
-        // The window never sees what the loop leaves out while it waits for the next buffer.
+        // The window never sees what the loop leaves out while it waits for the next buffer:
+        // 50 ms on, the position is held at the span's end, read from the one published.
         clock.seek_ms(1999.);
-        std::thread::sleep(Duration::from_millis(10));
-        assert!(clock.position_ms() <= 2000., "{}", clock.position_ms());
+        let later = clock.placed_at(Instant::now() + Duration::from_millis(50));
+        assert_eq!((later.ms, later.published_ms), (2000., 1999.));
         // Before the first span, it plays on to that span's end; between the two, to the second's;
         // after the last, to the end of the piece.
         clock.seek_ms(500.);
@@ -1278,6 +1336,19 @@ mod tests {
         }
         stop.store(true, Relaxed);
         writer.join().unwrap();
+    }
+
+    #[test]
+    fn a_read_never_whole_falls_back_on_the_last_whole_one_of_the_same_clock() {
+        let clock = two_spans(Default::default());
+        let whole = clock.looped();
+        assert_eq!(whole.as_slice(), [(1, 1), (3, 3)]);
+        assert_eq!(clock.whole_or_last(None), whole);
+        // Another clock's last loop is not this one's.
+        let other = two_spans(Default::default());
+        other.set_loop(Some((2, 2)));
+        assert_eq!(other.looped().as_slice(), [(2, 2)]);
+        assert!(clock.whole_or_last(None).is_empty());
     }
 
     #[test]

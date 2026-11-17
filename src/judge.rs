@@ -176,6 +176,10 @@ pub struct Moment {
     pub seeks: u32,
     /// Where the piece stands, in ms of its own tempo.
     pub ms: f64,
+    /// The position the clock published last, which `ms` was read from: `ms` may stand at the
+    /// end of a span of the loop, held there until the wrap, where the clock still plays that
+    /// span. Which span a pass plays, and its measure, are read from it.
+    pub published_ms: f64,
     /// The speed's factor, 0.25 to 1.
     pub speed: f64,
     /// Whether the clock waits for the player: no timing.
@@ -579,13 +583,15 @@ impl Judge {
         self.started = true;
         self.shift = 0.;
         self.seam = None;
+        // Where the clock stands as it plays: a span's end read from it is still that span.
+        let stands = moment.published_ms.min(moment.ms);
         let measure = self
             .measures
-            .partition_point(|&start| start <= moment.ms)
+            .partition_point(|&start| start <= stands)
             .saturating_sub(1);
         let measure_start = self.measures.get(measure).copied().unwrap_or(0.);
         let from = (moment.ms - slack).max(measure_start);
-        self.span = self.span_at(moment.ms);
+        self.span = self.span_at(stands);
         let end = self
             .span
             .and_then(|span| self.looped.get(span))
@@ -751,10 +757,11 @@ impl Live {
     }
 
     fn moment(clock: &Clock, at: Instant) -> Moment {
-        let (seeks, ms) = clock.position_at(at);
+        let placed = clock.placed_at(at);
         Moment {
-            seeks,
-            ms,
+            seeks: placed.seeks,
+            ms: placed.ms,
+            published_ms: placed.published_ms,
             speed: clock.speed().factor(),
             wait: clock.wait() != Wait::Off,
             playing: clock.playing(),
@@ -827,6 +834,7 @@ mod tests {
         Moment {
             seeks: 0,
             ms,
+            published_ms: ms,
             speed: 1.,
             wait: false,
             playing: true,
@@ -1295,6 +1303,54 @@ mod tests {
             (wrong.grade, wrong.at_ms, wrong.pass, wrong.measure),
             (Grade::Wrong, 5980., 0, 2)
         );
+    }
+
+    #[test]
+    fn a_pass_first_read_at_the_end_of_an_inner_span_plays_that_span() {
+        let mut judge = two_spans(&[(60, 5980.), (65, 12_000.)]);
+        judge.at(at(0.));
+        // A seek near the first span's end, first seen with the position held at that end (the
+        // clock waits for its next buffer to wrap): the clock still plays the first span.
+        judge.at(Moment {
+            seeks: 2,
+            ms: 6000.,
+            published_ms: 5950.,
+            ..at(0.)
+        });
+        // So the wrap goes into measure 6, not back to measure 2.
+        let first = hit(&mut judge, 65, pass(3, 12_000.));
+        assert_eq!(
+            (first.grade, first.offset_ms, first.measure),
+            (Grade::Perfect, Some(0.), 6)
+        );
+        judge.at(pass(3, 12_500.));
+        assert_eq!(
+            grades(judge.run()),
+            [(Grade::Perfect, Some(1)), (Grade::Missed, Some(0))]
+        );
+    }
+
+    #[test]
+    fn a_loop_whose_last_span_ends_with_the_piece_goes_round_without_ending_the_run() {
+        // Measures 2 and 9: 4 s to 6 s, then 18 s to the end, 20 s.
+        let mut judge = judge_of(&[(60, 4000.), (62, 18_000.)], 0.);
+        let spans: Vec<(f64, f64)> = [(2, 2), (9, 9)]
+            .iter()
+            .filter_map(|&(first, last)| judge.loop_ms(first, last))
+            .collect();
+        assert_eq!(spans, [(4000., 6000.), (18_000., 20_000.)]);
+        judge.set_loop(spans);
+        judge.at(pass(0, 3900.));
+        hit(&mut judge, 60, pass(0, 4000.));
+        hit(&mut judge, 62, pass(1, 18_000.));
+        // The clock reads the piece's end for a buffer before it wraps, playing.
+        assert!(judge.at(pass(1, 20_000.)).is_empty());
+        assert!(!judge.ended());
+        let again = hit(&mut judge, 60, pass(2, 4000.));
+        assert_eq!((again.grade, again.pass), (Grade::Perfect, 2));
+        assert!(!judge.ended());
+        assert_eq!(judge.runs(), 0, "the same run");
+        assert_eq!(judge.run().count(Grade::Missed), 0);
     }
 
     #[test]

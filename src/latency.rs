@@ -186,6 +186,7 @@ mod tests {
         let moment = |ms| Moment {
             seeks: 0,
             ms,
+            published_ms: ms,
             speed: 1.,
             wait: false,
             playing: true,
