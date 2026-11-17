@@ -27,6 +27,7 @@ use gpui_kit::*;
 use crate::clock::Spans;
 use crate::icons;
 use crate::judge::{Grade, Judgement};
+use crate::progress::Outcome;
 use crate::stars::{self, Feat};
 use crate::tally::{self, Standing, Tally};
 
@@ -258,6 +259,41 @@ pub fn sentence(summary: &Summary, names: &[impl AsRef<str>]) -> String {
     }
 }
 
+/// What the progress says of a run that earned `summary`'s stars: a new best, in the words of the
+/// end; none when it beat nothing.
+pub fn best_text(outcome: &Outcome, summary: &Summary) -> Option<String> {
+    let stars = match summary.stars {
+        1 => "1 star".to_owned(),
+        n => format!("{n} stars"),
+    };
+    let score = format!("a better score at {} %", summary.feat.speed);
+    match (outcome.new_stars, outcome.new_best) {
+        (false, false) => None,
+        (true, false) => Some(format!("New best: {stars}.")),
+        (false, true) => Some(format!("New best: {score}.")),
+        (true, true) => Some(format!("New best: {stars} and {score}.")),
+    }
+}
+
+/// The stars of a piece, as many as the most, the first `earned` filled: in the end of a run and
+/// in the home screen's rows.
+pub fn star_icons(earned: u8, cx: &App) -> Vec<AnyElement> {
+    let p = palette(cx);
+    (0..stars::MOST)
+        .map(|at| {
+            let earned = at < earned;
+            gpui_design_system::icon(if earned {
+                icons::STAR_FILL
+            } else {
+                icons::STAR
+            })
+            .size(px(14.))
+            .text_color(if earned { p.acc } else { p.faint })
+            .into_any_element()
+        })
+        .collect()
+}
+
 /// What a button of the end of a run does.
 pub type Action = Box<dyn Fn(&mut Window, &mut App)>;
 
@@ -269,10 +305,15 @@ pub struct Actions {
 }
 
 /// The end of a run, over the play screen: the kit's dialog, drawn all the time, `open` while it
-/// shows; `names` the measures as the score prints them, in the order of play.
+/// shows; `names` the measures as the score prints them, in the order of play; `best` what the
+/// run did to the piece's progress, none when it is not kept (a file opened, not a piece of the
+/// library).
+///
+/// A run that beat what the piece had says so (`progress.rs`).
 pub fn view(
     summary: &Summary,
     names: &[impl AsRef<str>],
+    best: Option<&Outcome>,
     open: bool,
     actions: Actions,
     cx: &App,
@@ -280,16 +321,6 @@ pub fn view(
     let p = palette(cx);
     let standing = &summary.standing;
     let stars_said = format!("{} of {}", summary.stars, stars::MOST);
-    let star_icons = (0..stars::MOST).map(|at| {
-        let earned = at < summary.stars;
-        gpui_design_system::icon(if earned {
-            icons::STAR_FILL
-        } else {
-            icons::STAR
-        })
-        .size(px(14.))
-        .text_color(if earned { p.acc } else { p.faint })
-    });
     let accuracy = standing
         .accuracy()
         .map_or_else(|| "\u{2013}".to_owned(), |accuracy| format!("{accuracy} %"));
@@ -319,7 +350,7 @@ pub fn view(
         .child(standing.best_combo.to_string())
         .into_any_element(),
         LabelledLine::new("run-end-stars", icons::STAR, "Stars", stars_said.clone())
-            .children(star_icons)
+            .children(star_icons(summary.stars, cx))
             .child(
                 div()
                     .pl(space::XS)
@@ -337,6 +368,16 @@ pub fn view(
             .text_color(p.mute)
             .child(said)
     });
+    let new_best = best
+        .and_then(|outcome| best_text(outcome, summary))
+        .map(|said| {
+            div()
+                .id("run-end-best")
+                .ui_text()
+                .semibold()
+                .text_color(p.acc)
+                .child(said)
+        });
     let missed = (!summary.missed.is_empty()).then(|| {
         div()
             .id("run-end-missed")
@@ -370,6 +411,7 @@ pub fn view(
         .open(open)
         .on_close(close)
         .child(lines_block(lines))
+        .children(new_best)
         .children(note)
         .children(missed);
     modal = modal.action(
@@ -392,8 +434,8 @@ pub fn view(
 mod tests {
     // Not `super::*`: gpui_kit's own `test` attribute would come with it.
     use super::{
-        Faults, Grade, Judgement, MOST_MISSED, Summary, faults_text, measure_name, measures_text,
-        most_missed, ordinal, rework, rework_text, sentence,
+        Faults, Grade, Judgement, MOST_MISSED, Outcome, Summary, best_text, faults_text,
+        measure_name, measures_text, most_missed, ordinal, rework, rework_text, sentence,
     };
 
     fn judged(grade: Grade, measure: u32, pass: u32, at_ms: f64) -> Judgement {
@@ -496,6 +538,45 @@ mod tests {
         assert_eq!(
             sentence(&summary, &none),
             "Nothing to rework: no note missed, late or wrong."
+        );
+    }
+
+    #[test]
+    fn a_new_best_is_said_with_its_stars_and_its_speed() {
+        let run: Vec<Judgement> = (0..4).map(|m| judged(Perfect, m, 0, 0.)).collect();
+        let summary = Summary::of(&run, 4, true, true, &[25, 50, 100]);
+        assert_eq!(summary.stars, 2);
+        let said = |new_stars, new_best| {
+            best_text(
+                &Outcome {
+                    new_stars,
+                    new_best,
+                },
+                &summary,
+            )
+        };
+        assert_eq!(said(false, false), None);
+        assert_eq!(said(true, false).unwrap(), "New best: 2 stars.");
+        assert_eq!(
+            said(false, true).unwrap(),
+            "New best: a better score at 100 %."
+        );
+        assert_eq!(
+            said(true, true).unwrap(),
+            "New best: 2 stars and a better score at 100 %."
+        );
+        let one = Summary::of(&run, 4, false, true, &[25, 50, 100]);
+        let first = Summary { stars: 1, ..one };
+        assert_eq!(
+            best_text(
+                &Outcome {
+                    new_stars: true,
+                    new_best: false
+                },
+                &first
+            )
+            .unwrap(),
+            "New best: 1 star."
         );
     }
 

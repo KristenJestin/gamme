@@ -4,6 +4,9 @@
 //!
 //! The library's work (reading, copying, listing) is blocking and runs off the main thread; the
 //! screen only puts its results in place and says them in toasts.
+//!
+//! A piece that was played shows its stars and its best score (`progress.rs`), read with the
+//! list.
 
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -18,13 +21,26 @@ use gpui_kit::*;
 
 use crate::icons;
 use crate::library::{ImportError, Library, Piece};
+use crate::progress::{Glance, Store};
+use crate::run_end::star_icons;
+use crate::tally::grouped;
 
-/// A row of the list: a piece and the menu of its "⋯" button, which keeps its state while the
-/// row stays.
+/// A row of the list: a piece, what was kept of its runs, and the menu of its "⋯" button, which
+/// keeps its state while the row stays.
 #[derive(Clone)]
 struct Row {
     piece: Piece,
+    glance: Glance,
     menu: Entity<Menu>,
+}
+
+/// The library's pieces, and what was kept of each one's runs. Blocking.
+fn read(library: &Library) -> (Vec<Piece>, HashMap<String, Glance>) {
+    let pieces = library.list();
+    let glances = Store::open()
+        .map(|store| store.glances(pieces.iter().map(|piece| piece.id.as_str())))
+        .unwrap_or_default();
+    (pieces, glances)
 }
 
 /// The home screen asks to play a piece of its library.
@@ -37,6 +53,8 @@ pub struct Home {
     /// `None` when there is no home folder to keep a library in.
     library: Option<Library>,
     pieces: Vec<Piece>,
+    /// What was kept of each piece's runs, by its id.
+    glances: HashMap<String, Glance>,
     /// Whether the library has been read once: until then the list is not empty, only unknown.
     loaded: bool,
     listing: Listing<Row>,
@@ -60,6 +78,7 @@ impl Home {
             loaded: library.is_none(),
             library,
             pieces: Vec::new(),
+            glances: HashMap::new(),
             listing: Listing::default(),
             menus: HashMap::new(),
             asking: None,
@@ -75,11 +94,12 @@ impl Home {
             return;
         };
         cx.spawn(async move |this, cx| {
-            let pieces = cx
+            let (pieces, glances) = cx
                 .background_executor()
-                .spawn(async move { library.list() })
+                .spawn(async move { read(&library) })
                 .await;
-            this.update(cx, |this, cx| this.set_pieces(pieces, cx)).ok();
+            this.update(cx, |this, cx| this.set_pieces(pieces, glances, cx))
+                .ok();
         })
         .detach();
     }
@@ -92,7 +112,12 @@ impl Home {
     }
 
     /// Takes the library as it is now, and gives each piece the menu of its row.
-    fn set_pieces(&mut self, pieces: Vec<Piece>, cx: &mut Context<Self>) {
+    fn set_pieces(
+        &mut self,
+        pieces: Vec<Piece>,
+        glances: HashMap<String, Glance>,
+        cx: &mut Context<Self>,
+    ) {
         let home = cx.entity().downgrade();
         for piece in &pieces {
             self.menus.entry(piece.id.clone()).or_insert_with(|| {
@@ -114,6 +139,7 @@ impl Home {
         self.menus
             .retain(|id, _| pieces.iter().any(|piece| &piece.id == id));
         self.pieces = pieces;
+        self.glances = glances;
         self.loaded = true;
         cx.notify();
     }
@@ -161,16 +187,16 @@ impl Home {
         self.importing += 1;
         cx.notify();
         cx.spawn(async move |this, cx| {
-            let (results, pieces) = cx
+            let (results, (pieces, glances)) = cx
                 .background_executor()
                 .spawn(async move {
                     let results: Vec<_> = paths.iter().map(|path| library.import(path)).collect();
-                    (results, library.list())
+                    (results, read(&library))
                 })
                 .await;
             this.update(cx, |this, cx| {
                 this.importing -= 1;
-                this.set_pieces(pieces, cx);
+                this.set_pieces(pieces, glances, cx);
                 announce(results, cx);
             })
             .ok();
@@ -201,15 +227,15 @@ impl Home {
             return;
         };
         cx.spawn(async move |this, cx| {
-            let (removed, pieces) = cx
+            let (removed, (pieces, glances)) = cx
                 .background_executor()
                 .spawn(async move {
                     let removed = library.remove(&piece.id).map(|()| piece);
-                    (removed, library.list())
+                    (removed, read(&library))
                 })
                 .await;
             this.update(cx, |this, cx| {
-                this.set_pieces(pieces, cx);
+                this.set_pieces(pieces, glances, cx);
                 match removed {
                     Ok(piece) => toast(Toast::success("Removed ").quoted_title(&piece.title), cx),
                     Err(error) => toast(
@@ -223,12 +249,17 @@ impl Home {
         .detach();
     }
 
-    fn row(row: &Row, ink: Hsla, now: u64, home: WeakEntity<Self>) -> ListRow {
+    fn row(row: &Row, ink: Hsla, now: u64, home: WeakEntity<Self>, cx: &App) -> ListRow {
         let piece = &row.piece;
+        let glance = row.glance;
         let id = piece.id.clone();
         let played = match piece.last_played {
             Some(at) => format!("played {}", ago(now, at)),
             None => "not played yet".to_owned(),
+        };
+        let played = match row.glance.top {
+            Some((speed, score)) => format!("best {} at {speed} % \u{b7} {played}", grouped(score)),
+            None => played,
         };
         // A piece with no composer says what its kind gives, which MIDI has less of.
         let line = match (&piece.composer, piece.kind.engraved()) {
@@ -244,6 +275,16 @@ impl Home {
         .tag(piece.kind.label())
         .when_some(line, |row, line| row.line(line))
         .meta(played)
+        .when(glance.played, |list_row| {
+            list_row.trailing(
+                div()
+                    .id(ElementId::Name(format!("piece-{id}-stars").into()))
+                    .aria_label(format!("{} of 3 stars", glance.stars))
+                    .flex()
+                    .gap(space::XS)
+                    .children(star_icons(glance.stars, cx)),
+            )
+        })
         .more(row.menu.clone())
         .on_click(move |_, _, cx| {
             home.update(cx, |home, cx| home.open(&id, cx)).ok();
@@ -295,6 +336,7 @@ impl Render for Home {
                     piece.id.clone(),
                     Row {
                         piece: piece.clone(),
+                        glance: self.glances.get(&piece.id).copied().unwrap_or_default(),
                         menu,
                     },
                 ))
@@ -310,7 +352,7 @@ impl Render for Home {
             list = list.item(
                 ElementId::Name(format!("piece-{}-item", slot.key).into()),
                 slot.placement,
-                Self::row(slot.value, p.faint, now, home.clone()),
+                Self::row(slot.value, p.faint, now, home.clone(), cx),
             );
         }
         let empty = self.loaded && self.listing.rows().next().is_none();

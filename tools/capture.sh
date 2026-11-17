@@ -3,7 +3,12 @@
 # seat) and a private bus, never the user's session. Prints the start-up timing.
 # usage: tools/capture.sh <file-or-folder> <out.png>; an empty first argument ("") starts it with
 # nothing open, on its start page.
+# The app never sees the real home: HOME and the four XDG folders (data, state, config, cache) are
+# temporary ones, whatever the caller's environment says, and removed afterwards.
 # STATE: a folder copied in as $XDG_STATE_HOME/gamme (what was read before, say).
+# DATA: a folder copied in as $XDG_DATA_HOME/gamme (a library of pieces, say).
+# CACHE: a folder used as $XDG_CACHE_HOME, kept after the run: to share Verovio's unpacked
+# resources between captures on purpose. Without it the cache is a temporary one too.
 # KEYS: keys typed into the window once it is up, as tools/xkeys.py takes them ("j j shift+g").
 # THEN: a shell command run afterwards (a change to the file, say).
 # RENDERER: Weston's renderer, pixman by default (with gl, weston-screenshooter writes the image
@@ -15,7 +20,8 @@ BIN=${GAMME_BIN:-$here/../target/release/gamme}
 FILE=; [ -n "$1" ] && FILE=$(realpath "$1"); OUT=$(realpath -m "$2")
 W=${W:-1280}; H=${H:-1700}
 D=$(mktemp -d /tmp/gamme-capture.XXXX)
-mkdir -p "$D"/{home,runtime,wrun,state,config}; chmod 700 "$D"/*
+mkdir -p "$D"/{home,runtime,wrun,state,config,data,cache}; chmod 700 "$D"/*
+[ -n "${CACHE:-}" ] && { mkdir -p "$CACHE"; CACHE=$(realpath "$CACHE"); }
 # OMARCHY=1: a copy of the current Omarchy theme, read-only, so the capture shows it.
 if [ -n "${OMARCHY:-}" ]; then
   mkdir -p "$D/state/omarchy/current/theme"
@@ -28,10 +34,12 @@ cleanup() {
   [ -n "${KEEP:-}" ] || rm -rf "$D"
 }
 trap cleanup EXIT
-export HOME=$D/home XDG_RUNTIME_DIR=$D/runtime XDG_STATE_HOME=$D/state XDG_CONFIG_HOME=$D/config
+export HOME=$D/home XDG_RUNTIME_DIR=$D/runtime XDG_STATE_HOME=$D/state XDG_CONFIG_HOME=$D/config \
+  XDG_DATA_HOME=$D/data XDG_CACHE_HOME=${CACHE:-$D/cache}
 unset WAYLAND_DISPLAY DBUS_SESSION_BUS_ADDRESS
 
 [ -n "${STATE:-}" ] && cp -r "$STATE" "$D/state/gamme"
+[ -n "${DATA:-}" ] && cp -r "$DATA" "$D/data/gamme"
 XDG_RUNTIME_DIR=$D/wrun weston --backend=headless --renderer=${RENDERER:-pixman} --xwayland --shell=kiosk --fake-seat --debug \
   --socket=wl-gamme --width=$W --height=$H >"$D/weston.log" 2>&1 &
 WPID=$!

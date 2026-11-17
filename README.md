@@ -12,8 +12,8 @@ piece engraved and falling over a keyboard and plays it with a built-in piano or
 your MIDI keyboard lighting and sounding its keys, practice with one hand or both (the piece
 waiting for you, or looping over a few measures), every note you play judged as you play it, with a
 combo and a score, the end of a run with its stars and the measures to rework, and the machinery to
-publish, install and update the app. Stars kept per piece, the practice method and the fingering
-come next.
+publish, install and update the app, and the stars and best scores kept per piece. The practice
+method and the fingering come next.
 
 ## The library
 
@@ -22,7 +22,13 @@ Import a piece with the **Import** button, or drop the file on the window: Music
 copied, with its title and composer, into `$XDG_DATA_HOME/gamme/library` (`~/.local/share/gamme/library`
 by default). The home screen lists the pieces, the last played first; a click on one opens it to
 play, and a piece is removed from the "⋯" menu of its row, which leaves the original file alone.
-A file that is not a score is refused with a sentence that says why.
+A file that is not a score is refused with a sentence that says why. A piece that was played
+shows its stars and its best score (at the fastest speed that has one) on its row.
+
+What a piece's runs earned is kept in `$XDG_STATE_HOME/gamme/progress` (`~/.local/state/gamme/progress`
+by default), one private file per piece, never sent anywhere: the stars (the best a run ever
+earned, never lowered), the best score at each speed, and the history of the last 200 runs. A
+piece removed and imported again gets its stars back, as it is the same piece.
 
 ## Playing a piece
 
@@ -122,7 +128,9 @@ the stars it earned, and the measures to rework.
   **Score** view); each needs 90 % accuracy with **Wait for me** off, on the whole piece (every
   note of your hands judged, struck or missed). A run counts at the slowest speed it was played
   at. A MIDI piece has no score, so it stops at two. When no star came, the dialog says what they
-  ask. They are not kept yet.
+  ask. They are kept with the piece, and the dialog says "New best" when the run earned more
+  stars than any before, or beat the best score kept at its speed. A best score counts only for a
+  run over the whole piece with the wait off.
 - **The measures to rework**: the three that weigh most, a note missed or a wrong key weighing
   two and a late note one, every time through the loop counted. They are named as the score prints
   them; a measure played again by a repeat says which time (“3 (2nd time)”).

@@ -19,7 +19,7 @@ Today it is one window, the design system's identity and theme (Omarchy's, follo
 screen and its library, the play screen (the score, the falling notes and the built-in piano), MIDI
 out and in, practice (hands, wait, A–B loop), the judge of every note with its latency calibration,
 its judgements shown live with a combo and a score, the end of a run (its stars, the measures most
-missed and Rework), and the machinery above. The rest of the game layer, the method, the fingering and the pieces come
+missed and Rework), the stars and best scores kept per piece, and the machinery above. The rest of the game layer, the method, the fingering and the pieces come
 as issues of their own.
 
 ## Commands
@@ -77,7 +77,8 @@ The last three are CI's `verify` job (`.github/workflows/ci.yml`), on Rust 1.95,
 | `judge.rs` | The judge of every note (perfect, good, late, missed, wrong), pure, on the piece's time laid end to end across the loop's passes; `Live` feeds it from the clock, the run's judgements kept in order |
 | `latency.rs` | The latency calibration's clicks and its pure measure, the offset the judge takes away |
 | `tally.rs` | The run's score, combo and accuracy (design §5.2), pure, counted in the piece's order (a miss is said late); what the transport says of them |
-| `stars.rs` | The stars a run earns (design §5.3), pure, from its `Feat` (slowest speed, accuracy, wait, whole piece, aid): for the end of a run and the progress to come |
+| `stars.rs` | The stars a run earns (design §5.3), pure, from its `Feat` (slowest speed, accuracy, wait, whole piece, aid): for the end of a run and the progress (`progress.rs`) |
+| `progress.rs` | What a piece's runs earned (design §5.4): stars (never lowered), best score per speed, the last 200 runs, one file per piece in `$XDG_STATE_HOME/gamme/progress`, read leniently and written atomically; the home screen's stars, the end's "New best" |
 | `run_end.rs` | The end of a run: the measures most missed and Rework's plan (pure), and the dialog that shows them with the stars |
 | `flash.rs` | The judgements on screen, fading (pure), and every colour and size they are drawn with, from the palette |
 | `falling.rs` | The falling notes over the keyboard, painted every frame in one canvas, the judgements flashing on the notes and keys, their words over them |

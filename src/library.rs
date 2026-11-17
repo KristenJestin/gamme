@@ -232,7 +232,7 @@ impl Library {
 }
 
 /// A 24-digit hex id: nothing that could leave the library's folder.
-fn is_id(id: &str) -> bool {
+pub(crate) fn is_id(id: &str) -> bool {
     id.len() == 24 && id.bytes().all(|b| b.is_ascii_hexdigit())
 }
 
