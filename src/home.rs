@@ -14,11 +14,12 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use gpui_design_system::{
     Button, Confirm, EmptyLine, Icon, ListCard, ListRow, Listing, Menu, PageHeader, Section, Toast,
-    Type as _, icon, palette, space, toast,
+    icon, palette, space, toast,
 };
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
 
+use crate::fonts::Pixel as _;
 use crate::icons;
 use crate::library::{ImportError, Library, Piece};
 use crate::progress::{Glance, Store};
@@ -416,7 +417,7 @@ impl Render for Home {
                                     home.update(cx, |_, cx| cx.emit(OpenSettings)).ok();
                                 }
                             })
-                            .below(div().ui_text().text_color(p.mute).child(
+                            .below(div().pixel_text().text_color(p.mute).child(
                                 "Learn the piano: the score first, the falling notes as a help.",
                             )),
                     )

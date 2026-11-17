@@ -24,11 +24,12 @@ use std::rc::Rc;
 use std::time::{Duration, Instant};
 
 use gpui_design_system::{
-    Button, Icon, Segmented, Select, SelectOption, Switch, Type as _, palette, space,
+    Button, Icon, Segmented, Select, SelectOption, Switch, look, palette, space,
 };
 use gpui_kit::*;
 
 use crate::flash::{self, Flashes};
+use crate::fonts::Pixel as _;
 use crate::icons;
 use crate::judge::Live;
 use crate::midi_in::{MidiIn, Played};
@@ -460,7 +461,7 @@ impl Transport {
         let waiting = self.player.clock.held().then(|| {
             div()
                 .id("transport-waiting")
-                .ui_text()
+                .pixel_text()
                 .text_color(p.acc)
                 .whitespace_nowrap()
                 .child(format!("Waiting for {}…", choice.playing.words()))
@@ -489,11 +490,13 @@ impl Transport {
                 .children(said.into_iter().map(|(what, value)| {
                     div()
                         .flex()
+                        .items_baseline()
                         .gap(space::XS)
-                        .ui_text()
+                        .pixel_text()
                         .whitespace_nowrap()
                         .child(div().text_color(p.mute).child(what))
-                        .child(div().text_color(p.text).semibold().child(value))
+                        // The run's figures in the title face, as a game says them.
+                        .child(div().pixel_title(2.).text_color(p.text).child(value))
                 }))
         });
         let rework = self.rework_at_hand().map(|plan| {
@@ -530,7 +533,7 @@ impl Transport {
             .gap(space::MD)
             .child(
                 div()
-                    .ui_text()
+                    .pixel_text()
                     .text_color(p.mute)
                     .whitespace_nowrap()
                     .child("You play (h)"),
@@ -543,7 +546,7 @@ impl Transport {
             .child(
                 div()
                     .id("transport-loop")
-                    .ui_text()
+                    .pixel_text()
                     .text_color(if looped { p.text } else { p.mute })
                     .whitespace_nowrap()
                     .child(label),
@@ -704,7 +707,7 @@ impl Render for Transport {
             .gap(space::SM)
             .px(space::XL)
             .py(space::MD)
-            .border_t_1()
+            .border_t(look().border)
             .border_color(p.line)
             .bg(p.bg)
             .child(
@@ -718,7 +721,7 @@ impl Render for Transport {
                     .child(
                         div()
                             .id("transport-position")
-                            .ui_text()
+                            .pixel_text()
                             .text_color(p.text)
                             .whitespace_nowrap()
                             .child(place),
@@ -736,7 +739,7 @@ impl Render for Transport {
                         div()
                             .id("transport-sound")
                             .flex_1()
-                            .ui_text()
+                            .pixel_text()
                             .text_color(p.mute)
                             .child(sound),
                     )
@@ -745,7 +748,7 @@ impl Render for Transport {
             .children(
                 self.notice
                     .clone()
-                    .map(|notice| div().id("transport-notice").ui_text().child(notice)),
+                    .map(|notice| div().id("transport-notice").pixel_text().child(notice)),
             )
     }
 }

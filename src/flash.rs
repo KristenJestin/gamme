@@ -33,8 +33,9 @@ pub const WORD_SIZE: f32 = 20.;
 pub const WORD_PAD: f32 = 4.;
 /// How opaque the ground under a word over the keys is, at its brightest.
 pub const WORD_GROUND: f32 = 0.85;
-/// The size of a word over an engraved note, in pixels.
-pub const SCORE_WORD_SIZE: f32 = 11.;
+/// The size of a word over an engraved note, in pixels: the title face (Jersey 10) at its own
+/// grid.
+pub const SCORE_WORD_SIZE: f32 = 10.;
 /// How far a flash spreads around an engraved notehead at its brightest, in pixels.
 pub const HALO: f32 = 6.;
 /// How much of its grade's colour a key or a note takes at the brightest of a flash.

@@ -19,12 +19,11 @@
 
 use std::collections::BTreeMap;
 
-use gpui_design_system::{
-    Button, Icon, LabelledLine, Modal, Type as _, lines_block, palette, space,
-};
+use gpui_design_system::{Button, Icon, LabelledLine, Modal, lines_block, palette, space};
 use gpui_kit::*;
 
 use crate::clock::Spans;
+use crate::fonts::Pixel as _;
 use crate::icons;
 use crate::judge::{Grade, Judgement};
 use crate::progress::Outcome;
@@ -364,7 +363,7 @@ pub fn view(
     let note = said_of_stars.map(|said| {
         div()
             .id("run-end-stars-note")
-            .ui_text()
+            .pixel_text()
             .text_color(p.mute)
             .child(said)
     });
@@ -373,8 +372,7 @@ pub fn view(
         .map(|said| {
             div()
                 .id("run-end-best")
-                .ui_text()
-                .semibold()
+                .pixel_title(2.)
                 .text_color(p.acc)
                 .child(said)
         });
@@ -384,12 +382,12 @@ pub fn view(
             .flex()
             .flex_col()
             .gap(space::XS)
-            .child(div().ui_text().semibold().child("The measures to rework"))
+            .child(div().pixel_title(2.).child("The measures to rework"))
             .children(summary.missed.iter().map(|faults| {
                 div()
                     .flex()
                     .gap(space::SM)
-                    .ui_text()
+                    .pixel_text()
                     .child(
                         div()
                             .text_color(p.text)

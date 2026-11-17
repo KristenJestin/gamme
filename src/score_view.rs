@@ -11,10 +11,12 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use gpui_design_system::theme::{radius, target_palette};
-use gpui_design_system::{Skeleton, Type as _, awaiting, palette, space};
+use gpui_design_system::{Corners, Skeleton, awaiting, look, palette, space};
+use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
 
 use crate::flash::{self, Flash, Inks};
+use crate::fonts;
 use crate::raster;
 use crate::score::{Cursor, Placed, Score};
 
@@ -276,7 +278,7 @@ impl ScoreView {
                     let size = flash::SCORE_WORD_SIZE;
                     let text = flash.grade.word();
                     let tall = (size * 1.4).round();
-                    // Wide enough for the word in the kit's face, as it is not measured here.
+                    // Wide enough for the word in the title face, as it is not measured here.
                     let wide = text.len() as f32 * size * 0.62 + 2. * flash::WORD_PAD;
                     let left = (a.left + a.right) / 2. * k - wide / 2.;
                     let top = a.top * k - halo - tall - flash::RISE / 2. * rise;
@@ -291,10 +293,9 @@ impl ScoreView {
                             .rounded(px(2.))
                             .bg(p.card.opacity(flash::WORD_GROUND * strength))
                             .text_center()
-                            .ui_text()
+                            .font_family(fonts::TITLE)
                             .text_size(px(size))
                             .line_height(px(tall))
-                            .semibold()
                             .text_color(ink.opacity(strength))
                             .child(text),
                     );
@@ -315,7 +316,11 @@ impl ScoreView {
                     .flex_none()
                     .w(px(page_width))
                     .h(px(height * k))
-                    .rounded(radius::CARD)
+                    // The page's paper takes the look's corners: rounded in the kit's own, square
+                    // in a pixel one (a page cannot be cut by a notch: GPUI does not clip).
+                    .when(look().corners == Corners::Rounded, |page| {
+                        page.rounded(radius::CARD)
+                    })
                     .bg(p.card)
                     .overflow_hidden()
                     .child(img(image.clone()).size_full())

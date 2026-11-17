@@ -11,11 +11,12 @@ use std::path::{Path, PathBuf};
 
 use gpui_design_system::appearance::{self, Appearance, Source};
 use gpui_design_system::theme::Shade as KitShade;
-use gpui_design_system::{Segmented, Type as _, palette, presence, space};
+use gpui_design_system::{Segmented, palette, presence, space};
 use gpui_kit::prelude::FluentBuilder as _;
-use gpui_kit::{App, IntoElement, ParentElement, Styled, div, px};
+use gpui_kit::{App, IntoElement, ParentElement, Styled, div};
 use serde::{Deserialize, Serialize};
 
+use crate::fonts::Pixel as _;
 use crate::{config, paths, theme};
 
 /// The id of the kit's Omarchy desktop source.
@@ -142,7 +143,7 @@ pub fn control(cx: &App) -> impl IntoElement {
             .flex()
             .items_center()
             .gap(space::MD)
-            .child(div().ui_text().child(label))
+            .child(div().pixel_text().child(label))
             .child(control)
     };
     let colours = Segmented::new(
@@ -193,7 +194,7 @@ pub fn control(cx: &App) -> impl IntoElement {
         .flex_col()
         .gap(space::SM)
         .child(row("Colours", colours))
-        .child(div().text_size(px(12.5)).text_color(p.faint).child(hint))
+        .child(div().pixel_text().text_color(p.faint).child(hint))
         .child(
             presence(
                 "appearance-shade-block",

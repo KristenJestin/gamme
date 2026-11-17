@@ -12,6 +12,7 @@ mod judge;
 mod keyboard;
 mod latency;
 mod library;
+mod look;
 mod midi_in;
 mod midi_out;
 mod paths;
@@ -153,8 +154,8 @@ fn window(opening: Option<play_screen::Opening>) {
                     theme::nocturne,
                 )])
                 .desktop(desktop);
-            gpui_design_system::init(identity, cx);
             fonts::register(cx);
+            gpui_design_system::init_with(identity, look::gamme(), cx);
             appearance::restore(cx);
             let bounds = Bounds::centered(None, size(px(1100.), px(760.)), cx);
             let options = WindowOptions {

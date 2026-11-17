@@ -19,13 +19,13 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use gpui_design_system::{
-    Button, Field, Icon, PageHeader, Section, Select, SelectOption, Toast, Type as _, palette,
-    space, toast,
+    Button, Field, Icon, PageHeader, Section, Select, SelectOption, Toast, palette, space, toast,
 };
 use gpui_kit::*;
 
 use crate::clock::Clock;
 use crate::config::{self, Settings};
+use crate::fonts::Pixel as _;
 use crate::midi_in::{self, Attached, MidiIn, Pedal, Played};
 use crate::midi_out::{self, PortInfo, Ports};
 use crate::player::{Player, Sound};
@@ -490,7 +490,7 @@ impl SettingsPage {
 impl Render for SettingsPage {
     fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let p = palette(cx);
-        let hint = |text: String| div().ui_text().text_color(p.mute).child(text);
+        let hint = |text: String| div().pixel_text().text_color(p.mute).child(text);
 
         let output = port_choice(
             &self.outputs,
@@ -667,7 +667,7 @@ impl Render for SettingsPage {
                                     .gap(space::SM)
                                     .child(
                                         div()
-                                            .ui_text()
+                                            .pixel_text()
                                             .text_color(p.text)
                                             .child(latency_text(self.settings.latency_ms)),
                                     )

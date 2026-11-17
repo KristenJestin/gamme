@@ -32,8 +32,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 use gpui_design_system::{
-    Button, EmptyLine, Icon, PageHeader, Segmented, Skeleton, Toast, Type as _, palette, space,
-    toast,
+    Button, EmptyLine, Icon, PageHeader, Segmented, Skeleton, Toast, look, palette, space, toast,
 };
 use gpui_kit::*;
 
@@ -41,6 +40,7 @@ use crate::clock::Clock;
 use crate::config::{self, Settings};
 use crate::engraver;
 use crate::falling::falling;
+use crate::fonts::Pixel as _;
 use crate::icons;
 use crate::keyboard::{Keyboard, Lights};
 use crate::library::{Library, Piece};
@@ -815,7 +815,7 @@ impl PlayScreen {
             State::Ready(_) => "",
         };
         if !status.is_empty() {
-            header = header.below(div().ui_text().text_color(p.mute).child(status));
+            header = header.below(div().pixel_text().text_color(p.mute).child(status));
         }
         if let State::Ready(ready) = &self.state {
             if ready.score.is_some() {
@@ -880,7 +880,7 @@ impl PlayScreen {
                         div()
                             .flex_1()
                             .min_w_0()
-                            .ui_text()
+                            .pixel_text()
                             .text_color(p.text)
                             .child(part.name.clone()),
                     )
@@ -905,9 +905,9 @@ impl PlayScreen {
             .flex()
             .flex_col()
             .gap(space::SM)
-            .border_b_1()
+            .border_b(look().border)
             .border_color(p.line)
-            .child(div().ui_text().text_color(p.mute).child(
+            .child(div().pixel_text().text_color(p.mute).child(
                 "Which hand plays each part. \u{201c}Both\u{201d} splits it at the middle C.",
             ))
             .children(rows)
@@ -966,7 +966,7 @@ impl Render for PlayScreen {
                             div()
                                 .flex_none()
                                 .h(relative(0.42))
-                                .border_t_1()
+                                .border_t(look().border)
                                 .border_color(p.line)
                                 .child(notes()),
                         )
@@ -1017,7 +1017,7 @@ impl Render for PlayScreen {
                     .px(space::XXL)
                     .pt(space::XL)
                     .pb(space::LG)
-                    .border_b_1()
+                    .border_b(look().border)
                     .border_color(p.line)
                     .child(header),
             )

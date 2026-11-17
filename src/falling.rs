@@ -23,14 +23,12 @@ use gpui_kit::*;
 use crate::flash::{self, Flashes, Inks};
 use crate::fonts;
 use crate::keyboard::{Keyboard, Lights, is_black};
+use crate::look::CELL;
 use crate::theme;
 use crate::timeline::{Hand, Timeline};
 
 /// How much of the piece the falling area shows ahead of now, in ms at its own tempo.
 pub const LOOKAHEAD_MS: f64 = 3_000.;
-
-/// One pixel of the art, in pixels of the window.
-pub const CELL: f32 = 4.;
 
 /// How many cells a key's front edge is high; a pressed key sinks by as much.
 const LIP: f32 = 2.;

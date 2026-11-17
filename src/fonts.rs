@@ -1,28 +1,24 @@
-//! Gamme's own faces, pixel fonts (README, "Brand"): Jersey 10 for the titles and the buttons,
+//! Gamme's own faces, pixel fonts (README, "Brand"): Jersey 10 for the titles and the controls,
 //! Gamme Dot (DotGothic16 with its "ç" put back on the baseline, `tools/fonts.py`) for the text.
-//! Both are bundled, under the SIL Open Font License (the licences are beside the files).
+//! Both are bundled, under the SIL Open Font License (the licences are beside the files); the kit
+//! draws its components in them (`look.rs`).
 //!
 //! A pixel font stays sharp only at its own size or a whole multiple of it, where each of its
-//! pixels covers whole pixels of the screen: the sizes below are those.
+//! pixels covers whole pixels of the screen: the sizes Gamme sets are those ([`Pixel`]).
 
 use std::borrow::Cow;
 
-use gpui_kit::App;
+use gpui_design_system::{Type as _, typography};
+use gpui_kit::{App, Styled, px};
 
-/// The titles, the buttons, and the judgements' words over the keys (`falling.rs`).
+/// The titles, the controls, and the judgements' words over the keys (`falling.rs`).
 pub const TITLE: &str = "Jersey 10";
-
-// The other names and sizes wait for the pixel components that set them (#29: the kit's
-// components cannot take another face yet).
 /// The interface's text.
-#[allow(dead_code)]
 pub const TEXT: &str = "Gamme Dot";
 
 /// Jersey 10 draws on 10 pixels to the em.
-#[allow(dead_code)]
 pub const TITLE_GRID: f32 = 10.;
 /// Gamme Dot draws on 16 pixels to the em.
-#[allow(dead_code)]
 pub const TEXT_GRID: f32 = 16.;
 
 const FILES: [&[u8]; 2] = [
@@ -30,19 +26,31 @@ const FILES: [&[u8]; 2] = [
     include_bytes!("../assets/fonts/GammeDot-Regular.ttf"),
 ];
 
-/// Hands the faces to the window's text system, once at start-up.
+/// Hands the faces to the window's text system, once at start-up, before the look names them.
 pub fn register(cx: &mut App) {
-    let fonts = FILES.iter().map(|bytes| Cow::Borrowed(*bytes)).collect();
-    if let Err(error) = cx.text_system().add_fonts(fonts) {
-        eprintln!("gamme: the bundled fonts could not be loaded: {error}");
+    typography::add_fonts(FILES.iter().map(|bytes| Cow::Borrowed(*bytes)), cx);
+}
+
+/// The pixel faces at their own sizes, for the texts Gamme sets itself (the kit sets its own).
+pub trait Pixel: Styled + Sized {
+    /// The interface's face (Gamme Dot) at its own size, on lines of 24 pixels.
+    fn pixel_text(self) -> Self {
+        self.ui_text()
+            .text_size(px(TEXT_GRID))
+            .line_height(px(TEXT_GRID * 1.5))
+    }
+
+    /// The title face (Jersey 10) at `times` its own size, on lines a fifth taller.
+    fn pixel_title(self, times: f32) -> Self {
+        let size = TITLE_GRID * times.round().max(1.);
+        self.ui_text()
+            .title_text()
+            .text_size(px(size))
+            .line_height(px((size * 1.2).round()))
     }
 }
 
-/// `size` in pixels, at the nearest whole multiple of `grid` (one multiple at least).
-#[allow(dead_code)]
-pub fn snap(size: f32, grid: f32) -> f32 {
-    (size / grid).round().max(1.) * grid
-}
+impl<T: Styled> Pixel for T {}
 
 #[cfg(test)]
 mod tests {
@@ -62,10 +70,13 @@ mod tests {
     }
 
     #[test]
-    fn a_size_is_a_whole_multiple_of_the_grid() {
-        assert_eq!(snap(16., TEXT_GRID), 16.);
-        assert_eq!(snap(13.5, TEXT_GRID), 16.);
-        assert_eq!(snap(26., TITLE_GRID), 30.);
-        assert_eq!(snap(2., TITLE_GRID), 10.);
+    fn gamme_s_texts_are_whole_multiples_of_their_face_s_grid() {
+        let size = |mut element: gpui_kit::Div| match element.style().text.font_size {
+            Some(gpui_kit::AbsoluteLength::Pixels(size)) => f32::from(size),
+            other => panic!("{other:?}"),
+        };
+        assert_eq!(size(gpui_kit::div().pixel_text()), TEXT_GRID);
+        // Rounded to whole times its grid.
+        assert_eq!(size(gpui_kit::div().pixel_title(2.4)), 2. * TITLE_GRID);
     }
 }
