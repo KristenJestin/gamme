@@ -27,23 +27,109 @@
 //!   past the next chord the player owes: it stands there until the window says it was struck
 //!   ([`Clock::owed`], [`Clock::release_chord`]). A chord is released for one pass of the position
 //!   (one value of the counter of seeks), so that a seek or a loop owes it again.
-//! - **Loop**: between measures A and B ([`Clock::set_loop`]), the position reaching B's end goes
+//! - **Loop**: between measures A and B (one span of [`Clock::set_spans`]), the position reaching B's end goes
 //!   on from A's start in the same step, with what was left of it: no gap. The wrap counts as a
 //!   seek, which the one that steps the clock knows of ([`Step::seeks`]): the audio side lets the
 //!   piece's notes go at the seam itself, at its exact frame.
+//! - **Spans**: a loop may be several spans of measures apart ([`Spans`], [`Clock::set_spans`]:
+//!   Rework's measures 3 and 7). The end of one goes on from the start of the next, the last's
+//!   from the first's, each seam a wrap as above. They live in two banks of atomics: the window
+//!   writes the one not in use, then says it is (`loop_state`); the audio side reads the one in
+//!   use, and again in the rare case a write began meanwhile, never waiting for one.
 //!
 //! The one that moves the clock asks first where a step goes ([`Clock::step`]), plays what it
 //! goes through, then commits it ([`Clock::commit`]): what is played and where the clock goes
 //! are the same, even when the window releases a chord in between.
 
-use std::sync::Arc;
 use std::sync::atomic::{
     AtomicBool, AtomicU8, AtomicU32, AtomicU64,
     Ordering::{AcqRel, Acquire, Relaxed, Release},
 };
+use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
 use crate::timeline::Timeline;
+
+/// The most spans a loop has: Rework's measures (`run_end.rs`), each apart.
+pub const MAX_SPANS: usize = 4;
+
+/// A loop: up to [`MAX_SPANS`] spans of measures, each its first and last (both included, in the
+/// order of play), sorted, apart; none plays on. Spans that touch or overlap are one.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Spans {
+    spans: [(usize, usize); MAX_SPANS],
+    len: usize,
+}
+
+impl Spans {
+    pub const NONE: Spans = Spans {
+        spans: [(0, 0); MAX_SPANS],
+        len: 0,
+    };
+
+    /// The spans of `measures` (first, last, in either order): sorted, joined where they touch,
+    /// those past [`MAX_SPANS`] dropped. The window's: it allocates.
+    pub fn of(measures: impl IntoIterator<Item = (usize, usize)>) -> Self {
+        let mut all: Vec<(usize, usize)> = measures
+            .into_iter()
+            .map(|(a, b)| (a.min(b), a.max(b)))
+            .collect();
+        all.sort_unstable();
+        let mut spans = Self::NONE;
+        for (first, last) in all {
+            match spans.len.checked_sub(1).map(|at| &mut spans.spans[at]) {
+                Some(previous) if first <= previous.1.saturating_add(1) => {
+                    previous.1 = previous.1.max(last);
+                }
+                _ if spans.len == MAX_SPANS => break,
+                _ => {
+                    spans.spans[spans.len] = (first, last);
+                    spans.len += 1;
+                }
+            }
+        }
+        spans
+    }
+
+    pub fn as_slice(&self) -> &[(usize, usize)] {
+        &self.spans[..self.len]
+    }
+
+    #[cfg(test)]
+    pub fn is_empty(&self) -> bool {
+        self.len == 0
+    }
+}
+
+/// The loop's spans as the clock plays them, in µs: each start and end, sorted, none empty.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct Loop {
+    spans: [(u64, u64); MAX_SPANS],
+    len: usize,
+}
+
+impl Loop {
+    fn get(&self, span: usize) -> Option<(u64, u64)> {
+        self.spans[..self.len].get(span).copied()
+    }
+
+    /// The span a position plays on to the end of: the first that ends after it.
+    fn span_of(&self, position: u64) -> Option<usize> {
+        self.spans[..self.len]
+            .iter()
+            .position(|&(_, end)| position < end)
+    }
+
+    /// The span that goes on from the end of `span`: the next, the first after the last.
+    fn after(&self, span: usize) -> Option<(u64, u64)> {
+        self.get((span + 1) % self.len.max(1))
+    }
+}
+
+/// The bank of spans in use at `state`'s generation (see [`Shared::loop_state`]).
+fn bank_of(state: u64) -> usize {
+    ((state >> 8) / 2 % 2) as usize
+}
 
 /// The position takes 40 bits, in microseconds (12 days); the counter of seeks the 23 above;
 /// the top bit says the audio side drives the clock.
@@ -182,7 +268,8 @@ pub struct Step {
     /// The time of the piece it goes through first, `[from, to)`, in µs.
     pub from_us: u64,
     pub to_us: u64,
-    /// Past the end of the loop (`to_us`), what it goes through from the loop's start.
+    /// Past the end of a span of the loop (`to_us`), what it goes through from the next one's
+    /// start.
     pub wrapped: Option<(u64, u64)>,
     /// How much of the time asked it covers: less when a chord owed holds it.
     pub moved_us: u64,
@@ -223,9 +310,18 @@ struct Shared {
     gates: [Gates; 3],
     /// The [`Wait`] chosen, by its place in [`Wait::ALL`].
     wait: AtomicU8,
-    /// The loop, as its first measure above and its last plus one below; 0 for none. One
-    /// atomic, so that the audio side never reads the start of one loop and the end of another.
-    looped: AtomicU64,
+    /// The loop's spans, each as its first measure above and its last plus one below, in two
+    /// banks: the one in use, and the one the next loop is written in.
+    banks: [[AtomicU64; MAX_SPANS]; 2],
+    /// A generation above, the number of spans of the bank in use below (8 bits). The window
+    /// writes a loop in three moves: one more on the generation (odd: the other bank is being
+    /// written), that bank, then one more again with its count (even: it is in use). A reader
+    /// reads the bank of the generation it saw ([`bank_of`]); it read one loop whole if the
+    /// generation went up by one at most meanwhile, as the bank it read is written again only
+    /// two writes later.
+    loop_state: AtomicU64,
+    /// The window's writes of the loop, one at a time; the audio side never takes it.
+    loop_writer: Mutex<()>,
     origin: Instant,
     /// When the position was last set or advanced, in nanoseconds since `origin`: written after
     /// the position (Release), read before it (Acquire).
@@ -270,7 +366,9 @@ impl Clock {
             measures: measures.into(),
             gates: std::array::from_fn(|list| Gates::new(&marks.gates_ms[list])),
             wait: AtomicU8::new(0),
-            looped: AtomicU64::new(0),
+            banks: Default::default(),
+            loop_state: AtomicU64::new(0),
+            loop_writer: Mutex::new(()),
             origin: Instant::now(),
             stamp_ns: AtomicU64::new(0),
             stamp_speed: AtomicU32::new(Speed::FULL.percent()),
@@ -365,43 +463,94 @@ impl Clock {
     /// Plays measures `first` to `last` (0 is the first, in the order of play, both included)
     /// again and again; none plays on. A measure the clock does not know is held to the last
     /// one. It does not move the position: the window seeks to A when it stands outside.
+    #[cfg(test)]
     pub fn set_loop(&self, measures: Option<(usize, usize)>) {
+        self.set_spans(Spans::of(measures));
+    }
+
+    /// Plays `spans` one after the other, again and again (see the module); none plays on.
+    /// Measures it does not know are held to the last one. The window's, never the audio side's.
+    pub fn set_spans(&self, spans: Spans) {
         let count = self.0.measures.len();
-        let packed = measures.map_or(0, |(first, last)| {
-            let (first, last) = (first.min(last), first.max(last));
-            let first = first.min(count - 1) as u64;
-            let end = (last + 1).min(count) as u64;
-            first << 32 | end
-        });
-        self.0.looped.store(packed, Release);
-    }
-
-    /// The loop's first and last measures, when there is one.
-    pub fn looped(&self) -> Option<(usize, usize)> {
-        let packed = self.0.looped.load(Acquire);
-        (packed != 0).then(|| ((packed >> 32) as usize, (packed as u32 as usize) - 1))
-    }
-
-    /// The loop's start and end, in µs.
-    fn loop_us(&self) -> Option<(u64, u64)> {
-        let (first, last) = self.looped()?;
-        let start = *self.0.measures.get(first)?;
-        let end = self
+        let held = Spans::of(
+            spans
+                .as_slice()
+                .iter()
+                .map(|&(first, last)| (first.min(count - 1), last.min(count - 1))),
+        );
+        let _one = self
             .0
-            .measures
-            .get(last + 1)
-            .copied()
-            .unwrap_or(self.0.end_us);
-        (start < end).then_some((start, end))
+            .loop_writer
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let state = self.0.loop_state.load(Acquire);
+        // Writes come one at a time: the generation is even here. Odd: the other bank is written.
+        let writing = (state >> 8) | 1;
+        self.0
+            .loop_state
+            .store(writing << 8 | (state & 0xff), Release);
+        let bank = &self.0.banks[bank_of((writing + 1) << 8)];
+        for (slot, &(first, last)) in bank.iter().zip(held.as_slice()) {
+            slot.store((first as u64) << 32 | (last as u64 + 1), Release);
+        }
+        self.0
+            .loop_state
+            .store((writing + 1) << 8 | held.len as u64, Release);
     }
 
-    /// Where the position stops going on from `position`, the chords aside: the end of the loop
-    /// when it is before it, the end of the piece otherwise.
-    fn limit_us(&self, position: u64, looped: Option<(u64, u64)>) -> u64 {
-        match looped {
-            Some((_, end)) if position < end => end,
-            _ => self.0.end_us,
+    /// The loop's spans of measures; none when there is no loop.
+    pub fn looped(&self) -> Spans {
+        // A write takes nanoseconds and they come at the player's pace: a second try is already
+        // rare. Bounded all the same, the audio side never spins: past them, no loop for a read.
+        for _ in 0..64 {
+            let mut spans = Spans::NONE;
+            let before = self.0.loop_state.load(Acquire);
+            let bank = &self.0.banks[bank_of(before)];
+            let len = ((before & 0xff) as usize).min(MAX_SPANS);
+            for (span, slot) in spans.spans.iter_mut().zip(bank).take(len) {
+                let packed = slot.load(Acquire);
+                *span = (
+                    (packed >> 32) as usize,
+                    (packed as u32 as usize).saturating_sub(1),
+                );
+            }
+            spans.len = len;
+            let after = self.0.loop_state.load(Acquire);
+            if (after >> 8).wrapping_sub(before >> 8) <= 1 {
+                return spans;
+            }
         }
+        Spans::NONE
+    }
+
+    /// The loop's spans in µs, those of no length left out. No lock, no allocation.
+    fn loop_us(&self) -> Loop {
+        let mut looped = Loop::default();
+        for &(first, last) in self.looped().as_slice() {
+            let Some(&start) = self.0.measures.get(first) else {
+                continue;
+            };
+            let end = self
+                .0
+                .measures
+                .get(last + 1)
+                .copied()
+                .unwrap_or(self.0.end_us);
+            if start < end {
+                looped.spans[looped.len] = (start, end);
+                looped.len += 1;
+            }
+        }
+        looped
+    }
+
+    /// Where the position stops going on from `position`, the chords aside: the end of the span
+    /// of the loop it plays on to, the end of the piece past the loop's last.
+    fn limit_us(&self, position: u64, looped: &Loop) -> u64 {
+        looped
+            .span_of(position)
+            .and_then(|span| looped.get(span))
+            .map_or(self.0.end_us, |(_, end)| end)
     }
 
     /// The list of chords waited for now.
@@ -417,7 +566,7 @@ impl Clock {
     }
 
     /// The chord the player owes now: the one the clock stands on, or the next it will. Past the
-    /// last one of the loop, the first of its next pass. None while nothing is waited for.
+    /// last one of the loop's span, the first of its next pass. None while nothing is waited for.
     #[cfg(test)]
     pub fn owed(&self) -> Option<Owed> {
         self.owed_seen(None)
@@ -436,7 +585,7 @@ impl Clock {
         let snapshot = self.snapshot();
         let position = snapshot.position_us;
         let looped = self.loop_us();
-        let limit = self.limit_us(position, looped);
+        let limit = self.limit_us(position, &looped);
         // The position the window sees (a buffer ahead of the published one), or the one asked.
         let seen_us = match seen_ms {
             Some(ms) => ms * 1e3,
@@ -450,14 +599,15 @@ impl Clock {
                 ahead_ms: (gates.onsets[index] as f64 - seen_us).max(0.) / 1e3,
             });
         }
-        let (start, end) = looped.filter(|&(_, end)| position < end)?;
+        let (start, end) = looped.after(looped.span_of(position)?)?;
         let pass = snapshot.seeks.wrapping_add(1) & SEEKS_MASK as u32;
         let index = gates.owed(start, end, pass)?;
         Some(Owed {
             wait,
             index,
             pass,
-            ahead_ms: ((end as f64 - seen_us).max(0.) + (gates.onsets[index] - start) as f64) / 1e3,
+            ahead_ms: ((limit as f64 - seen_us).max(0.) + (gates.onsets[index] - start) as f64)
+                / 1e3,
         })
     }
 
@@ -478,7 +628,7 @@ impl Clock {
             return false;
         }
         let position = snapshot.position_us;
-        let limit = self.limit_us(position, self.loop_us());
+        let limit = self.limit_us(position, &self.loop_us());
         self.hold_us(position, limit, snapshot.seeks) == Some(position)
     }
 
@@ -507,7 +657,7 @@ impl Clock {
             ms += ahead as f64 / 1e6 * Speed::new(speed).factor();
             // Never past what stops the position: a chord owed, the end of the loop.
             let seeks = seeks_of(shared.state.load(Acquire)) as u32;
-            let limit = self.limit_us(position, self.loop_us());
+            let limit = self.limit_us(position, &self.loop_us());
             let stop = self.hold_us(position, limit, seeks).unwrap_or(limit);
             ms = ms.min(stop as f64 / 1e3);
         }
@@ -556,7 +706,7 @@ impl Clock {
                 .min(EXTRAPOLATION_LIMIT_NS as i64)
                 .max(set.min(stamp) - stamp);
             ms = (ms + ahead_ns as f64 / 1e6 * Speed::new(speed).factor()).max(0.);
-            let limit = self.limit_us(position, self.loop_us());
+            let limit = self.limit_us(position, &self.loop_us());
             let stop = self.hold_us(position, limit, seeks).unwrap_or(limit);
             ms = ms.min(stop as f64 / 1e3);
         }
@@ -598,29 +748,34 @@ impl Clock {
 
     /// Where moving on by `us` of the piece's own tempo (already scaled by the speed) from
     /// `from` goes: no further than the chord owed next, nor than the end of the piece; past the
-    /// end of the loop, on from its start. Nothing moves until it is committed. No lock, no
-    /// allocation.
+    /// end of a span of the loop, on from the start of the next (the first after the last).
+    /// Nothing moves until it is committed. No lock, no allocation.
     pub fn step(&self, from: &Snapshot, us: u64) -> Step {
         let position = from.position_us;
         let looped = self.loop_us();
-        let limit = self.limit_us(position, looped);
+        let limit = self.limit_us(position, &looped);
         let target = position.saturating_add(us);
         let held = |at: u64, below: u64, pass: u32, to: u64| {
             self.hold_us(at, below, pass)
                 .map_or(to, |hold| to.min(hold))
         };
         let first = held(position, limit, from.seeks, target.min(limit));
-        let wrap = looped.filter(|&(_, end)| position < end && first == end && target >= end);
+        let wrap = looped
+            .span_of(position)
+            .filter(|_| first == limit && target >= limit)
+            .and_then(|span| looped.after(span));
         match wrap {
             Some((start, end)) => {
+                // A step longer than the next span (one shorter than a buffer) goes round in it,
+                // never past its end into what the loop leaves out.
                 let length = end - start;
                 let pass = from.seeks.wrapping_add(1) & SEEKS_MASK as u32;
-                let to = held(start, end, pass, start + (target - end) % length);
+                let to = held(start, end, pass, start + (target - limit) % length);
                 Step {
                     from_us: position,
-                    to_us: end,
+                    to_us: limit,
                     wrapped: Some((start, to)),
-                    moved_us: (end - position) + (to - start),
+                    moved_us: (limit - position) + (to - start),
                     seeks: pass,
                 }
             }
@@ -961,7 +1116,7 @@ mod tests {
     fn a_loop_goes_on_from_its_start_with_what_was_left_and_counts_as_a_seek() {
         let clock = four_measures(Default::default());
         clock.set_loop(Some((2, 1)));
-        assert_eq!(clock.looped(), Some((1, 2)), "its ends in order");
+        assert_eq!(clock.looped().as_slice(), [(1, 2)], "its ends in order");
         clock.seek_ms(2900.);
         clock.play();
         let before = clock.snapshot();
@@ -990,12 +1145,139 @@ mod tests {
 
         // Measures it does not know are held to its last one; none plays on.
         clock.set_loop(Some((7, 99)));
-        assert_eq!(clock.looped(), Some((3, 3)));
+        assert_eq!(clock.looped().as_slice(), [(3, 3)]);
         clock.set_loop(None);
-        assert_eq!(clock.looped(), None);
+        assert!(clock.looped().is_empty());
         clock.seek_ms(3900.);
         clock.tick(seconds(0.2));
         assert!(!clock.playing(), "the end of the piece");
+    }
+
+    #[test]
+    fn spans_are_sorted_joined_where_they_touch_and_held_to_the_most() {
+        assert_eq!(Spans::of([(6, 6), (2, 2)]).as_slice(), [(2, 2), (6, 6)]);
+        assert_eq!(
+            Spans::of([(3, 2), (4, 4), (9, 7)]).as_slice(),
+            [(2, 4), (7, 9)]
+        );
+        assert_eq!(Spans::of([(1, 5), (2, 3)]).as_slice(), [(1, 5)]);
+        let many = Spans::of((0..10).map(|m| (m * 2, m * 2)));
+        assert_eq!(many.as_slice().len(), MAX_SPANS);
+        assert_eq!(
+            many.as_slice()[MAX_SPANS - 1],
+            (6, 6),
+            "the first ones kept"
+        );
+        assert!(Spans::of(None).is_empty());
+    }
+
+    /// Measures 2 and 4 of five measures of a second (1 s to 2 s, 3 s to 4 s).
+    fn two_spans(gates: [Vec<f64>; 3]) -> Clock {
+        let clock = Clock::with_marks(
+            5000.,
+            &Marks {
+                measures_ms: vec![0., 1000., 2000., 3000., 4000.],
+                gates_ms: gates,
+            },
+        );
+        clock.set_spans(Spans::of([(3, 3), (1, 1)]));
+        clock
+    }
+
+    #[test]
+    fn a_loop_of_two_spans_goes_from_the_end_of_each_to_the_start_of_the_next() {
+        let clock = two_spans(Default::default());
+        assert_eq!(clock.looped().as_slice(), [(1, 1), (3, 3)]);
+        clock.seek_ms(1900.);
+        clock.play();
+        // From the first span's end on into the second's start, with what was left: no gap.
+        let before = clock.snapshot();
+        let step = clock.step(&before, 300_000);
+        assert_eq!((step.from_us, step.to_us), (1_900_000, 2_000_000));
+        assert_eq!(step.wrapped, Some((3_000_000, 3_200_000)));
+        assert_eq!(step.moved_us, 300_000);
+        assert_eq!(step.seeks, before.seeks + 1, "one wrap");
+        assert!(clock.commit(&before, &step));
+        // From the last span's end back to the first's.
+        clock.tick(seconds(0.9));
+        assert_eq!(clock.snapshot().position_us, 1_100_000);
+        assert_eq!(clock.snapshot().seeks, before.seeks + 2);
+        assert!(clock.playing());
+        // The window never sees what the loop leaves out while it waits for the next buffer.
+        clock.seek_ms(1999.);
+        std::thread::sleep(Duration::from_millis(10));
+        assert!(clock.position_ms() <= 2000., "{}", clock.position_ms());
+        // Before the first span, it plays on to that span's end; between the two, to the second's;
+        // after the last, to the end of the piece.
+        clock.seek_ms(500.);
+        clock.tick(seconds(1.6));
+        assert_eq!(clock.snapshot().position_us, 3_100_000);
+        clock.seek_ms(2500.);
+        clock.tick(seconds(1.6));
+        assert_eq!(clock.snapshot().position_us, 1_100_000);
+        clock.seek_ms(4500.);
+        clock.tick(seconds(1.));
+        assert!(!clock.playing(), "the end of the piece");
+    }
+
+    #[test]
+    fn the_loop_ending_with_the_piece_goes_on_into_its_next_span() {
+        let clock = two_spans(Default::default());
+        clock.set_spans(Spans::of([(1, 1), (4, 4)]));
+        clock.seek_ms(4900.);
+        clock.play();
+        clock.tick(seconds(0.2));
+        assert_eq!(clock.snapshot().position_us, 1_100_000);
+        assert!(clock.playing());
+    }
+
+    #[test]
+    fn past_the_last_chord_of_a_span_the_first_of_the_next_is_owed_in_the_next_pass() {
+        let clock = two_spans([vec![1000., 2500., 3200.], vec![], vec![]]);
+        clock.set_wait(Wait::Right);
+        clock.seek_ms(1950.);
+        clock.play();
+        // Not the chord at 2.5 s, which the loop leaves out: the one at 3.2 s, after the seam.
+        let owed = clock.owed().unwrap();
+        assert_eq!(owed.index, 2);
+        assert_eq!(owed.pass, clock.snapshot().seeks + 1);
+        assert!((owed.ahead_ms - 250.).abs() < 5., "{}", owed.ahead_ms);
+        // It holds the clock there once it wrapped.
+        clock.tick(seconds(0.5));
+        assert_eq!(clock.snapshot().position_us, 3_200_000);
+        assert!(clock.held());
+    }
+
+    #[test]
+    fn a_loop_is_always_read_whole_while_the_window_changes_it() {
+        let clock = Clock::with_marks(
+            10_000.,
+            &Marks {
+                measures_ms: (0..10).map(|m| f64::from(m) * 1000.).collect(),
+                gates_ms: Default::default(),
+            },
+        );
+        let a = Spans::of([(1, 1), (3, 4), (8, 8)]);
+        let b = Spans::of([(2, 2), (6, 6)]);
+        let stop = Arc::new(AtomicBool::new(false));
+        let writer = {
+            let (clock, stop) = (clock.clone(), stop.clone());
+            std::thread::spawn(move || {
+                let mut flip = false;
+                while !stop.load(Relaxed) {
+                    clock.set_spans(if flip { a } else { b });
+                    clock.set_loop(None);
+                    flip = !flip;
+                }
+            })
+        };
+        // Short: a few tens of milliseconds of a writer that never pauses.
+        for _ in 0..50_000 {
+            let seen = clock.looped();
+            assert!(seen == a || seen == b || seen.is_empty(), "{seen:?}");
+        }
+        stop.store(true, Relaxed);
+        writer.join().unwrap();
     }
 
     #[test]

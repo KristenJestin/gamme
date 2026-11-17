@@ -12,6 +12,11 @@
 //! instant it arrived, and each tick tells it time moved on. Hands changed, the run starts again.
 //! What the judge says is counted (`tally.rs`: score, combo, accuracy, said in the practice row)
 //! and flashed (`flash.rs`: drawn by the play screen on the notes and the keys).
+//!
+//! When a run ends at the end of the piece, its end (`run_end.rs`) is made here, for the play
+//! screen to show over the piece: what it says, its stars, its Rework. Whether the falling notes
+//! were shown while the run played (the aid, which the third star asks to be gone) is followed
+//! here too, the play screen saying what it shows.
 
 use std::cell::RefCell;
 use std::rc::Rc;
@@ -28,6 +33,7 @@ use crate::judge::Live;
 use crate::midi_in::{MidiIn, Played};
 use crate::player::{Player, Sound};
 use crate::practice::{self, Choice, Playing, Practice};
+use crate::run_end::{self, Summary};
 use crate::soundfont::Stage;
 use crate::tally::{self, Tally};
 use crate::wall_clock::WallClock;
@@ -38,8 +44,16 @@ const REFRESH: Duration = Duration::from_millis(33);
 /// How long the app waits for the output to close when it quits.
 const QUIT_WAIT: Duration = Duration::from_millis(500);
 
-/// The speeds offered, in percent: the clock takes any from 25 to 100.
+/// The speeds offered, in percent: the clock takes any from 25 to 100. Rework slows to one of them.
 const SPEEDS: [u32; 3] = [25, 50, 100];
+
+/// The end of the run that ended last, and whether it is shown.
+struct End {
+    summary: Summary,
+    /// Its judge's run: one more, and another run started.
+    run: u64,
+    shown: bool,
+}
 
 pub struct Transport {
     player: Player,
@@ -60,19 +74,29 @@ pub struct Transport {
     flashes: flash::Shared,
     /// What the settings measured, taken away from each key.
     latency_ms: f64,
+    /// Whether the piece has a score: a MIDI file has none.
+    engraved: bool,
+    /// Whether the play screen shows the falling notes.
+    aid: bool,
+    /// Whether they were shown while the judge's run [`Transport::aided_run`] played.
+    aided: bool,
+    aided_run: u64,
+    end: Option<End>,
     _refresh: Task<()>,
 }
 
 impl EventEmitter<Choice> for Transport {}
 
 impl Transport {
-    /// `practice` is put on the player at once; `latency_ms` is the settings'.
+    /// `practice` is put on the player at once; `latency_ms` is the settings'; `engraved` whether
+    /// the piece has a score.
     pub fn new(
         player: Player,
         names: Vec<SharedString>,
         mut practice: Practice,
         midi_in: MidiIn,
         latency_ms: i32,
+        engraved: bool,
         cx: &mut Context<Self>,
     ) -> Self {
         practice.set_keyboard(midi_in.listening_to_any(), &player);
@@ -93,6 +117,10 @@ impl Transport {
                             judge.tick(&this.player.clock);
                         }
                         if this.catch_up() {
+                            cx.notify();
+                        }
+                        this.follow_aid();
+                        if this.look_for_the_end() {
                             cx.notify();
                         }
                         // A keyboard plugged in or out: the wait can be had, or not.
@@ -136,7 +164,110 @@ impl Transport {
             tally: Tally::default(),
             flashes: Rc::new(RefCell::new(Flashes::default())),
             latency_ms,
+            engraved,
+            aid: true,
+            aided: false,
+            aided_run: 0,
+            end: None,
             _refresh: refresh,
+        }
+    }
+
+    /// Whether the play screen shows the falling notes from now on.
+    pub fn set_aid(&mut self, aid: bool) {
+        self.aid = aid;
+        self.follow_aid();
+    }
+
+    /// The run being played was aided once the falling notes were shown while it played.
+    fn follow_aid(&mut self) {
+        let run = self.judge.as_ref().map_or(0, Live::runs);
+        if run != self.aided_run {
+            self.aided_run = run;
+            self.aided = false;
+        }
+        if self.aid && self.player.clock.playing() {
+            self.aided = true;
+        }
+    }
+
+    /// Makes the end of a run that just ended, and shows it; hides the one shown once another
+    /// run started. Whether anything changed.
+    fn look_for_the_end(&mut self) -> bool {
+        let Some(judge) = &self.judge else {
+            return false;
+        };
+        let run = judge.runs();
+        if !judge.ended() {
+            let started = self
+                .end
+                .as_ref()
+                .is_some_and(|end| end.shown && end.run != run);
+            if let Some(end) = self.end.as_mut().filter(|_| started) {
+                end.shown = false;
+            }
+            return started;
+        }
+        if self.end.as_ref().is_some_and(|end| end.run == run) || judge.run().is_empty() {
+            return false;
+        }
+        let summary = Summary::of(
+            judge.run().judgements(),
+            judge.owed(),
+            self.aided,
+            self.engraved,
+            &SPEEDS,
+        );
+        self.end = Some(End {
+            summary,
+            run,
+            shown: true,
+        });
+        true
+    }
+
+    /// The end of the run that ended last, and whether it is shown; none before one ended.
+    pub fn end(&self) -> Option<(&Summary, bool)> {
+        self.end.as_ref().map(|end| (&end.summary, end.shown))
+    }
+
+    /// The measures as the score prints them, in the order of play, when they fit the piece.
+    pub fn names(&self) -> &[SharedString] {
+        if self.names.len() == self.player.timeline.measure_count() {
+            &self.names
+        } else {
+            &[]
+        }
+    }
+
+    pub fn close_end(&mut self, cx: &mut Context<Self>) {
+        if let Some(end) = &mut self.end {
+            end.shown = false;
+        }
+        cx.notify();
+    }
+
+    /// The piece again from its start, as it was played: Rework ends.
+    pub fn play_again(&mut self, cx: &mut Context<Self>) {
+        self.close_end(cx);
+        if self.practice.reworking().is_some() {
+            self.practice.clear_loop(&self.player);
+        }
+        self.player.clock.seek_ms(0.);
+        if !self.player.wants_to_play() {
+            self.toggle(cx);
+        }
+    }
+
+    /// Rework of the run that ended: its measures most missed, looped, slowed, played at once.
+    pub fn rework(&mut self, cx: &mut Context<Self>) {
+        let Some(plan) = self.end.as_ref().and_then(|end| end.summary.rework.clone()) else {
+            return;
+        };
+        self.close_end(cx);
+        self.practice.rework(plan, &self.player);
+        if !self.player.wants_to_play() {
+            self.toggle(cx);
         }
     }
 
@@ -192,6 +323,13 @@ impl Transport {
             &self.player.clock,
         );
         self.tally = Tally::default();
+        self.aided_run = 0;
+        self.aided = false;
+        if let Some(end) = &mut self.end {
+            // The new judge counts its runs from 0: the end shown is no run of it.
+            end.run = u64::MAX;
+            end.shown = false;
+        }
         cx.emit(self.practice.choice());
         cx.notify();
     }
@@ -309,13 +447,14 @@ impl Transport {
                 .child(format!("Waiting for {}…", choice.playing.words()))
         });
         // Names that do not fit the measures played are not used (as `measure_text`).
-        let names: &[SharedString] = if self.names.len() == self.player.timeline.measure_count() {
-            &self.names
-        } else {
-            &[]
-        };
+        let names = self.names();
         let (looped, half) = (self.practice.looped(), self.practice.half_loop());
-        let label = practice::loop_text(looped, half, names);
+        let reworking = self.practice.reworking();
+        let label = match reworking {
+            Some(plan) => run_end::rework_text(plan, names),
+            None => practice::loop_text(looped, half, names),
+        };
+        let looped = looped.is_some() || reworking.is_some();
         // The run as it stands: score, combo, accuracy, once something was judged.
         let said = self
             .judge
@@ -350,7 +489,7 @@ impl Transport {
                 .tooltip("Loop to this measure (b)")
                 .on_click(move |_, _, cx| this.update(cx, |t, cx| t.set_b(cx)))
         };
-        let clear = (looped.is_some() || half.is_some()).then(|| {
+        let clear = (looped || half.is_some()).then(|| {
             let this = this.clone();
             Button::quiet("transport-loop-clear", "Clear")
                 .tooltip("No loop (l)")
@@ -376,7 +515,7 @@ impl Transport {
                 div()
                     .id("transport-loop")
                     .ui_text()
-                    .text_color(if looped.is_some() { p.text } else { p.mute })
+                    .text_color(if looped { p.text } else { p.mute })
                     .whitespace_nowrap()
                     .child(label),
             )

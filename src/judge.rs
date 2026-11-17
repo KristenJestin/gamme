@@ -26,7 +26,8 @@
 //! - **Passes**: the judge follows the clock's counter of seeks. A wrap of the loop goes on along
 //!   one line: the next pass's notes come after the last pass's, so a key struck just before the
 //!   seam can be early for the first note after it, and one struck just after late for the last
-//!   note before it. Any other change is a seek, and starts a pass afresh from where the clock
+//!   note before it. A loop of several spans (`clock.rs`) wraps at the end of each into the next:
+//!   each span played is a pass. Any other change is a seek, and starts a pass afresh from where the clock
 //!   stands (a little before, within its measure, for a seek seen a frame late); the notes it left
 //!   unjudged are not judged: the player was not given them. Each pass owes its notes again. The
 //!   judge's first moment, and a loop changed without a seek, start from where the clock stands:
@@ -49,7 +50,7 @@
 use std::collections::VecDeque;
 use std::time::Instant;
 
-use crate::clock::{self, Clock, Wait};
+use crate::clock::{self, Clock, Spans, Wait};
 use crate::midi_in::Played;
 use crate::practice::{EARLY_MS, Playing};
 use crate::timeline::{Hand, Timeline};
@@ -218,21 +219,11 @@ impl Run {
         &self.judgements
     }
 
-    #[cfg_attr(
-        not(test),
-        expect(dead_code, reason = "the end of a run (#19) counts each grade")
-    )]
+    #[cfg(test)]
     pub fn count(&self, grade: Grade) -> usize {
         self.counts[grade.index()]
     }
 
-    #[cfg_attr(
-        not(test),
-        expect(
-            dead_code,
-            reason = "the end of a run (#19) says when nothing was judged"
-        )
-    )]
     pub fn is_empty(&self) -> bool {
         self.judgements.is_empty()
     }
@@ -252,14 +243,15 @@ struct Owed {
 }
 
 /// Where the notes owed are made next: the next of the judge's notes, the shift of its pass's
-/// moments onto the line, that pass, and the moment of the piece the pass ends at (the loop's
-/// end, when it wraps there).
+/// moments onto the line, that pass, the moment of the piece the pass ends at (the end of its
+/// span of the loop, when it wraps there), and that span.
 #[derive(Clone, Copy, Debug)]
 struct Next {
     index: usize,
     shift: f64,
     pass: u32,
     end: f64,
+    span: Option<usize>,
 }
 
 /// Judges the keys struck against the notes owed (see the module).
@@ -275,7 +267,13 @@ pub struct Judge {
     windows: Windows,
     /// Taken away from each key, in ms of real time.
     latency_ms: f64,
-    looped: Option<(f64, f64)>,
+    /// The loop's spans, start and end in ms, sorted; none plays on.
+    looped: Vec<(f64, f64)>,
+    /// The span of the loop the clock's pass plays on to the end of.
+    span: Option<usize>,
+    /// What the last wrap added to the shift: a wrong key read after it but struck before it is
+    /// put back where it was.
+    seam: Option<f64>,
     /// The loop changed since the last moment: a pass starts afresh.
     loop_changed: bool,
     /// The clock's counter of seeks last seen; none before the first moment.
@@ -321,7 +319,9 @@ impl Judge {
             } else {
                 0.
             },
-            looped: None,
+            looped: Vec::new(),
+            span: None,
+            seam: None,
             loop_changed: false,
             seeks: None,
             started: false,
@@ -335,6 +335,7 @@ impl Judge {
                 shift: 0.,
                 pass: 0,
                 end: f64::INFINITY,
+                span: None,
             },
             run: Run::default(),
             finished: None,
@@ -353,12 +354,20 @@ impl Judge {
     }
 
     /// The run played before this one, to its end.
-    #[cfg_attr(
-        not(test),
-        expect(dead_code, reason = "the end of a run (#19) reads the run that ended")
-    )]
+    #[cfg(test)]
     pub fn finished(&self) -> Option<&Run> {
         self.finished.as_ref()
+    }
+
+    /// Whether the run has ended: the clock stopped at the end of the piece. It stays the run
+    /// ([`Judge::run`]) until the next moment that is not the end starts another.
+    pub fn ended(&self) -> bool {
+        self.ended
+    }
+
+    /// How many notes a pass of the whole piece owes.
+    pub fn owed(&self) -> usize {
+        self.expected.len()
     }
 
     /// The loop's start and end, in ms of the piece, for measures `first` to `last` (both
@@ -374,14 +383,31 @@ impl Judge {
         (start < end).then_some((start, end))
     }
 
-    /// The loop the clock plays now, in ms of the piece. A change starts a pass afresh at the
-    /// next moment.
-    pub fn set_loop(&mut self, looped: Option<(f64, f64)>) {
-        let looped = looped.filter(|(start, end)| start < end);
+    /// The loop the clock plays now: its spans, each start and end in ms of the piece, sorted
+    /// and apart, as the clock's. A change starts a pass afresh at the next moment.
+    pub fn set_loop(&mut self, looped: impl IntoIterator<Item = (f64, f64)>) {
+        let looped: Vec<(f64, f64)> = looped
+            .into_iter()
+            .filter(|(start, end)| start < end)
+            .collect();
         if looped != self.looped {
             self.looped = looped;
             self.loop_changed = true;
         }
+    }
+
+    /// The span of the loop a pass at `ms` plays on to the end of: the first ending after it,
+    /// as the clock's.
+    fn span_at(&self, ms: f64) -> Option<usize> {
+        self.looped.iter().position(|&(_, end)| ms < end)
+    }
+
+    /// The span that goes on from the end of `span`, and what its seam adds to the shift.
+    fn after(&self, span: usize) -> Option<(usize, (f64, f64), f64)> {
+        let (_, end) = *self.looped.get(span)?;
+        let next = (span + 1) % self.looped.len();
+        let (start, next_end) = self.looped[next];
+        Some((next, (start, next_end), end - start))
     }
 
     /// Time moves on to `moment`: the clock's pass is followed, the notes coming are owed, those
@@ -512,11 +538,13 @@ impl Judge {
             return;
         }
         if !self.loop_changed
-            && let Some((start, end)) = self.looped
+            && let Some((span, (start, end), seam)) = self.span.and_then(|span| self.after(span))
             && clock::one_wrap(seen, moment.seeks)
         {
             self.seeks = Some(moment.seeks);
-            self.shift += end - start;
+            self.shift += seam;
+            self.seam = Some(seam);
+            self.span = Some(span);
             self.pass += 1;
             // Nothing of the new pass was made yet (nothing came near the seam): from its start.
             if self.next.pass < self.pass {
@@ -525,6 +553,7 @@ impl Judge {
                     shift: self.shift,
                     pass: self.pass,
                     end,
+                    span: Some(span),
                 };
             }
             return;
@@ -549,21 +578,24 @@ impl Judge {
         }
         self.started = true;
         self.shift = 0.;
+        self.seam = None;
         let measure = self
             .measures
             .partition_point(|&start| start <= moment.ms)
             .saturating_sub(1);
         let measure_start = self.measures.get(measure).copied().unwrap_or(0.);
         let from = (moment.ms - slack).max(measure_start);
-        let end = match self.looped {
-            Some((_, end)) if moment.ms < end => end,
-            _ => f64::INFINITY,
-        };
+        self.span = self.span_at(moment.ms);
+        let end = self
+            .span
+            .and_then(|span| self.looped.get(span))
+            .map_or(f64::INFINITY, |&(_, end)| end);
         self.next = Next {
             index: self.first_from(from),
             shift: 0.,
             pass: self.pass,
             end,
+            span: self.span,
         };
     }
 
@@ -571,7 +603,7 @@ impl Judge {
         self.expected.partition_point(|note| note.on_ms < ms)
     }
 
-    /// Owes the notes up to `until` on the line, round the loop as it wraps.
+    /// Owes the notes up to `until` on the line, round the loop's spans as it wraps.
     fn make(&mut self, until: f64) {
         loop {
             while let Some(note) = self.expected.get(self.next.index) {
@@ -589,13 +621,11 @@ impl Judge {
                 });
                 self.next.index += 1;
             }
-            let Some((start, end)) = self.looped else {
+            let Some((span, (start, end), seam)) = self.next.span.and_then(|span| self.after(span))
+            else {
                 return;
             };
-            if self.next.end != end {
-                return;
-            }
-            let shift = self.next.shift + (end - start);
+            let shift = self.next.shift + seam;
             if start + shift > until {
                 return;
             }
@@ -604,6 +634,7 @@ impl Judge {
                 shift,
                 pass: self.next.pass + 1,
                 end,
+                span: Some(span),
             };
         }
     }
@@ -635,11 +666,11 @@ impl Judge {
         let mut at_ms = line - self.shift;
         let mut pass = self.pass;
         // Struck before the seam, read after it: where it was, in the pass before.
-        if let Some((start, end)) = self.looped
+        if let Some(seam) = self.seam
+            && let Some(&(start, _)) = self.span.and_then(|span| self.looped.get(span))
             && at_ms < start
-            && self.shift >= end - start
         {
-            at_ms += end - start;
+            at_ms += seam;
             pass = pass.saturating_sub(1);
         }
         let at_ms = at_ms.max(0.);
@@ -668,7 +699,7 @@ impl Judge {
 pub struct Live {
     judge: Judge,
     /// The clock's loop, as last seen.
-    looped: Option<(usize, usize)>,
+    looped: Spans,
 }
 
 impl Live {
@@ -694,7 +725,7 @@ impl Live {
                 Windows::DEFAULT,
                 latency_ms,
             ),
-            looped: None,
+            looped: Spans::NONE,
         };
         live.tick(clock);
         Some(live)
@@ -702,6 +733,16 @@ impl Live {
 
     pub fn run(&self) -> &Run {
         self.judge.run()
+    }
+
+    /// Whether the run has ended at the end of the piece ([`Judge::ended`]).
+    pub fn ended(&self) -> bool {
+        self.judge.ended()
+    }
+
+    /// How many notes a pass of the whole piece owes.
+    pub fn owed(&self) -> usize {
+        self.judge.owed()
     }
 
     /// How many runs ended before the one being played.
@@ -724,8 +765,12 @@ impl Live {
         let looped = clock.looped();
         if looped != self.looped {
             self.looped = looped;
-            let looped = looped.and_then(|(first, last)| self.judge.loop_ms(first, last));
-            self.judge.set_loop(looped);
+            let spans: Vec<(f64, f64)> = looped
+                .as_slice()
+                .iter()
+                .filter_map(|&(first, last)| self.judge.loop_ms(first, last))
+                .collect();
+            self.judge.set_loop(spans);
         }
     }
 
@@ -1175,6 +1220,80 @@ mod tests {
         assert_eq!(
             (late.grade, late.note, late.pass, late.offset_ms),
             (Grade::Late, Some(1), 0, Some(150.))
+        );
+    }
+
+    /// Rework's loop: measures 2 and 6 apart, 4 s to 6 s then 12 s to 14 s.
+    fn two_spans(notes: &[(u8, f64)]) -> Judge {
+        let mut judge = judge_of(notes, 0.);
+        let spans: Vec<(f64, f64)> = [(2, 2), (6, 6)]
+            .iter()
+            .filter_map(|&(first, last)| judge.loop_ms(first, last))
+            .collect();
+        assert_eq!(spans, [(4000., 6000.), (12_000., 14_000.)]);
+        judge.set_loop(spans);
+        judge
+    }
+
+    #[test]
+    fn each_span_of_a_loop_is_a_pass_and_what_it_leaves_out_is_never_owed() {
+        let mut judge = two_spans(&[
+            (60, 4000.),
+            (62, 5900.),
+            (64, 8000.),
+            (65, 12_000.),
+            (67, 13_900.),
+        ]);
+        judge.at(pass(0, 3900.));
+        hit(&mut judge, 60, pass(0, 4000.));
+        // The seam into measure 6: one wrap.
+        let first = hit(&mut judge, 65, pass(1, 12_000.));
+        assert_eq!(
+            (first.grade, first.pass, first.measure, first.offset_ms),
+            (Grade::Perfect, 1, 6, Some(0.))
+        );
+        judge.at(pass(1, 13_999.));
+        // Back to measure 2: its note owed again.
+        let again = hit(&mut judge, 60, pass(2, 4010.));
+        assert_eq!((again.grade, again.pass), (Grade::Perfect, 2));
+        judge.at(pass(2, 4500.));
+        let said: Vec<(Grade, Option<usize>, u32)> = judge
+            .run()
+            .judgements()
+            .iter()
+            .map(|j| (j.grade, j.note, j.pass))
+            .collect();
+        assert_eq!(
+            said,
+            [
+                (Grade::Perfect, Some(0), 0),
+                (Grade::Perfect, Some(3), 1),
+                (Grade::Missed, Some(1), 0),
+                (Grade::Perfect, Some(0), 2),
+                (Grade::Missed, Some(4), 1),
+            ]
+        );
+    }
+
+    #[test]
+    fn a_key_near_a_seam_between_two_spans_belongs_to_the_pass_it_is_nearest() {
+        // Early for the first note of the next span, struck before the seam.
+        let mut judge = two_spans(&[(60, 4000.), (65, 12_000.)]);
+        judge.at(pass(0, 4000.));
+        hit(&mut judge, 60, pass(0, 4000.));
+        let early = hit(&mut judge, 65, pass(0, 5950.));
+        assert_eq!(
+            (early.grade, early.note, early.pass, early.offset_ms),
+            (Grade::Perfect, Some(1), 1, Some(-50.))
+        );
+        // A wrong key read after the seam: where it was struck, in the span before.
+        let mut judge = two_spans(&[(60, 4000.), (65, 12_000.)]);
+        judge.at(pass(0, 5900.));
+        judge.at(pass(1, 12_010.));
+        let wrong = hit(&mut judge, 70, pass(1, 11_980.));
+        assert_eq!(
+            (wrong.grade, wrong.at_ms, wrong.pass, wrong.measure),
+            (Grade::Wrong, 5980., 0, 2)
         );
     }
 
