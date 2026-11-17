@@ -66,6 +66,7 @@ The last three are CI's `verify` job (`.github/workflows/ci.yml`), on Rust 1.95,
 | `settings.rs` | The settings page, from the kit's components; the latency's calibration, played along with clicks |
 | `touch.rs` | The touch of the player's keys on the built-in piano: the pure velocity curve (light, normal, heavy, fixed), applied before the keys enter `piano.rs`'s ring |
 | `theme.rs` | Gamme's palette, "Nocturne", light and dark, on the kit's tokens |
+| `fonts.rs` | The bundled pixel fonts (Jersey 10 for titles and buttons, Gamme Dot for text), registered at start-up, and the whole multiples of their grids they are set at |
 | `appearance.rs` | Omarchy's colours or Gamme's: the choice, kept in the state folder, and its control |
 | `engraver.rs` | The one Verovio toolkit of the process, on its own thread; its resources unpacked once into the cache; a piece's pages, timemap, MIDI and written notes |
 | `score.rs` | A piece engraved: its pages, where its measures and notes sit, the cursor at each moment |
@@ -81,7 +82,7 @@ The last three are CI's `verify` job (`.github/workflows/ci.yml`), on Rust 1.95,
 | `progress.rs` | What a piece's runs earned (design §5.4): stars (never lowered), best score per speed, the last 200 runs, one file per piece in `$XDG_STATE_HOME/gamme/progress`, read leniently and written atomically; the home screen's stars, the end's "New best" |
 | `run_end.rs` | The end of a run: the measures most missed and Rework's plan (pure), and the dialog that shows them with the stars |
 | `flash.rs` | The judgements on screen, fading (pure), and every colour and size they are drawn with, from the palette |
-| `falling.rs` | The falling notes over the keyboard, painted every frame in one canvas, the judgements flashing on the notes and keys, their words over them |
+| `falling.rs` | The falling notes over the keyboard, painted every frame in one canvas, in pixel art on a grid of 4-pixel cells, the judgements flashing on the notes and keys, their words over them |
 | `keyboard.rs` | The on-screen keyboard's keys and places, and the keys lit from outside (MIDI in) |
 | `wall_clock.rs` | The clock moved by the wall clock while no sound moves it (the piano not ready, no output) |
 | `clock.rs` | The play position shared with the audio thread (atomics): play, pause, seek, speed; the chords it waits at and the loop it goes round (spans of measures, apart or not), obeyed by whoever steps it (`step`, `commit`); where the piece stood at a key's instant (`position_at`) |
@@ -108,6 +109,9 @@ Besides `src/`:
     keys and clicks into its display;
   - `brand.py`: writes the mark's SVGs and the icon's SVG and PNGs from one pixel grid; edit the
     grid there and run `python3 tools/brand.py`, never a generated file;
+  - `fonts.py`: writes the bundled pixel fonts (`assets/fonts/`: Jersey 10, and Gamme Dot, a
+    changed DotGothic16) from their pinned upstream files; needs fontTools, never a generated
+    file edited by hand;
   - `version.sh`, `changelog.sh`, `package.sh`: the version, the notes and the archive of a
     build (`docs/releases.md`);
   - `test-install.sh`: `install.sh` and `gamme update` run against fake releases from a local

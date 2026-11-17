@@ -278,8 +278,17 @@ dark until chosen) or Omarchy (the desktop's theme, followed as it changes). Off
 window shows Nocturne whatever is chosen, and the control says why Omarchy is not available. The
 choice applies at once and is kept in `$XDG_STATE_HOME/gamme/appearance.json`.
 
-The style is pixel art everywhere except the score, which stays engraved; the pixel-art
-interface is its own issue.
+The style is pixel art everywhere except the score, which stays engraved. The falling notes and
+the keys are drawn on a grid of 4-pixel cells: a note is outlined in a darker shade of its colour,
+lit along its left edge and frayed at its top, and a key that sounds sinks into its front edge.
+
+The type is two pixel fonts, bundled: **Jersey 10** (Sarah Cadigan-Fried) for the titles and the
+buttons, and **Gamme Dot** for the text. Gamme Dot is DotGothic16 (Fontworks) changed for Gamme:
+its "ç" stood a row above the other lowercase letters and is put back on the baseline, the narrow
+no-break space French puts before `: ; ! ?` is added, and only the Latin scripts are kept.
+`python3 tools/fonts.py` writes both from their upstream files, pinned and checked (it needs
+fontTools, which the build does not). A pixel font is set only at its own size or a whole
+multiple of it, so that its pixels stay whole.
 
 ## Building
 
@@ -292,8 +301,11 @@ whose C++ takes about 35 minutes to compile the first time. `AGENTS.md` says how
 
 ## Licence
 
-AGPL-3.0-only (see `LICENSE`). The bundled Geist and Geist Mono fonts, from the design system,
-are under the SIL Open Font License (`assets/fonts/OFL.txt`). Verovio is LGPL-3.0-or-later. The
+AGPL-3.0-only (see `LICENSE`). The bundled fonts are under the SIL Open Font License 1.1: Geist
+and Geist Mono, from the design system (`assets/fonts/OFL.txt`), Jersey 10
+(`assets/fonts/Jersey10-OFL.txt`) and Gamme Dot, a Modified Version of DotGothic16
+(`assets/fonts/GammeDot-OFL.txt`); a release holds the three in `LICENSE-fonts.txt`. Verovio is
+LGPL-3.0-or-later. The
 SoundFonts are downloaded, not distributed with Gamme: the small upright is the FreePats project's
 *Upright Piano KW* (CC0 1.0), the concert grand is Alexander Holm's *Salamander Grand Piano*,
 packed by FreePats (CC BY 3.0: credit to Alexander Holm).
