@@ -17,8 +17,8 @@ for versions, CI, releases, install and update. This file is how to work.
 
 Today it is one window, the design system's identity and theme (Omarchy's, followed), the home
 screen and its library, the play screen (the score, the falling notes and the built-in piano), MIDI
-out and in, and the machinery above. The game layer, the method, the fingering and the pieces come as issues of
-their own.
+out and in, practice (hands, wait, A–B loop), and the machinery above. The game layer, the method,
+the fingering and the pieces come as issues of their own.
 
 ## Commands
 
@@ -54,7 +54,7 @@ The last three are CI's `verify` job (`.github/workflows/ci.yml`), on Rust 1.95,
 | `main.rs` | The entry: arguments (`--help`, `--version`, `update`, `play`, a piece), the window and its theme |
 | `screens.rs` | The window's screens and the way between them: home, a piece played and the settings; the window's toasts |
 | `home.rs` | The home screen: the library's pieces, import (picker, drop), removal, and opening one |
-| `library.rs` | The library in `$XDG_DATA_HOME/gamme/library`: import, list, remove, mark played, the hands kept per piece |
+| `library.rs` | The library in `$XDG_DATA_HOME/gamme/library`: import, list, remove, mark played, the hands and the practice kept per piece |
 | `piece_file.rs` | What an imported file is: MusicXML, MEI or MIDI, its title and composer, why it is refused |
 | `icons.rs` | The icons Gamme adds to the kit's (Lucide) |
 | `update.rs` | `gamme update`: the channel's latest build, its sum checked, the binary replaced |
@@ -69,17 +69,18 @@ The last three are CI's `verify` job (`.github/workflows/ci.yml`), on Rust 1.95,
 | `raster.rs` | The pages rasterized (resvg), off the main thread |
 | `score_view.rs` | The score as the play screen holds it, the cursor and the sounding notes drawn over it every frame; the `Playhead` the clock feeds |
 | `timeline.rs` | The notes of a piece in time, each with its hand, its measure and its engraved note (from Verovio's MIDI, or a MIDI file's tracks), and where its measures start |
-| `play_screen.rs` | The play screen: a piece opened, its three views (score and falling notes, falling notes, score), the hands of a MIDI piece's parts, the keys played (lit, sounded, kept) |
+| `play_screen.rs` | The play screen: a piece opened, its three views (score and falling notes, falling notes, score), the hands of a MIDI piece's parts, the keys played (lit, sounded, kept, handed to the wait) |
+| `practice.rs` | Practice: the hands the player plays (the computer plays the others), the player's chords, the judge of the wait (`Waiter`), the A–B loop chosen |
 | `falling.rs` | The falling notes over the keyboard, painted every frame in one canvas |
 | `keyboard.rs` | The on-screen keyboard's keys and places, and the keys lit from outside (MIDI in) |
 | `wall_clock.rs` | The clock moved by the wall clock while no sound moves it (the piano not ready, no output) |
-| `clock.rs` | The play position shared with the audio thread (atomics): play, pause, seek, speed |
+| `clock.rs` | The play position shared with the audio thread (atomics): play, pause, seek, speed; the chords it waits at and the loop it goes round, obeyed by whoever steps it (`step`, `commit`) |
 | `soundfont.rs` | The SoundFonts of the built-in piano and their resumable, checked download |
 | `piano.rs` | The built-in piano: the audio callback's logic (`Renderer`), the player's keys on their lock-free way to it (`LiveKeys`), and the `cpal` output |
 | `player.rs` | A piece being played: timeline, clock, and its output (an `Audio`: the built-in piano or MIDI out) made ready on its own thread; the fallback to the built-in piano |
 | `midi_out.rs` | MIDI out as an `Audio`: a thread paces the clock by the wall clock and sends the notes; `midir` is behind `Ports` and `Wire` so no test opens a port (inputs included) |
 | `midi_in.rs` | MIDI in: one thread watches the input ports (every one, or the one chosen) and connects them as they appear; each key timestamped on arrival, counted per port, handed to the play screen's `Keys` |
-| `transport.rs` | The transport bar (play, seek by measure, speed, SoundFont progress); it holds the player |
+| `transport.rs` | The transport bar (play, seek by measure, speed, the hands played, the wait, the loop, SoundFont progress); it holds the player and its practice |
 
 Besides `src/`:
 

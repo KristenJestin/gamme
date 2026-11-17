@@ -9,7 +9,8 @@ piece, because apps that only show falling notes teach to follow, not to read.
 **Status: first notes.** What exists today is one window with the shared design system's look
 (it follows the Omarchy theme), a home screen that lists your pieces, a play screen that shows a
 piece engraved and falling over a keyboard and plays it with a built-in piano or a MIDI output,
-your MIDI keyboard lighting and sounding its keys, and the machinery to publish, install and update
+your MIDI keyboard lighting and sounding its keys, practice with one hand or both (the piece
+waiting for you, or looping over a few measures), and the machinery to publish, install and update
 the app. The game layer, the practice method and the fingering come next.
 
 ## The library
@@ -40,7 +41,35 @@ else by their pitch, the higher ones the right hand. **Hands** corrects them, pa
 left, or both split at the middle C), and the choice is kept with the piece.
 
 Keys: `Space` plays and pauses, `v` changes the view, `←` and `→` move by measure, `+`, `-` and
-`0` zoom the score, `Escape` goes back to the pieces.
+`0` zoom the score, `h`, `w`, `a`, `b` and `l` practise (below), `Escape` goes back to the pieces.
+
+## Practice
+
+The row under the transport chooses what you play:
+
+- **You play**: **Listen** (the computer plays the piece), **Right hand**, **Left hand** or **Both
+  hands** (`h` goes round them). The computer plays the hand you do not, and never yours: your
+  hand's notes still fall and light, but only your keyboard sounds them.
+- **Wait for me** (`w`): the piece stops at each note or chord of your hands until you strike it,
+  every key of it down together, from your MIDI keyboard. The computer's hand waits with it and
+  plays on with your chord. A wrong key releases nothing, and a key you held from before is struck
+  again. Striking up to 200 ms (of real time) before the chord counts, so that being a little
+  ahead does not make you play it twice; earlier than that counts for nothing.
+- **The loop**: **A** (`a`) and **B** (`b`) set its first and last measures where the piece is
+  (move there with `←` and `→`), **Clear** (`l`) ends it. Once both are set, measures A to B play
+  again and again: at B's end the piece goes on from A's start with no gap, the notes still
+  sounding let go. The loop counts measures in the order they are played, so after a repeat a
+  measure number comes twice: the control names the measures as the score prints them, and as
+  played when a repeat makes the two differ. Made while the piece is outside it, the loop starts
+  at A.
+
+What you play and the wait are kept with the piece; the loop is not.
+
+Known limits:
+
+- the wait listens to a MIDI keyboard only: the keys on the screen cannot be clicked;
+- a chord is the notes of your hands that start within 30 ms of each other: a rolled chord written
+  as separate notes is waited for note by note.
 
 ## Install
 

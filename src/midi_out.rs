@@ -8,8 +8,8 @@
 //! that a note goes out within a millisecond of its time. The thread is not the audio callback's:
 //! the callback never calls MIDI, and this one may block on the port as it likes.
 //!
-//! What sounds is always let go of: on a pause, a seek or the end of the piece (the renderer
-//! releases every key): a note-off for each key of the piece that sounds, then All Notes Off; and
+//! What sounds is always let go of: on a pause, a seek, the seam of the A–B loop or the end of the
+//! piece (the renderer releases every key): a note-off for each key of the piece that sounds, then All Notes Off; and
 //! when the output closes (a different port is chosen, the player goes): every key, the sustain
 //! pedal, All Sound Off and All Notes Off. The player's own keys ([`Live`]) are kept apart from
 //! the piece's: a pause or a seek does not cut a key the player holds.
@@ -1192,6 +1192,70 @@ mod tests {
         until("All Notes Off", || {
             ports.sent().iter().any(|m| m == &ALL_NOTES_OFF)
         });
+    }
+
+    /// The loop on MIDI out: each note of the loop goes out once a pass, is let go at the seam,
+    /// and nothing past B goes out.
+    #[test]
+    fn a_loop_sends_each_note_once_a_pass_and_lets_it_go_at_the_seam() {
+        let note = |key, on_ms: f64| Note {
+            key,
+            velocity: 80,
+            on_ms,
+            off_ms: on_ms + 100.,
+            hand: Hand::Right,
+            part: 0,
+            measure: 0,
+            element: None,
+        };
+        // Measures of 100 ms; the loop is the second, its note ends with it.
+        let timeline = Timeline::new(
+            vec![note(61, 0.), note(62, 100.), note(64, 200.)],
+            vec![0., 100., 200., 300.],
+            400.,
+        );
+        let ports = Arc::new(FakePorts::new(&["Digital Piano MIDI 1 20:0"], &[]));
+        let midi = MidiOut::new(
+            ports.clone(),
+            "Digital Piano MIDI 1".into(),
+            Arc::new(Builtin::default()),
+        );
+        let marks = crate::clock::Marks {
+            measures_ms: vec![0., 100., 200., 300.],
+            ..Default::default()
+        };
+        let clock = Clock::with_marks(timeline.duration_ms(), &marks);
+        clock.set_loop(Some((1, 1)));
+        clock.seek_ms(100.);
+        let lost = Arc::new(AtomicBool::new(false));
+        let output = midi
+            .open(Path::new(""), &timeline, &clock, &Hands::both(), &lost)
+            .unwrap();
+        clock.play();
+        let ons = |key| {
+            ports
+                .sent()
+                .iter()
+                .filter(|m| m[..] == [NOTE_ON, key, 80])
+                .count()
+        };
+        until("three passes", || ons(62) >= 3);
+        assert!(clock.playing());
+        drop(output);
+        // On, then off, each pass: never struck twice, never left on.
+        let of_62: Vec<u8> = ports
+            .sent()
+            .iter()
+            .filter(|m| m.len() == 3 && m[1] == 62 && m[0] & 0xF0 != 0xB0)
+            .map(|m| m[0])
+            .collect();
+        assert!(of_62.len() >= 6, "{of_62:?}");
+        for (at, status) in of_62.iter().enumerate() {
+            let expected = if at % 2 == 0 { NOTE_ON } else { NOTE_OFF };
+            assert_eq!(*status, expected, "{of_62:?}");
+        }
+        assert_eq!(of_62.last(), Some(&NOTE_OFF));
+        assert_eq!(ons(61) + ons(64), 0, "nothing outside the loop");
     }
 
     #[test]

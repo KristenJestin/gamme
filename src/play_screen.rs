@@ -13,9 +13,13 @@
 //!   on the piece's output, playing or not, his sustain pedal too: the output is opened with the
 //!   piece when its piano is downloaded already, else at the first key struck (or play). Keys and
 //!   pedal are kept apart, with the instant each arrived, for the game.
+//! - Practice (`practice.rs`, its controls in the transport): the hands the player plays, the
+//!   wait (each key from MIDI in goes to it as it comes), the A–B loop. The hands and the wait
+//!   are kept with a piece of the library; all of it goes on when a MIDI file's parts change hands.
 //!
 //! Keys: Space plays and pauses, `v` changes the view, Left and Right move by measure, `+`, `-`
-//! and `0` zoom the score, Escape goes back.
+//! and `0` zoom the score, `h` changes the hands played, `w` waits or not, `a` and `b` set the
+//! loop's first and last measures where the piece is, `l` ends the loop, Escape goes back.
 
 use std::collections::VecDeque;
 use std::path::{Path, PathBuf};
@@ -39,6 +43,7 @@ use crate::midi_in::{self, Attached, MidiIn, Pedal, Played};
 use crate::midi_out::{PortInfo, Ports};
 use crate::paths;
 use crate::player::{self, Player};
+use crate::practice::{Choice, Practice};
 use crate::score::Score;
 use crate::score_view::{Playhead, ScoreView, timing};
 use crate::soundfont::{self, Font};
@@ -282,6 +287,8 @@ struct Ready {
     score: Option<Entity<ScoreView>>,
     keyboard: Keyboard,
     _observe: Subscription,
+    /// The practice chosen, kept with the piece.
+    _keep: Subscription,
 }
 
 enum State {
@@ -415,13 +422,16 @@ impl PlayScreen {
     }
 
     /// The keys played last, oldest first, each with the instant it arrived.
-    #[expect(dead_code, reason = "wait mode (#15) reads the keys played")]
+    #[expect(
+        dead_code,
+        reason = "the game's judgement reads the keys played with their instants; the wait takes each as it comes"
+    )]
     pub fn played(&self) -> &VecDeque<Played> {
         &self.played
     }
 
     /// The pedal's last moves, oldest first, apart from the keys.
-    #[expect(dead_code, reason = "wait mode (#15) reads the pedal")]
+    #[expect(dead_code, reason = "the game's judgement reads the pedal")]
     pub fn pedal(&self) -> &VecDeque<Pedal> {
         &self.pedal
     }
@@ -440,6 +450,11 @@ impl PlayScreen {
             self.played.pop_front();
         }
         self.played.push_back(played);
+        if let State::Ready(ready) = &self.state {
+            ready.transport.update(cx, |transport, cx| {
+                transport.key(played.key, played.velocity, cx);
+            });
+        }
         if played.velocity > 0 {
             // The first key struck opens the output, if nothing did yet; the next ones are heard.
             self.sound_wanted = true;
@@ -480,8 +495,27 @@ impl PlayScreen {
         if self.sound_wanted {
             player.warm();
         }
-        let transport = cx.new(|cx| Transport::new(player, names, cx));
+        // The practice of the player this one replaces goes on; else the piece's own.
+        let practice = match &self.state {
+            State::Ready(ready) => ready
+                .transport
+                .read(cx)
+                .practice()
+                .carried(player.chords.clone()),
+            _ => Practice::new(
+                self.opening
+                    .library
+                    .as_ref()
+                    .and_then(|(_, piece)| piece.practice)
+                    .unwrap_or_default(),
+                player.chords.clone(),
+            ),
+        };
+        let transport = cx.new(|cx| Transport::new(player, names, practice, cx));
         let observe = cx.observe(&transport, |_, _, cx| cx.notify());
+        let keep = cx.subscribe(&transport, |this, _, choice: &Choice, cx| {
+            this.keep_practice(*choice, cx);
+        });
         let score = loaded.score.map(|score| {
             let head = Box::new(ClockHead(clock.clone()));
             cx.new(|_| ScoreView::new(score, head))
@@ -496,7 +530,25 @@ impl PlayScreen {
             score,
             keyboard,
             _observe: observe,
+            _keep: keep,
         });
+    }
+
+    /// The hands played and the wait, kept with the piece, off the main thread.
+    fn keep_practice(&mut self, choice: Choice, cx: &mut Context<Self>) {
+        let Some((library, piece)) = &mut self.opening.library else {
+            return;
+        };
+        // What opens it again on this screen (its hands changed) starts with it too.
+        piece.practice = Some(choice);
+        let (library, id) = (library.clone(), piece.id.clone());
+        cx.background_executor()
+            .spawn(async move {
+                if let Err(error) = library.set_practice(&id, choice) {
+                    eprintln!("gamme: the practice was not kept: {error}");
+                }
+            })
+            .detach();
     }
 
     fn set_view(&mut self, view: View, cx: &mut Context<Self>) {
@@ -589,6 +641,19 @@ impl PlayScreen {
                 });
             }
             "v" => self.set_view(self.view.next(), cx),
+            "h" | "w" | "a" | "b" | "l" => transport.update(cx, |transport, cx| match key {
+                "h" => {
+                    let next = transport.practice().choice().playing.next();
+                    transport.set_playing(next, cx);
+                }
+                "w" => {
+                    let wait = !transport.practice().choice().wait;
+                    transport.set_wait(wait, cx);
+                }
+                "a" => transport.set_a(cx),
+                "b" => transport.set_b(cx),
+                _ => transport.clear_loop(cx),
+            }),
             _ => {
                 // The score zooms only where it is shown.
                 let shown = score.filter(|_| self.view != View::Falling);

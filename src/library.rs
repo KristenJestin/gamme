@@ -16,6 +16,7 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest as _, Sha256};
 
 use crate::piece_file::{self, Kind};
+use crate::practice::Choice;
 use crate::timeline::PartHand;
 
 const METADATA: &str = "piece.json";
@@ -38,6 +39,10 @@ pub struct Piece {
     /// them: `None` until they do, and the timeline's guess holds.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub hands: Option<Vec<PartHand>>,
+    /// The hands the player plays and whether the clock waits for them (`practice.rs`), as he
+    /// left them: `None` until he chooses, and he listens.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub practice: Option<Choice>,
 }
 
 /// Why a file was not imported, as a sentence the player can read.
@@ -135,6 +140,7 @@ impl Library {
             imported_at: now(),
             last_played: None,
             hands: None,
+            practice: None,
         };
         self.keep(&piece, &bytes)
             .map_err(|error| refuse(format!("could not be kept in the library ({error})")))?;
@@ -190,6 +196,11 @@ impl Library {
     /// Keeps the hands the player gave the parts of a piece.
     pub fn set_hands(&self, id: &str, hands: &[PartHand]) -> io::Result<()> {
         self.change(id, |piece| piece.hands = Some(hands.to_vec()))
+    }
+
+    /// Keeps the hands the player plays a piece with, and the wait.
+    pub fn set_practice(&self, id: &str, choice: Choice) -> io::Result<()> {
+        self.change(id, |piece| piece.practice = Some(choice))
     }
 
     /// The score's file of a piece.
@@ -424,6 +435,26 @@ mod tests {
             library.root.join(&tune.id).join("score.mid")
         );
         assert!(library.set_hands("../keep", &hands).is_err());
+    }
+
+    #[test]
+    fn the_practice_chosen_is_kept_with_the_piece_and_read_again() {
+        use crate::practice::Playing;
+        let (home, library) = library();
+        let dance = library.import(&fixture("short-dance.mei")).unwrap();
+        assert_eq!(dance.practice, None);
+        let json = fs::read_to_string(library.root.join(&dance.id).join(METADATA)).unwrap();
+        assert!(!json.contains("practice"), "{json}");
+
+        let choice = Choice {
+            playing: Playing::Right,
+            wait: true,
+        };
+        library.set_practice(&dance.id, choice).unwrap();
+        let again = Library::at(home.path().join("data/gamme/library")).list();
+        assert_eq!(again[0].practice, Some(choice));
+        assert_eq!(again[0].title, dance.title, "the rest stays");
+        assert!(library.set_practice("../keep", choice).is_err());
     }
 
     #[test]

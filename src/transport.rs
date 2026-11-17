@@ -1,18 +1,23 @@
-//! The transport of a piece: play and pause, seek by measure, speed, and what the built-in piano
-//! is doing (its SoundFont's download, with its progress). A bar built from the kit's own
-//! components, under the play screen (`play_screen.rs`).
+//! The transport of a piece: play and pause, seek by measure, speed, practice (the hands the
+//! player plays, the wait, the A–B loop: `practice.rs`), and what the built-in piano is doing
+//! (its SoundFont's download, with its progress). A bar built from the kit's own components,
+//! under the play screen (`play_screen.rs`).
 //!
 //! It holds the [`Player`], and moves its clock by the wall clock while the piano does not
 //! (`wall_clock.rs`): a piece played before its SoundFont is there, or with no audio output,
-//! goes on in silence.
+//! goes on in silence. A change of the hands or of the wait is said ([`Choice`] as an event),
+//! for the play screen to keep it with the piece.
 
 use std::time::Duration;
 
-use gpui_design_system::{Button, Icon, Segmented, Type as _, palette, space};
+use gpui_design_system::{
+    Button, Icon, Segmented, Select, SelectOption, Switch, Type as _, palette, space,
+};
 use gpui_kit::*;
 
 use crate::icons;
 use crate::player::{Player, Sound};
+use crate::practice::{self, Choice, Playing, Practice};
 use crate::soundfont::Stage;
 use crate::wall_clock::WallClock;
 
@@ -30,14 +35,24 @@ pub struct Transport {
     /// Each measure's name as the score prints it, in the order of play; empty for a piece with
     /// no score, whose measures are counted.
     names: Vec<SharedString>,
+    practice: Practice,
     wall: WallClock,
     /// What the player said last about its output (it was replaced), kept on screen.
     notice: Option<String>,
     _refresh: Task<()>,
 }
 
+impl EventEmitter<Choice> for Transport {}
+
 impl Transport {
-    pub fn new(player: Player, names: Vec<SharedString>, cx: &mut Context<Self>) -> Self {
+    /// `practice` is put on the player at once.
+    pub fn new(
+        player: Player,
+        names: Vec<SharedString>,
+        practice: Practice,
+        cx: &mut Context<Self>,
+    ) -> Self {
+        practice.apply(&player);
         let refresh = cx.spawn(async move |this, cx| {
             loop {
                 cx.background_executor().timer(REFRESH).await;
@@ -71,6 +86,7 @@ impl Transport {
         Self {
             player,
             names,
+            practice,
             wall: WallClock::default(),
             notice: None,
             _refresh: refresh,
@@ -79,6 +95,45 @@ impl Transport {
 
     pub fn player(&self) -> &Player {
         &self.player
+    }
+
+    pub fn practice(&self) -> &Practice {
+        &self.practice
+    }
+
+    /// A key from MIDI in, for the wait.
+    pub fn key(&mut self, key: u8, velocity: u8, cx: &mut Context<Self>) {
+        if self.practice.key(key, velocity, &self.player.clock) {
+            cx.notify();
+        }
+    }
+
+    pub fn set_playing(&mut self, playing: Playing, cx: &mut Context<Self>) {
+        self.practice.set_playing(playing, &self.player);
+        cx.emit(self.practice.choice());
+        cx.notify();
+    }
+
+    pub fn set_wait(&mut self, wait: bool, cx: &mut Context<Self>) {
+        self.practice.set_wait(wait, &self.player);
+        cx.emit(self.practice.choice());
+        cx.notify();
+    }
+
+    /// `a` and `b`: the loop starts, or ends, with the measure the piece is in.
+    pub fn set_a(&mut self, cx: &mut Context<Self>) {
+        self.practice.set_a(&self.player);
+        cx.notify();
+    }
+
+    pub fn set_b(&mut self, cx: &mut Context<Self>) {
+        self.practice.set_b(&self.player);
+        cx.notify();
+    }
+
+    pub fn clear_loop(&mut self, cx: &mut Context<Self>) {
+        self.practice.clear_loop(&self.player);
+        cx.notify();
     }
 
     /// Plays, or pauses. Until the piano is ready the clock starts at once and the wall clock
@@ -118,6 +173,104 @@ impl Transport {
     pub fn next_measure(&mut self) {
         let measure = self.player.clock.measure(&self.player.timeline);
         self.player.seek_measure(measure + 1);
+    }
+}
+
+impl Transport {
+    /// The hands the player plays, the wait, and the loop, from the kit's components.
+    fn practice_row(&self, cx: &mut Context<Self>) -> Div {
+        let p = palette(cx);
+        let this = cx.entity();
+        let choice = self.practice.choice();
+        // Four choices: the kit's Segmented takes three at most, a Select the rest.
+        let hands = {
+            let this = this.clone();
+            Select::new(
+                "transport-hands",
+                [
+                    SelectOption::new("listen", "Listen").line("The computer plays the piece"),
+                    SelectOption::new("right", "Right hand").line("The computer plays the left"),
+                    SelectOption::new("left", "Left hand").line("The computer plays the right"),
+                    SelectOption::new("both", "Both hands").line("The computer plays nothing"),
+                ],
+                choice.playing.index(),
+            )
+            .width(px(180.))
+            .on_choose(move |index, _, cx| {
+                this.update(cx, |t, cx| t.set_playing(Playing::ALL[index], cx))
+            })
+        };
+        let wait = {
+            let this = this.clone();
+            Switch::new("transport-wait", choice.wait, "Wait for me (w)")
+                .disabled(choice.playing == Playing::Listen)
+                .on_click(move |_, _, cx| {
+                    this.update(cx, |t, cx| {
+                        let wait = !t.practice.choice().wait;
+                        t.set_wait(wait, cx);
+                    })
+                })
+        };
+        let waiting = self.player.clock.held().then(|| {
+            div()
+                .id("transport-waiting")
+                .ui_text()
+                .text_color(p.acc)
+                .whitespace_nowrap()
+                .child(format!("Waiting for {}…", choice.playing.words()))
+        });
+        // Names that do not fit the measures played are not used (as `measure_text`).
+        let names: &[SharedString] = if self.names.len() == self.player.timeline.measure_count() {
+            &self.names
+        } else {
+            &[]
+        };
+        let (looped, half) = (self.practice.looped(), self.practice.half_loop());
+        let label = practice::loop_text(looped, half, names);
+        let set_a = {
+            let this = this.clone();
+            Button::secondary("transport-loop-a", "A")
+                .tooltip("Loop from this measure (a)")
+                .on_click(move |_, _, cx| this.update(cx, |t, cx| t.set_a(cx)))
+        };
+        let set_b = {
+            let this = this.clone();
+            Button::secondary("transport-loop-b", "B")
+                .tooltip("Loop to this measure (b)")
+                .on_click(move |_, _, cx| this.update(cx, |t, cx| t.set_b(cx)))
+        };
+        let clear = (looped.is_some() || half.is_some()).then(|| {
+            let this = this.clone();
+            Button::quiet("transport-loop-clear", "Clear")
+                .tooltip("No loop (l)")
+                .on_click(move |_, _, cx| this.update(cx, |t, cx| t.clear_loop(cx)))
+        });
+        div()
+            .flex()
+            .items_center()
+            .gap(space::MD)
+            .child(
+                div()
+                    .ui_text()
+                    .text_color(p.mute)
+                    .whitespace_nowrap()
+                    .child("You play (h)"),
+            )
+            .child(hands)
+            .child(wait)
+            .children(waiting)
+            .child(div().flex_1())
+            .child(
+                div()
+                    .id("transport-loop")
+                    .ui_text()
+                    .text_color(if looped.is_some() { p.text } else { p.mute })
+                    .whitespace_nowrap()
+                    .child(label),
+            )
+            .child(set_a)
+            .child(set_b)
+            .children(clear)
     }
 }
 
@@ -260,6 +413,7 @@ impl Render for Transport {
             time_text(position),
             time_text(timeline.duration_ms()),
         );
+        let practice = self.practice_row(cx);
 
         div()
             .id("transport")
@@ -291,6 +445,7 @@ impl Render for Transport {
                     .child(div().flex_1())
                     .child(speeds),
             )
+            .child(practice)
             .child(
                 div()
                     .flex()

@@ -15,6 +15,7 @@ mod piano;
 mod piece_file;
 mod play_screen;
 mod player;
+mod practice;
 mod raster;
 mod score;
 mod score_view;
