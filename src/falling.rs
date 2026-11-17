@@ -1,29 +1,39 @@
 //! The falling notes: each note drops toward the key that plays it, its length how long it is
-//! held, and reaches the keyboard at the moment it is due. Drawn at every frame in one canvas,
-//! as plain rectangles on whole pixels (the pixel-art look of the game parts comes later, #29).
+//! held, and reaches the keyboard at the moment it is due. Drawn at every frame in one canvas, in
+//! pixel art (#29): everything lies on a grid of [`CELL`] pixels, a cell the art's pixel, so that
+//! each is a whole number of the screen's pixels at every whole scale.
 //!
-//! The right hand is the accent, the left the second colour; a note on a black key is darker.
-//! A key sounds in its hand's colour while the piece plays it, and in the hit colour while it is
-//! lit from outside ([`Lights`]: the keys the player strikes).
+//! The right hand is the accent, the left the second colour; a note on a black key is darker. A
+//! note is outlined in a darker shade of its colour, lit along its left edge, and dithered at its
+//! top, where it ends. A key sounds in its hand's colour while the piece plays it, and in the hit
+//! colour while it is lit from outside ([`Lights`]: the keys the player strikes); a key that
+//! sounds is pressed: it sinks into its front edge.
 //!
 //! A judgement (`flash.rs`) flashes in its grade's colour on the note it judged, while that note
-//! is near the keys, and on its key, and its word rises over the key and fades: one word for the
-//! notes of a chord judged alike.
+//! is near the keys, and on its key, and its word rises over the key and fades, a cell at a time:
+//! one word for the notes of a chord judged alike.
 
 use std::sync::Arc;
 use std::time::Instant;
 
+use gpui_design_system::Palette;
 use gpui_design_system::color::{hex, mix};
-use gpui_design_system::{Palette, Type as _};
 use gpui_kit::*;
 
 use crate::flash::{self, Flashes, Inks};
+use crate::fonts;
 use crate::keyboard::{Keyboard, Lights, is_black};
 use crate::theme;
 use crate::timeline::{Hand, Timeline};
 
 /// How much of the piece the falling area shows ahead of now, in ms at its own tempo.
 pub const LOOKAHEAD_MS: f64 = 3_000.;
+
+/// One pixel of the art, in pixels of the window.
+pub const CELL: f32 = 4.;
+
+/// How many cells a key's front edge is high; a pressed key sinks by as much.
+const LIP: f32 = 2.;
 
 /// The colours of the falling notes and the keyboard.
 #[derive(Clone, Copy)]
@@ -61,9 +71,19 @@ impl Look {
             false => color,
         }
     }
+
+    /// The outline of a note of `color`.
+    fn outline(color: Hsla) -> Hsla {
+        mix(color, hex(theme::NIGHT), 0.55)
+    }
+
+    /// The lit left edge of a note, and of a white key at rest.
+    fn light(color: Hsla) -> Hsla {
+        mix(color, hex(0xFFFFFF), 0.4)
+    }
 }
 
-/// A rectangle in whole pixels, from the canvas's top left corner.
+/// A rectangle in whole cells, from the canvas's top left corner.
 #[derive(Clone, Copy, Debug, PartialEq)]
 struct Rect {
     x: f32,
@@ -72,7 +92,13 @@ struct Rect {
     h: f32,
 }
 
-/// Where things go in a canvas of `width` by `height`.
+impl Rect {
+    fn new(x: f32, y: f32, w: f32, h: f32) -> Self {
+        Self { x, y, w, h }
+    }
+}
+
+/// Where things go in a canvas of `width` by `height` pixels, in cells.
 #[derive(Clone, Copy, Debug, PartialEq)]
 struct Layout {
     keyboard: Keyboard,
@@ -87,9 +113,13 @@ struct Layout {
 
 impl Layout {
     fn new(keyboard: Keyboard, width: f32, height: f32) -> Self {
+        let (width, height) = ((width / CELL).floor(), (height / CELL).floor());
         let whites = keyboard.whites().max(1) as f32;
         let white = (width / whites).floor().max(1.);
-        let keys = (height * 0.2).clamp(40., 120.).min(height).round();
+        let keys = (height * 0.2)
+            .clamp(40. / CELL, 120. / CELL)
+            .min(height)
+            .round();
         Self {
             keyboard,
             left: ((width - white * whites) / 2.).floor().max(0.),
@@ -99,7 +129,7 @@ impl Layout {
         }
     }
 
-    /// The left edge and the width of `key`, in pixels.
+    /// The left edge and the width of `key`.
     fn key(&self, key: u8) -> (f32, f32) {
         let (left, width) = self.keyboard.place(key);
         (
@@ -123,18 +153,49 @@ impl Layout {
         let bottom = y(on_ms).min(self.area);
         let top = y(off_ms).max(0.);
         let (x, w) = self.key(key);
-        // A pixel apart from its neighbours, and from the note after it on the same key.
-        Some(Rect {
-            x: x + 1.,
-            y: top,
-            w: (w - 2.).max(1.),
-            h: (bottom - top - 1.).max(2.),
-        })
+        // A cell apart from its neighbours, and from the note after it on the same key.
+        Some(Rect::new(
+            x + 1.,
+            top,
+            (w - 2.).max(1.),
+            (bottom - top - 1.).max(2.),
+        ))
     }
 }
 
+/// The cells of a note of `color` in `rect`: its outline, its body, its lit left edge and the
+/// dither of its top two rows. A note too thin for an inside is its outline.
+fn note_cells(rect: Rect, color: Hsla) -> Vec<(Rect, Hsla)> {
+    let outline = Look::outline(color);
+    let mut cells = vec![(rect, outline)];
+    if rect.w < 3. || rect.h < 3. {
+        return cells;
+    }
+    let inside = Rect::new(rect.x + 1., rect.y + 1., rect.w - 2., rect.h - 2.);
+    cells.push((inside, color));
+    cells.push((
+        Rect::new(inside.x, inside.y, 1., inside.h),
+        Look::light(color),
+    ));
+    // A checkerboard of the outline over the first two rows: the note's end, frayed.
+    for row in 0..2u8.min(inside.h as u8) {
+        let y = inside.y + f32::from(row);
+        let mut x = inside.x + 1. + f32::from(row % 2);
+        while x < inside.x + inside.w {
+            cells.push((Rect::new(x, y, 1., 1.), outline));
+            x += 2.;
+        }
+    }
+    cells
+}
+
+/// `pixels` on the grid: the nearest whole number of cells.
+fn on_grid(pixels: f32) -> f32 {
+    (pixels / CELL).round() * CELL
+}
+
 /// The falling notes of `timeline` at `position`, over its keyboard, filling their parent, with
-/// the judgements of `flashes` as they stand at `now`; their words in the kit's face.
+/// the judgements of `flashes` as they stand at `now`; their words in the title face.
 pub fn falling(
     timeline: Arc<Timeline>,
     keyboard: Keyboard,
@@ -160,7 +221,11 @@ pub fn falling(
     )
     .size_full();
     // The canvas paints its words in the text style around it.
-    div().size_full().ui_text().semibold().child(notes)
+    div()
+        .size_full()
+        .font_family(fonts::TITLE)
+        .text_size(px(flash::WORD_SIZE))
+        .child(notes)
 }
 
 /// What is lit and judged from outside the piece, at the frame's moment.
@@ -188,33 +253,22 @@ fn paint(
     let width = f32::from(bounds.size.width);
     let height = f32::from(bounds.size.height);
     let layout = Layout::new(keyboard, width, height);
-    let origin = bounds.origin;
+    // The grid starts on a whole pixel of the window.
+    let origin = point(bounds.origin.x.round(), bounds.origin.y.round());
     let mut quad = |rect: Rect, color: Hsla| {
-        let at = point(origin.x + px(rect.x), origin.y + px(rect.y));
-        window.paint_quad(fill(Bounds::new(at, size(px(rect.w), px(rect.h))), color));
+        let at = point(origin.x + px(rect.x * CELL), origin.y + px(rect.y * CELL));
+        let size = size(px(rect.w * CELL), px(rect.h * CELL));
+        window.paint_quad(fill(Bounds::new(at, size), color));
     };
 
     quad(
-        Rect {
-            x: 0.,
-            y: 0.,
-            w: width,
-            h: height,
-        },
+        Rect::new(0., 0., (width / CELL).ceil(), (height / CELL).ceil()),
         look.ground,
     );
     // A line above each C, and across at each measure to come.
     for key in keyboard.keys().filter(|key| key % 12 == 0) {
         let (x, _) = layout.key(key);
-        quad(
-            Rect {
-                x,
-                y: 0.,
-                w: 1.,
-                h: layout.area,
-            },
-            look.line,
-        );
+        quad(Rect::new(x, 0., 1., layout.area), look.line);
     }
     let first = timeline.measure_at(position);
     for measure in first + 1.. {
@@ -225,15 +279,8 @@ fn paint(
             break;
         }
         let y = (layout.area - (at - position) as f32 * layout.per_ms()).round();
-        quad(
-            Rect {
-                x: layout.left,
-                y,
-                w: layout.white * keyboard.whites() as f32,
-                h: 1.,
-            },
-            look.line,
-        );
+        let across = layout.white * keyboard.whites() as f32;
+        quad(Rect::new(layout.left, y, across, 1.), look.line);
     }
 
     // The notes on white keys first: those on black keys lie over them, as their keys do.
@@ -258,83 +305,80 @@ fn paint(
                     }
                     _ => color,
                 };
-                quad(rect, color);
+                for (cell, color) in note_cells(rect, color) {
+                    quad(cell, color);
+                }
             }
         }
     }
-    quad(
-        Rect {
-            x: 0.,
-            y: layout.area - 2.,
-            w: width,
-            h: 2.,
-        },
-        look.now,
-    );
+    // Now: a dashed line across, where the notes meet the keys.
+    let columns = (width / CELL).ceil();
+    let mut x = 0.;
+    while x < columns {
+        quad(Rect::new(x, layout.area - 1., 2., 1.), look.now);
+        x += 4.;
+    }
 
     // The keys: a key struck by the player is the hit colour, one the piece plays its hand's;
-    // a key judged takes its grade's colour, fading.
+    // either is pressed. A key judged takes its grade's colour, fading.
     let color = |key: u8, idle: Hsla| {
-        let color = match (shown.lights.lit(key), sounding[usize::from(key)]) {
-            (true, _) => hex(theme::HIT),
-            (false, Some(hand)) => Look::hand(hand, is_black(key)),
-            (false, None) => idle,
+        let (color, down) = match (shown.lights.lit(key), sounding[usize::from(key)]) {
+            (true, _) => (hex(theme::HIT), true),
+            (false, Some(hand)) => (Look::hand(hand, is_black(key)), true),
+            (false, None) => (idle, false),
         };
-        match shown.flashes.on_key(key, now) {
+        let color = match shown.flashes.on_key(key, now) {
             Some(f) => mix(color, look.inks.get(f.grade), flash::TINT * f.strength(now)),
             None => color,
-        }
+        };
+        (color, down)
     };
-    let top = layout.area;
+    let (top, keys) = (layout.area, layout.keys);
+    let night = hex(theme::NIGHT);
     for key in keyboard.keys().filter(|&key| !is_black(key)) {
         let (x, w) = layout.key(key);
+        let (fill, down) = color(key, look.white);
+        let sink = if down { LIP } else { 0. };
+        quad(Rect::new(x, top, w, keys), look.gap);
+        quad(Rect::new(x + 1., top + sink, w - 1., keys - 1. - LIP), fill);
         quad(
-            Rect {
-                x,
-                y: top,
-                w,
-                h: layout.keys,
-            },
-            look.gap,
+            Rect::new(x + 1., top + keys - 1. - LIP + sink, w - 1., LIP - sink),
+            mix(fill, night, 0.22),
         );
-        quad(
-            Rect {
-                x: x + 1.,
-                y: top,
-                w: (w - 1.).max(1.),
-                h: layout.keys - 1.,
-            },
-            color(key, look.white),
-        );
+        if !down {
+            quad(
+                Rect::new(x + 1., top, 1., keys - 1. - LIP),
+                Look::light(fill),
+            );
+        }
     }
-    let black_height = (layout.keys * 0.62).round();
+    let black_height = (keys * 0.62).round();
+    let paper = hex(theme::PAPER);
     for key in keyboard.keys().filter(|&key| is_black(key)) {
         let (x, w) = layout.key(key);
+        let (fill, down) = color(key, look.black);
+        quad(Rect::new(x, top, w, black_height), look.gap);
         quad(
-            Rect {
-                x,
-                y: top,
-                w,
-                h: black_height,
-            },
-            look.gap,
+            Rect::new(x + 1., top, (w - 2.).max(1.), black_height - 1.),
+            fill,
         );
-        quad(
-            Rect {
-                x: x + 1.,
-                y: top,
-                w: (w - 2.).max(1.),
-                h: black_height - 1.,
-            },
-            color(key, look.black),
-        );
+        if !down {
+            quad(
+                Rect::new(x + 1., top + black_height - 1. - LIP, (w - 2.).max(1.), LIP),
+                mix(fill, paper, 0.22),
+            );
+            quad(
+                Rect::new(x + 1., top, 1., black_height - 1. - LIP),
+                mix(fill, paper, 0.12),
+            );
+        }
     }
 
-    // The words, over the keys they say, rising as they fade; the newest nearest the keys, an
-    // older one in its way lifted over it.
+    // The words, over the keys they say, rising as they fade, a cell at a time; the newest
+    // nearest the keys, an older one in its way lifted over it. Each sits on whole cells.
     let style = window.text_style();
     let font_size = px(flash::WORD_SIZE);
-    let tall = (flash::WORD_SIZE * 1.4).round();
+    let tall = (flash::WORD_SIZE * 1.2 / CELL).ceil() * CELL;
     let mut said: Vec<flash::Place> = Vec::new();
     for word in shown.flashes.words(now).iter().rev() {
         if !keyboard.shows(word.low) || !keyboard.shows(word.high) {
@@ -342,7 +386,7 @@ fn paint(
         }
         let (low, _) = layout.key(word.low);
         let (high, high_width) = layout.key(word.high);
-        let middle = (low + high + high_width) / 2.;
+        let middle = (low + high + high_width) / 2. * CELL;
         let text = SharedString::from(word.grade.word());
         let run = TextRun {
             color: look.inks.get(word.grade).opacity(word.flash.strength(now)),
@@ -352,67 +396,59 @@ fn paint(
             .text_system()
             .shape_line(text, font_size, &[run], None);
         let wide = f32::from(line.width());
-        let left = (middle - wide / 2.).clamp(0., (width - wide).max(0.));
-        let top = layout.area - 4. - tall - flash::RISE * word.flash.rise(now);
-        let pad = flash::WORD_PAD;
-        let place = flash::lift(&said, left - pad, wide + 2. * pad, top, tall);
+        let boxed = ((wide + 2. * flash::WORD_PAD) / CELL).ceil() * CELL;
+        let left = on_grid((middle - boxed / 2.).clamp(0., (width - boxed).max(0.)));
+        let top = on_grid(layout.area * CELL - CELL - tall - flash::RISE * word.flash.rise(now));
+        let place = flash::lift(&said, left, boxed, top, tall);
         said.push(place);
-        let at = point(
-            origin.x + px(place.left.round()),
-            origin.y + px(place.top.round().max(0.)),
-        );
+        let at = point(origin.x + px(place.left), origin.y + px(place.top.max(0.)));
         // On the ground's colour: a word over the note it judged, tinted alike, still reads.
         let ground = look
             .ground
             .opacity(flash::WORD_GROUND * word.flash.strength(now));
         window.paint_quad(fill(
-            Bounds::new(at, size(px(place.wide.round()), px(tall))),
+            Bounds::new(at, size(px(place.wide), px(tall))),
             ground,
         ));
         // A word that cannot be shaped is not said; the flash on the key still shows.
-        let text_at = point(at.x + px(pad), at.y);
+        let text_at = point(at.x + px(((boxed - wide) / 2.).round()), at.y);
         let _ = line.paint(text_at, px(tall), TextAlign::Left, None, window, cx);
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{LOOKAHEAD_MS, Layout, Rect};
+    use super::{CELL, LOOKAHEAD_MS, Layout, Rect, note_cells, on_grid};
     use crate::keyboard::Keyboard;
+    use gpui_design_system::color::hex;
 
-    /// Two octaves from C3, 14 white keys of 20 px in 290 px, over 400 px of height.
+    /// Two octaves from C3, 14 white keys of 5 cells in 72 cells, over 125 cells of height.
     fn layout() -> Layout {
         Layout::new(Keyboard::fit(48, 71), 290., 500.)
     }
 
     #[test]
-    fn the_keyboard_is_centred_on_whole_pixels() {
+    fn the_keyboard_is_centred_on_whole_cells() {
         let layout = layout();
-        assert_eq!((layout.white, layout.left), (20., 5.));
-        assert_eq!((layout.area, layout.keys), (400., 100.));
-        assert_eq!(layout.key(48), (5., 20.));
-        assert_eq!(layout.key(49), (19., 12.));
+        assert_eq!(CELL, 4.);
+        assert_eq!((layout.white, layout.left), (5., 1.));
+        assert_eq!((layout.area, layout.keys), (100., 25.));
+        assert_eq!(layout.key(48), (1., 5.));
+        // C#3 across the line between C3 and D3 (at 6): from 4.5 cells, rounded.
+        assert_eq!(layout.key(49), (5., 3.));
     }
 
     #[test]
     fn a_note_reaches_the_keys_when_it_is_due() {
         let layout = layout();
-        // Due in half the look-ahead: its start is halfway down, it lasts 300 ms (40 px).
+        // Due in half the look-ahead: its start is halfway down, it lasts 300 ms (10 cells).
         let half = LOOKAHEAD_MS / 2.;
         let rect = layout.note(60, half, half + 300., 0.).unwrap();
-        assert_eq!(
-            rect,
-            Rect {
-                x: 146.,
-                y: 160.,
-                w: 18.,
-                h: 39.
-            }
-        );
+        assert_eq!(rect, Rect::new(37., 40., 3., 9.));
         // Sounding now: its bottom is on the keys, and what has sounded is gone.
-        let now = layout.note(60, 0., 750., 375.).unwrap();
+        let now = layout.note(60, 0., 900., 300.).unwrap();
         assert_eq!(now.y + now.h + 1., layout.area);
-        assert_eq!(now.h, 49.);
+        assert_eq!(now.h, 19.);
     }
 
     #[test]
@@ -423,5 +459,37 @@ mod tests {
         assert_eq!(layout.note(90, 0., 100., 0.), None, "off the keyboard");
         // A long note is cut at the top of the area.
         assert_eq!(layout.note(60, 0., 1e6, 0.).unwrap().y, 0.);
+    }
+
+    #[test]
+    fn a_note_is_outlined_lit_and_dithered_inside_itself() {
+        let rect = Rect::new(10., 20., 5., 8.);
+        let cells = note_cells(rect, hex(0x7C5CFF));
+        // Outline, body, lit edge, then the dither: every cell inside the note.
+        assert_eq!(cells[0].0, rect);
+        assert_eq!(cells[1].0, Rect::new(11., 21., 3., 6.));
+        for (cell, _) in &cells {
+            assert!(
+                cell.x >= rect.x && cell.x + cell.w <= rect.x + rect.w,
+                "{cell:?}"
+            );
+            assert!(
+                cell.y >= rect.y && cell.y + cell.h <= rect.y + rect.h,
+                "{cell:?}"
+            );
+            assert_eq!((cell.x.fract(), cell.y.fract()), (0., 0.), "on the grid");
+        }
+        // Too thin for an inside: only its outline.
+        assert_eq!(
+            note_cells(Rect::new(0., 0., 2., 9.), hex(0x7C5CFF)).len(),
+            1
+        );
+    }
+
+    #[test]
+    fn a_word_rises_a_whole_cell_at_a_time() {
+        assert_eq!(on_grid(13.9), 12.);
+        assert_eq!(on_grid(14.1), 16.);
+        assert_eq!(on_grid(-2.1), -4.);
     }
 }

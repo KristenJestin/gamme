@@ -25,12 +25,12 @@ use crate::theme;
 
 /// How long a judgement shows.
 pub const FLASH: Duration = Duration::from_millis(700);
-/// How far a word rises while it fades, in pixels.
-pub const RISE: f32 = 22.;
-/// The size of a word over the keys, in pixels.
-pub const WORD_SIZE: f32 = 13.;
-/// The room on either side of a word over the keys, on the ground's colour, in pixels.
-pub const WORD_PAD: f32 = 3.;
+/// How far a word rises while it fades, in pixels: six cells of the falling notes' grid.
+pub const RISE: f32 = 24.;
+/// The size of a word over the keys, in pixels: the title face (Jersey 10) at twice its grid.
+pub const WORD_SIZE: f32 = 20.;
+/// The room on either side of a word over the keys, on the ground's colour, in pixels: a cell.
+pub const WORD_PAD: f32 = 4.;
 /// How opaque the ground under a word over the keys is, at its brightest.
 pub const WORD_GROUND: f32 = 0.85;
 /// The size of a word over an engraved note, in pixels.

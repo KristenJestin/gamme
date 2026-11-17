@@ -9,11 +9,11 @@ use std::borrow::Cow;
 
 use gpui_kit::App;
 
-// The names and sizes wait for the pixel components that set them (#29: the kit's components
-// cannot take another face yet).
-/// The titles and the buttons.
-#[allow(dead_code)]
+/// The titles, the buttons, and the judgements' words over the keys (`falling.rs`).
 pub const TITLE: &str = "Jersey 10";
+
+// The other names and sizes wait for the pixel components that set them (#29: the kit's
+// components cannot take another face yet).
 /// The interface's text.
 #[allow(dead_code)]
 pub const TEXT: &str = "Gamme Dot";
