@@ -417,9 +417,9 @@ impl PlayScreen {
             }
             "v" => self.set_view(self.view.next(), cx),
             _ => {
-                if let Some(score) = score
-                    && self.view != View::Falling
-                {
+                // The score zooms only where it is shown.
+                let shown = score.filter(|_| self.view != View::Falling);
+                if let Some(score) = shown {
                     score.update(cx, |score, cx| score.zoom_key(key, cx));
                 }
             }
