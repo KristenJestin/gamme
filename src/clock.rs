@@ -316,7 +316,9 @@ impl Clock {
     pub fn seek_ms(&self, ms: f64) {
         let target = micros(ms).min(self.0.end_us);
         let _ = self.0.state.try_update(AcqRel, Acquire, |state| {
-            let seeks = seeks_of(state).wrapping_add(1) & SEEKS_MASK;
+            // Two: one more is the pass after the loop's next wrap, which a chord may be released
+            // for already (struck just before the seam); a seek is never that pass.
+            let seeks = seeks_of(state).wrapping_add(2) & SEEKS_MASK;
             Some(state & AUDIO_DRIVES | seeks << POSITION_BITS | target)
         });
         self.stamp();
@@ -859,6 +861,24 @@ mod tests {
             wall.tick_at(&clock, at(100 * tick));
         }
         assert_eq!(clock.snapshot().position_us, 1_500_000);
+        assert!(clock.held());
+    }
+
+    #[test]
+    fn a_chord_released_for_the_next_pass_is_owed_again_after_a_seek() {
+        let clock = four_measures([vec![1000.], vec![], vec![]]);
+        clock.set_loop(Some((1, 1)));
+        clock.set_wait(Wait::Right);
+        clock.seek_ms(1950.);
+        clock.play();
+        // Just before the seam, the chord at A's start of the next pass.
+        let owed = clock.owed().unwrap();
+        assert_eq!(owed.pass, clock.snapshot().seeks + 1);
+        clock.release_chord(&owed);
+        // A seek instead of the wrap: the chord is owed in the pass the seek starts.
+        clock.seek_ms(1000.);
+        clock.tick(seconds(0.1));
+        assert_eq!(clock.snapshot().position_us, 1_000_000);
         assert!(clock.held());
     }
 
