@@ -10,8 +10,9 @@ piece, because apps that only show falling notes teach to follow, not to read.
 (it follows the Omarchy theme), a home screen that lists your pieces, a play screen that shows a
 piece engraved and falling over a keyboard and plays it with a built-in piano or a MIDI output,
 your MIDI keyboard lighting and sounding its keys, practice with one hand or both (the piece
-waiting for you, or looping over a few measures), and the machinery to publish, install and update
-the app. The game layer, the practice method and the fingering come next.
+waiting for you, or looping over a few measures), every note you play judged, and the machinery to
+publish, install and update the app. The rest of the game layer, the practice method and the
+fingering come next.
 
 ## The library
 
@@ -72,6 +73,26 @@ Known limits:
 - a chord is the notes of your hands that start within 30 ms of each other: a rolled chord written
   as separate notes is waited for note by note.
 
+## Judgements
+
+While you play a hand, every note of it is judged by when you strike its key, in real time
+(whatever the speed):
+
+| Judgement | When |
+|---|---|
+| perfect | within 50 ms of the note, early or late |
+| good | within 120 ms, early or late |
+| late | 120 to 250 ms after |
+| missed | not struck within 250 ms |
+
+A key struck where none of your notes is due is **wrong**. Each note of a chord is judged on its
+own; a key repeated fast goes to each of its notes in turn. With **Wait for me** on there is no
+timing: a note is perfect when you strike it, a wrong key is wrong. Each time the loop comes round,
+or after a seek, the notes are owed again and judged afresh; changing the hands you play starts
+the count again. The latency measured in the settings is taken away from each key. For now the
+row under the transport counts them; the judgements on the notes themselves, the combo and the
+score come next.
+
 ## Install
 
 ```
@@ -126,7 +147,8 @@ MIDI output. On the built-in piano your keys and pedal are apart from the piece'
 hold is not cut by the piece ending its own note on that key, by a pause or by a seek, a key you
 let go does not cut the piece's note on it, and your pedal holds your notes only. The keys held
 and the pedal down on a keyboard that is unplugged are let go, within a second. Each key and each
-move of the pedal is stamped with the instant it arrived, for the game to come.
+move of the pedal is stamped with the instant it arrived: the judge places each key on the
+piece's clock at that instant (Judgements, below).
 
 The built-in piano is opened with the piece when its SoundFont is there already; otherwise the
 first key you strike (or **Play**) downloads it. A digital piano that is both your keyboard and the
@@ -160,6 +182,12 @@ The **settings page** (the Settings button of the home screen) chooses:
   *Heavy* (a firmer touch is needed) or *Fixed* (every key at one volume). It shapes the keys you
   strike on the built-in piano, not the piece and not a MIDI output, whose own touch setting
   applies; a value this version does not know reads as *Light*;
+- **Latency**: **Calibrate** plays 16 clicks on the output the piece plays on (the built-in piano
+  made ready first if it must be); you listen to the first 4, then strike any key with each click.
+  The mean of how late your keys land (the sound reaching you, your hand, the key coming back) is
+  kept and taken away when your keys are judged. Slips (more than 100 ms from the others) do not
+  count, and fewer than 6 keys measure nothing. A value missing or this version cannot take reads
+  as 0;
 - **Colours**: Gamme's Nocturne or Omarchy's theme (see Brand).
 
 The choices apply at once and are kept in `$XDG_CONFIG_HOME/gamme/settings.json` (`~/.config/gamme`,

@@ -157,6 +157,12 @@ fn pass_mark(pass: u32) -> u32 {
     (pass & SEEKS_MASK as u32) + 1
 }
 
+/// Whether the counter of seeks went from `from` to `to` by one wrap of the loop and nothing else
+/// (a seek adds two).
+pub fn one_wrap(from: u32, to: u32) -> bool {
+    to == from.wrapping_add(1) & SEEKS_MASK as u32
+}
+
 /// A chord the player owes, as [`Clock::owed`] finds it.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct Owed {
@@ -487,6 +493,50 @@ impl Clock {
         ms.min(shared.end_us as f64 / 1e3)
     }
 
+    /// Where the piece stood at `at` (a key's arrival), in ms of its own tempo, and the counter of
+    /// seeks it is read against: the position published last, moved on or back by the real time
+    /// between its stamp and `at`, at the speed it advanced at, never past what stops it. Paused,
+    /// the position itself.
+    ///
+    /// Read back across the loop's seam (a key struck just before it, read just after), it lies
+    /// before the loop's start: on the same line as the pass before, which is what the judge
+    /// (`judge.rs`) needs.
+    pub fn position_at(&self, at: Instant) -> (u32, f64) {
+        let shared = &self.0;
+        let (mut state, mut stamp, mut speed) = (0, 0, Speed::FULL.percent());
+        for _ in 0..4 {
+            let before = shared.stamp_ns.load(Acquire);
+            state = shared.state.load(Acquire);
+            speed = shared.stamp_speed.load(Relaxed);
+            stamp = shared.stamp_ns.load(Acquire);
+            if before == stamp {
+                break;
+            }
+        }
+        let seeks = seeks_of(state) as u32;
+        let position = state & POSITION_MASK;
+        let mut ms = position as f64 / 1e3;
+        if self.playing() && position < shared.end_us {
+            let at_ns = match at.checked_duration_since(shared.origin) {
+                Some(since) => since.as_nanos().min(i64::MAX as u128) as i64,
+                None => {
+                    -(shared
+                        .origin
+                        .duration_since(at)
+                        .as_nanos()
+                        .min(i64::MAX as u128) as i64)
+                }
+            };
+            let ahead_ns =
+                (at_ns - stamp.min(i64::MAX as u64) as i64).min(EXTRAPOLATION_LIMIT_NS as i64);
+            ms += ahead_ns as f64 / 1e6 * Speed::new(speed).factor();
+            let limit = self.limit_us(position, self.loop_us());
+            let stop = self.hold_us(position, limit, seeks).unwrap_or(limit);
+            ms = ms.min(stop as f64 / 1e3);
+        }
+        (seeks, ms.min(shared.end_us as f64 / 1e3))
+    }
+
     /// The measure the position falls in (0 is the first).
     pub fn measure(&self, timeline: &Timeline) -> usize {
         timeline.measure_at(self.position_ms())
@@ -628,6 +678,49 @@ mod tests {
 
     fn seconds(s: f64) -> Duration {
         Duration::from_secs_f64(s)
+    }
+
+    #[test]
+    fn a_key_is_placed_where_the_piece_stood_when_it_arrived() {
+        let ago = |ms| {
+            Instant::now()
+                .checked_sub(Duration::from_millis(ms))
+                .unwrap()
+        };
+        let clock = Clock::new(10_000.);
+        // Paused: where the piece stands, whenever the key came; with the counter of seeks.
+        clock.seek_ms(1500.);
+        assert_eq!(clock.position_at(ago(300)), (clock.snapshot().seeks, 1500.));
+        clock.play();
+        clock.tick(seconds(1.));
+        let (_, now) = clock.position_at(Instant::now());
+        assert!((now - 2500.).abs() < 20., "{now}");
+        // A key that arrived 100 ms before the last buffer: 100 ms back.
+        let (_, before) = clock.position_at(ago(100));
+        assert!((before - 2400.).abs() < 20., "{before}");
+        // At half speed, 100 ms of real time are 50 of the piece.
+        clock.set_speed(Speed::new(50));
+        clock.tick(seconds(0.2));
+        let (_, half) = clock.position_at(ago(100));
+        assert!((half - 2550.).abs() < 20., "{half}");
+        // Never past a chord owed.
+        let marks = Marks {
+            measures_ms: vec![],
+            gates_ms: [vec![1000.], vec![], vec![1000.]],
+        };
+        let held = Clock::with_marks(10_000., &marks);
+        held.set_wait(Wait::Right);
+        held.play();
+        held.tick(seconds(2.));
+        assert_eq!(held.position_at(Instant::now()).1, 1000.);
+    }
+
+    #[test]
+    fn one_wrap_is_one_more_on_the_counter_and_a_seek_two() {
+        assert!(one_wrap(4, 5));
+        assert!(!one_wrap(4, 6));
+        assert!(!one_wrap(4, 4));
+        assert!(one_wrap(SEEKS_MASK as u32, 0));
     }
 
     #[test]

@@ -17,8 +17,9 @@ for versions, CI, releases, install and update. This file is how to work.
 
 Today it is one window, the design system's identity and theme (Omarchy's, followed), the home
 screen and its library, the play screen (the score, the falling notes and the built-in piano), MIDI
-out and in, practice (hands, wait, A–B loop), and the machinery above. The game layer, the method,
-the fingering and the pieces come as issues of their own.
+out and in, practice (hands, wait, A–B loop), the judge of every note with its latency calibration,
+and the machinery above. The rest of the game layer, the method, the fingering and the pieces come
+as issues of their own.
 
 ## Commands
 
@@ -60,8 +61,8 @@ The last three are CI's `verify` job (`.github/workflows/ci.yml`), on Rust 1.95,
 | `update.rs` | `gamme update`: the channel's latest build, its sum checked, the binary replaced |
 | `desktop.rs` | The launcher entry and the icon, written by `update` as `install.sh` writes them |
 | `paths.rs` | `$XDG_STATE_HOME/gamme`, `$XDG_CONFIG_HOME/gamme`, `$XDG_CACHE_HOME/gamme`, `$XDG_DATA_HOME`, `$XDG_DATA_HOME/gamme` and the library's folder |
-| `config.rs` | The settings in `$XDG_CONFIG_HOME/gamme/settings.json` (piano, MIDI out and in, touch), written atomically, and the output they choose (`Settings::audio`) |
-| `settings.rs` | The settings page, from the kit's components |
+| `config.rs` | The settings in `$XDG_CONFIG_HOME/gamme/settings.json` (piano, MIDI out and in, touch, latency), written atomically, and the output they choose (`Settings::audio`) |
+| `settings.rs` | The settings page, from the kit's components; the latency's calibration, played along with clicks |
 | `touch.rs` | The touch of the player's keys on the built-in piano: the pure velocity curve (light, normal, heavy, fixed), applied before the keys enter `piano.rs`'s ring |
 | `theme.rs` | Gamme's palette, "Nocturne", light and dark, on the kit's tokens |
 | `appearance.rs` | Omarchy's colours or Gamme's: the choice, kept in the state folder, and its control |
@@ -72,16 +73,18 @@ The last three are CI's `verify` job (`.github/workflows/ci.yml`), on Rust 1.95,
 | `timeline.rs` | The notes of a piece in time, each with its hand, its measure and its engraved note (from Verovio's MIDI, or a MIDI file's tracks), and where its measures start |
 | `play_screen.rs` | The play screen: a piece opened, its three views (score and falling notes, falling notes, score), the hands of a MIDI piece's parts, the keys played (lit, sounded, kept, handed to the wait) |
 | `practice.rs` | Practice: the hands the player plays (the computer plays the others), the player's chords, the judge of the wait (`Waiter`), the A–B loop chosen |
+| `judge.rs` | The judge of every note (perfect, good, late, missed, wrong), pure, on the piece's time laid end to end across the loop's passes; `Live` feeds it from the clock, the run's judgements kept in order |
+| `latency.rs` | The latency calibration's clicks and its pure measure, the offset the judge takes away |
 | `falling.rs` | The falling notes over the keyboard, painted every frame in one canvas |
 | `keyboard.rs` | The on-screen keyboard's keys and places, and the keys lit from outside (MIDI in) |
 | `wall_clock.rs` | The clock moved by the wall clock while no sound moves it (the piano not ready, no output) |
-| `clock.rs` | The play position shared with the audio thread (atomics): play, pause, seek, speed; the chords it waits at and the loop it goes round, obeyed by whoever steps it (`step`, `commit`) |
+| `clock.rs` | The play position shared with the audio thread (atomics): play, pause, seek, speed; the chords it waits at and the loop it goes round, obeyed by whoever steps it (`step`, `commit`); where the piece stood at a key's instant (`position_at`) |
 | `soundfont.rs` | The SoundFonts of the built-in piano and their resumable, checked download |
 | `piano.rs` | The built-in piano: the audio callback's logic (`Renderer`), the player's keys on their lock-free way to it (`LiveKeys`), and the `cpal` output |
 | `player.rs` | A piece being played: timeline, clock, and its output (an `Audio`: the built-in piano or MIDI out) made ready on its own thread; the fallback to the built-in piano |
 | `midi_out.rs` | MIDI out as an `Audio`: a thread paces the clock by the wall clock and sends the notes; `midir` is behind `Ports` and `Wire` so no test opens a port (inputs included) |
 | `midi_in.rs` | MIDI in: one thread watches the input ports (every one, or the one chosen) and connects them as they appear; each key timestamped on arrival, counted per port, handed to the play screen's `Keys` |
-| `transport.rs` | The transport bar (play, seek by measure, speed, the hands played, the wait, the loop, SoundFont progress); it holds the player and its practice |
+| `transport.rs` | The transport bar (play, seek by measure, speed, the hands played, the wait, the loop, SoundFont progress); it holds the player, its practice and the judge of the run |
 
 Besides `src/`:
 
