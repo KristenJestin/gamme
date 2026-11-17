@@ -665,6 +665,8 @@ impl PlayScreen {
         };
         let transport = ready.transport.clone();
         let score = ready.score.clone();
+        let held = &event.keystroke.modifiers;
+        let chorded = held.control || held.alt || held.platform;
         match key {
             "space" => transport.update(cx, |transport, cx| transport.toggle(cx)),
             "left" | "right" => {
@@ -676,20 +678,23 @@ impl PlayScreen {
                     cx.notify();
                 });
             }
-            "v" => self.set_view(self.view.next(), cx),
-            "h" | "w" | "a" | "b" | "l" => transport.update(cx, |transport, cx| match key {
-                "h" => {
-                    let next = transport.practice().choice().playing.next();
-                    transport.set_playing(next, cx);
-                }
-                "w" => {
-                    let wait = !transport.practice().choice().wait;
-                    transport.set_wait(wait, cx);
-                }
-                "a" => transport.set_a(cx),
-                "b" => transport.set_b(cx),
-                _ => transport.clear_loop(cx),
-            }),
+            // A letter with Ctrl, Alt or Super is another shortcut's (the desktop's), not ours.
+            "v" if !chorded => self.set_view(self.view.next(), cx),
+            "h" | "w" | "a" | "b" | "l" if !chorded => {
+                transport.update(cx, |transport, cx| match key {
+                    "h" => {
+                        let next = transport.practice().choice().playing.next();
+                        transport.set_playing(next, cx);
+                    }
+                    "w" => {
+                        let wait = !transport.practice().choice().wait;
+                        transport.set_wait(wait, cx);
+                    }
+                    "a" => transport.set_a(cx),
+                    "b" => transport.set_b(cx),
+                    _ => transport.clear_loop(cx),
+                })
+            }
             _ => {
                 // The score zooms only where it is shown.
                 let shown = score.filter(|_| self.view != View::Falling);
