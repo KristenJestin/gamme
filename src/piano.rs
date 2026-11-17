@@ -84,7 +84,12 @@ struct Ring {
     /// How many were ever written, and read: a slot is free once read.
     written: AtomicUsize,
     read: AtomicUsize,
-    /// The writers take turns (several keyboards); the reader never takes it.
+    /// The pedal as the player left it last: an output that opens later starts with it.
+    pedal: AtomicU8,
+    /// The writers take turns: the ring has one writer's index, and two writing at once would
+    /// claim the same slot. MIDI in hands the keys of every keyboard on one at a time already,
+    /// but `push` is open to any thread, and a lock is cheap there. Only writers take it; the
+    /// reader (the callback) never does, so the callback stays lock-free.
     writing: Mutex<()>,
 }
 
@@ -94,6 +99,7 @@ impl Default for LiveKeys {
             slots: std::array::from_fn(|_| AtomicU16::new(0)),
             written: AtomicUsize::new(0),
             read: AtomicUsize::new(0),
+            pedal: AtomicU8::new(0),
             writing: Mutex::new(()),
         }))
     }
@@ -108,6 +114,7 @@ impl LiveKeys {
 
     /// The sustain pedal moved to `value`; as [`LiveKeys::push`].
     pub fn push_pedal(&self, value: u8) -> bool {
+        self.0.pedal.store(value & 127, Relaxed);
         self.write(Live::Pedal(value))
     }
 
@@ -319,9 +326,13 @@ impl<S: Sink> Renderer<S> {
         .following()
     }
 
-    /// Sounds the keys the player strikes too, from now on.
+    /// Sounds the keys the player strikes too, from now on, his pedal as he holds it now.
     pub fn with_live(mut self, live: LiveKeys) -> Self {
         live.discard();
+        let pedal = live.0.pedal.load(Relaxed);
+        if pedal > 0 {
+            self.sink.live_pedal(pedal);
+        }
         self.live = Some(live);
         self
     }
@@ -903,6 +914,18 @@ mod tests {
                 Call::Pedal(0, 100),
             ]
         );
+    }
+
+    #[test]
+    fn an_output_that_opens_with_the_pedal_down_starts_with_it() {
+        let live = LiveKeys::default();
+        live.push_pedal(127);
+        let (renderer, _, _) = rig(vec![]);
+        let renderer = renderer.with_live(live.clone());
+        assert_eq!(renderer.sink.calls, [Call::Pedal(127, 0)]);
+        live.push_pedal(0);
+        let (renderer, _, _) = rig(vec![]);
+        assert_eq!(renderer.with_live(live).sink.calls, []);
     }
 
     #[test]

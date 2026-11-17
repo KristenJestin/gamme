@@ -103,6 +103,14 @@ first key you strike (or **Play**) downloads it. A digital piano that is both yo
 MIDI output sounds its own keys: they are not sent back to it. Gamme's own ports are never
 listened to, and ALSA's **Midi Through** only when it is the port chosen.
 
+Known limits:
+
+- a keyboard unplugged is seen within a second, so its keys and pedal are let go up to a second
+  late; one unplugged and plugged back within that second may stay silent until it is unplugged
+  longer (or the input is chosen again in the settings);
+- on a MIDI output your sustain pedal goes on the piece's channel, so while you hold it the
+  piece's notes ring on too, through a pause or a seek, as they would on the piano itself.
+
 ## MIDI out and the settings
 
 The piece can sound on a **MIDI output** (a piano with its own speakers) instead of the built-in

@@ -181,9 +181,29 @@ enum Arrival {
 /// sounded there, and sent on to the window.
 struct Struck {
     lights: Lights,
-    /// The player's output, once there is a player.
-    sound: Mutex<Option<player::Keys>>,
+    sound: Mutex<Heard>,
     arrived: async_channel::Sender<Arrival>,
+}
+
+/// Where the keys are heard, and the pedal as it stands, so that a new player starts with it.
+#[derive(Default)]
+struct Heard {
+    /// The player's output, once there is a player.
+    keys: Option<player::Keys>,
+    pedal: u8,
+    /// The port the pedal came from, by its id.
+    pedal_from: String,
+}
+
+impl Struck {
+    /// The keys are heard on `keys` from now on, the pedal held already too.
+    fn hear_on(&self, keys: player::Keys) {
+        let mut heard = self.sound.lock().expect("the keys' lock");
+        if heard.pedal > 0 {
+            keys.pedal(heard.pedal, &heard.pedal_from);
+        }
+        heard.keys = Some(keys);
+    }
 }
 
 impl midi_in::Keys for Struck {
@@ -193,17 +213,21 @@ impl midi_in::Keys for Struck {
         } else {
             self.lights.release(played.key);
         }
-        if let Some(sound) = self.sound.lock().expect("the keys' lock").as_ref() {
-            sound.note(played.key, played.velocity, &from.id);
+        if let Some(keys) = &self.sound.lock().expect("the keys' lock").keys {
+            keys.note(played.key, played.velocity, &from.id);
         }
         // Unbounded: never full, and it goes with the screen.
         let _ = self.arrived.try_send(Arrival::Key(played));
     }
 
     fn pedal(&self, pedal: Pedal, from: &PortInfo) {
-        if let Some(sound) = self.sound.lock().expect("the keys' lock").as_ref() {
-            sound.pedal(pedal.value, &from.id);
+        let mut heard = self.sound.lock().expect("the keys' lock");
+        heard.pedal = pedal.value;
+        from.id.clone_into(&mut heard.pedal_from);
+        if let Some(keys) = &heard.keys {
+            keys.pedal(pedal.value, &from.id);
         }
+        drop(heard);
         let _ = self.arrived.try_send(Arrival::Pedal(pedal));
     }
 }
@@ -351,7 +375,7 @@ impl PlayScreen {
         let (arrived, arrivals) = async_channel::unbounded();
         let struck = Arc::new(Struck {
             lights: lights.clone(),
-            sound: Mutex::new(None),
+            sound: Mutex::default(),
             arrived,
         });
         let attached = midi_in.attach(struck.clone());
@@ -452,7 +476,7 @@ impl PlayScreen {
         let (clock, timeline) = (player.clock.clone(), player.timeline.clone());
         clock.seek_ms(at);
         // The keys struck sound on this player's output from now on; the last one's is closed.
-        *self.struck.sound.lock().expect("the keys' lock") = Some(player.keys());
+        self.struck.hear_on(player.keys());
         if self.sound_wanted {
             player.warm();
         }

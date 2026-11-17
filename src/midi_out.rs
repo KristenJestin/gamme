@@ -21,7 +21,12 @@
 //! output that took its place is lost.
 //!
 //! The player's keys (MIDI in, `midi_in.rs`) go out through [`Audio::live`], except those of the
-//! very piano the piece goes to: it sounds its own keys already.
+//! very piano the piece goes to: it sounds its own keys already. They are still counted as held,
+//! so that the piece does not cut them.
+//!
+//! A known limit: the player's sustain pedal goes out on the piece's channel (the first: which
+//! channels a piano answers on is not known), so while he holds it the piece's notes ring on too,
+//! through a pause or a seek, as they would on the piano itself.
 //!
 //! The MIDI library (`midir`, on ALSA) is behind [`Ports`] and [`Wire`], so that the tests open
 //! no real port. [`Ports`] connects the input ports too, for MIDI in.
@@ -195,6 +200,8 @@ impl Ports for Alsa {
             *client = midir::MidiInput::new(CLIENT).ok();
         }
         let client = client.as_ref()?;
+        // A port whose name cannot be read went between the two calls: it alone is left out
+        // (the `?` is the closure's), the list is still read.
         Some(
             client
                 .ports()
@@ -293,6 +300,9 @@ struct State {
     /// The keys the piece sounds, and the keys the player holds (see [`Live`]).
     piece: [bool; 128],
     live: [bool; 128],
+    /// The piece's keys whose note-off was held back for a key the player holds: it goes with
+    /// his, even when his note-on was not sent (his piano's own key).
+    owed: [bool; 128],
     /// Nothing is sent once the link is closed: a key that comes late stays silent.
     closed: bool,
 }
@@ -304,6 +314,7 @@ impl Link {
                 wire,
                 piece: [false; 128],
                 live: [false; 128],
+                owed: [false; 128],
                 closed: false,
             }),
             lost,
@@ -330,25 +341,31 @@ impl Link {
         let at = usize::from(key & 127);
         state.piece[at] = false;
         // The player holds that key too: it is his to let go.
-        if !state.live[at] {
+        if state.live[at] {
+            state.owed[at] = true;
+        } else {
             self.send(&mut state, &[0x80 | CHANNEL, key & 127, 0]);
         }
     }
 
-    fn live_on(&self, key: u8, velocity: u8) {
+    /// A key the player strikes; `echo`: sent, which a piano's own key is not (it sounds it).
+    fn live_on(&self, key: u8, velocity: u8, echo: bool) {
         let mut state = self.state.lock().expect("the MIDI port's lock");
         state.live[usize::from(key & 127)] = true;
-        self.send(
-            &mut state,
-            &[0x90 | CHANNEL, key & 127, velocity.clamp(1, 127)],
-        );
+        if echo {
+            self.send(
+                &mut state,
+                &[0x90 | CHANNEL, key & 127, velocity.clamp(1, 127)],
+            );
+        }
     }
 
-    fn live_off(&self, key: u8) {
+    fn live_off(&self, key: u8, echo: bool) {
         let mut state = self.state.lock().expect("the MIDI port's lock");
         let at = usize::from(key & 127);
         state.live[at] = false;
-        if !state.piece[at] {
+        let owed = std::mem::take(&mut state.owed[at]);
+        if !state.piece[at] && (echo || owed) {
             self.send(&mut state, &[0x80 | CHANNEL, key & 127, 0]);
         }
     }
@@ -375,7 +392,12 @@ impl Link {
         let mut state = self.state.lock().expect("the MIDI port's lock");
         for key in 0..128u8 {
             let at = usize::from(key);
-            if std::mem::take(&mut state.piece[at]) && !state.live[at] {
+            if !std::mem::take(&mut state.piece[at]) {
+                continue;
+            }
+            if state.live[at] {
+                state.owed[at] = true;
+            } else {
                 self.send(&mut state, &[0x80 | CHANNEL, key, 0]);
             }
         }
@@ -390,6 +412,7 @@ impl Link {
         let mut state = self.state.lock().expect("the MIDI port's lock");
         for key in 0..128u8 {
             let at = usize::from(key);
+            state.owed[at] = false;
             if std::mem::take(&mut state.piece[at]) | std::mem::take(&mut state.live[at]) {
                 self.send(&mut state, &[0x80 | CHANNEL, key, 0]);
             }
@@ -429,36 +452,73 @@ impl Sink for MidiSink {
 /// answers the keyboard too. It is valid for every output the [`MidiOut`] opens, one after the
 /// other; with none open, nothing is sent.
 #[derive(Clone, Default)]
-pub struct Live(Arc<Mutex<Option<Arc<Link>>>>);
+pub struct Live(Arc<Mutex<LiveState>>);
+
+#[derive(Default)]
+struct LiveState {
+    link: Option<Arc<Link>>,
+    /// The player's pedal as he left it last, and the device it came from: an output that
+    /// opens later starts with it.
+    pedal: u8,
+    pedal_from: String,
+}
 
 impl Live {
     fn set(&self, link: Option<Arc<Link>>) {
-        *self.0.lock().expect("the live keys' lock") = link;
+        let mut state = self.0.lock().expect("the live keys' lock");
+        if let Some(link) = &link
+            && state.pedal > 0
+            && link.device != state.pedal_from
+        {
+            link.live_pedal(state.pedal);
+        }
+        state.link = link;
     }
 
     fn link(&self) -> Option<Arc<Link>> {
-        self.0.lock().expect("the live keys' lock").clone()
+        self.0.lock().expect("the live keys' lock").link.clone()
     }
 
-    /// Whether the input port `from` is a port of the device the output is open on.
-    fn same_device(&self, from: &str) -> bool {
-        self.link().is_some_and(|link| link.device == client(from))
-    }
-
+    #[cfg(test)]
     pub fn note_on(&self, key: u8, velocity: u8) {
         if let Some(link) = self.link() {
-            link.live_on(key, velocity);
+            link.live_on(key, velocity, true);
         }
     }
 
+    #[cfg(test)]
     pub fn note_off(&self, key: u8) {
         if let Some(link) = self.link() {
-            link.live_off(key);
+            link.live_off(key, true);
         }
     }
 
-    pub fn pedal(&self, value: u8) {
-        if let Some(link) = self.link() {
+    /// A key the player struck (`velocity` above 0) or let go on the input port `from`: sent,
+    /// unless the port is of the output's own device, and counted as held either way.
+    fn key(&self, key: u8, velocity: u8, from: &str) {
+        let Some(link) = self.link() else {
+            return;
+        };
+        let echo = link.device != client(from);
+        if velocity > 0 {
+            link.live_on(key, velocity, echo);
+        } else {
+            link.live_off(key, echo);
+        }
+    }
+
+    /// The player's pedal moved, on the input port `from`: sent, unless the port is of the
+    /// output's own device (its pedal is its own already).
+    fn pedal(&self, value: u8, from: &str) {
+        let link = {
+            let mut state = self.0.lock().expect("the live keys' lock");
+            state.pedal = value;
+            client(from).clone_into(&mut state.pedal_from);
+            state.link.clone()
+        };
+        if let Some(link) = link
+            && link.device != client(from)
+        {
             link.live_pedal(value);
         }
     }
@@ -674,28 +734,20 @@ impl Audio for MidiOut {
 
     fn live(&self, key: u8, velocity: u8, from: &str) {
         // A digital piano that is both the keyboard and the output sounds its keys itself: sent
-        // back, each would sound twice.
-        if self.live.same_device(from) {
-            return;
-        }
-        if velocity > 0 {
-            self.live.note_on(key, velocity);
-        } else {
-            self.live.note_off(key);
-        }
+        // back, each would sound twice. They are held all the same (`Live::key`).
+        self.live.key(key, velocity, from);
     }
 
     fn live_pedal(&self, value: u8, from: &str) {
-        // Its own pedal too.
-        if !self.live.same_device(from) {
-            self.live.pedal(value);
-        }
+        self.live.pedal(value, from);
     }
 }
 
 /// Ports that are not real, for the tests of this module and of the ones that use it.
 #[cfg(test)]
 pub mod testing {
+    use std::sync::atomic::AtomicU32;
+
     use super::*;
 
     /// An input connected to, as `connect_input` left it.
@@ -724,6 +776,7 @@ pub mod testing {
         input_connections: Mutex<u32>,
         /// Whether connecting to an input fails.
         refuse_inputs: AtomicBool,
+        looks: AtomicU32,
         sent: Arc<Mutex<Vec<Vec<u8>>>>,
         /// Whether the wires refuse what they are sent, as a port that went does.
         broken: Arc<AtomicBool>,
@@ -748,6 +801,7 @@ pub mod testing {
                 listening: Mutex::new(Vec::new()),
                 input_connections: Mutex::new(0),
                 refuse_inputs: AtomicBool::new(false),
+                looks: AtomicU32::new(0),
                 sent: Arc::default(),
                 broken: Arc::default(),
                 connections: Mutex::new(0),
@@ -780,6 +834,11 @@ pub mod testing {
         /// Connecting to an input fails from now on, or works again.
         pub fn refuse_inputs(&self, refuse: bool) {
             self.refuse_inputs.store(refuse, Relaxed);
+        }
+
+        /// How many times the inputs were listed.
+        pub fn looks(&self) -> u32 {
+            self.looks.load(Relaxed)
         }
 
         pub fn input_connections(&self) -> u32 {
@@ -859,6 +918,7 @@ pub mod testing {
         }
 
         fn input_list(&self) -> Option<Vec<PortInfo>> {
+            self.looks.fetch_add(1, Relaxed);
             if self.unknown.load(Relaxed) {
                 return None;
             }
@@ -1215,6 +1275,56 @@ mod tests {
             .filter(|m| m[..2] == [0xB0, 64])
             .collect();
         assert_eq!(pedal, [vec![0xB0, 64, 127], vec![0xB0, 64, 0]]);
+    }
+
+    #[test]
+    fn the_pianos_own_key_held_is_not_cut_by_the_piece_nor_a_pause() {
+        let opened = opened();
+        opened.clock.play();
+        until("the note on", || opened.count(NOTE_ON, 60) == 1);
+        // The player holds the piece's key on the piano itself (client 20, as the output).
+        Audio::live(&opened.midi, 60, 100, "20:1");
+        assert_eq!(opened.count(NOTE_ON, 60), 1, "not sent back");
+        opened.clock.pause();
+        std::thread::sleep(Duration::from_millis(150));
+        // Neither the piece's note-off nor All Notes Off: either would cut his key.
+        assert_eq!(opened.count(NOTE_OFF, 60), 0, "{:?}", opened.sent());
+        assert!(!opened.silenced(), "{:?}", opened.sent());
+        // He lets go: the piece's note-off held back goes now.
+        Audio::live(&opened.midi, 60, 0, "20:1");
+        assert_eq!(opened.count(NOTE_OFF, 60), 1);
+        // A key of his alone, let go: the piano ended it itself, nothing is sent.
+        Audio::live(&opened.midi, 62, 100, "20:1");
+        Audio::live(&opened.midi, 62, 0, "20:1");
+        assert_eq!(opened.count(NOTE_OFF, 62), 0);
+    }
+
+    #[test]
+    fn an_output_that_opens_with_the_pedal_down_starts_with_it() {
+        let ports = Arc::new(FakePorts::new(&["Digital Piano MIDI 1 20:0"], &[]));
+        let midi = MidiOut::new(
+            ports.clone(),
+            "Digital Piano MIDI 1".into(),
+            Arc::new(Builtin::default()),
+        );
+        // Before any output: kept.
+        midi.live_pedal(127, "40:0");
+        assert!(ports.sent().is_empty());
+        let timeline = timeline();
+        let clock = Clock::new(timeline.duration_ms());
+        let lost = Arc::new(AtomicBool::new(false));
+        let output = midi
+            .open(Path::new(""), &timeline, &clock, &Hands::both(), &lost)
+            .unwrap();
+        assert_eq!(ports.sent(), [vec![0xB0, 64, 127]]);
+        drop(output);
+        // The piano's own pedal is not sent to it, at the open either.
+        midi.live_pedal(127, "20:1");
+        let sent = ports.sent().len();
+        let _output = midi
+            .open(Path::new(""), &timeline, &clock, &Hands::both(), &lost)
+            .unwrap();
+        assert_eq!(ports.sent().len(), sent);
     }
 
     #[test]

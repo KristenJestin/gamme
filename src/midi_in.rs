@@ -19,9 +19,16 @@
 //! there calls GPUI. A key held on two keyboards is let go when the last one lets go of it, and
 //! the keys held on a port that goes, and its pedal, are let go then.
 //!
-//! A known limit: a port unplugged is seen at the next look, so its keys and its pedal are let go
-//! up to a second late. ALSA announces a port that goes (its System Announce port); listening to
-//! it would let go at once, but `midir` does not expose it.
+//! Known limits, both from looking at the list rather than being told:
+//! - a port unplugged is seen at the next look, so its keys and its pedal are let go up to a
+//!   second late;
+//! - a keyboard unplugged and plugged back between two looks, at the same address (ALSA often
+//!   gives it the same "client:port" again) and so the same name, looks as if it never went: the
+//!   connection kept is the old one, whose subscription went with the old port, and the keyboard
+//!   stays silent until it is unplugged for longer than a look or the choice changes.
+//!
+//! ALSA announces the ports that come and go (its System Announce port); listening to it would
+//! end both, but `midir` does not expose it.
 //!
 //! Gamme's own ports (its MIDI out) are never listened to, and "Midi Through" only when it is
 //! chosen: it echoes what other software sends it, and the piece itself when it is the output.
@@ -323,7 +330,19 @@ impl MidiIn {
     /// The keys go to `keys` until what comes back is dropped, or another is attached.
     pub fn attach(&self, keys: Arc<dyn Keys>) -> Attached {
         let id = self.0.attachments.fetch_add(1, Relaxed) + 1;
-        lock(&self.0.hub).keys = Some((id, keys));
+        let mut hub = lock(&self.0.hub);
+        // A pedal held already is told, from the keyboard that holds it most.
+        if hub.pedal > 0
+            && let Some(from) = hub.connections.iter().max_by_key(|c| c.pedal)
+        {
+            let pedal = Pedal {
+                value: hub.pedal,
+                at: Instant::now(),
+            };
+            keys.pedal(pedal, &from.port);
+        }
+        hub.keys = Some((id, keys));
+        drop(hub);
         Attached {
             hub: self.0.hub.clone(),
             id,
@@ -513,6 +532,13 @@ mod tests {
         MidiIn::watching(ports.clone(), move || choice, EVERY)
     }
 
+    /// Waits for `looks` more looks to start: all but the last are whole, since one thread makes
+    /// them one after the other.
+    fn looked(ports: &FakePorts, looks: u32) {
+        let from = ports.looks();
+        until(&format!("{looks} looks"), || ports.looks() >= from + looks);
+    }
+
     fn listening(midi: &MidiIn, names: &[&str]) {
         until(&format!("listening to {names:?}"), || {
             let mut listening = midi.listening();
@@ -554,6 +580,23 @@ mod tests {
         assert!(keys.1.lock().unwrap()[0].0.at >= before);
         // Not among the keys.
         assert!(keys.keys().is_empty());
+    }
+
+    #[test]
+    fn a_pedal_held_already_is_told_to_what_is_attached() {
+        let ports = Arc::new(FakePorts::new(&[], &[KEYSTATION]));
+        let midi = start(&ports, None);
+        listening(&midi, &[KEYSTATION]);
+        ports.send_from(KEYSTATION, &[0xB0, 64, 90]);
+        let keys = Arc::new(Recorder::default());
+        let _attached = midi.attach(keys.clone());
+        assert_eq!(keys.pedals(), [90]);
+        assert_eq!(keys.1.lock().unwrap()[0].1, KEYSTATION);
+        // Up, nothing is told.
+        ports.send_from(KEYSTATION, &[0xB0, 64, 0]);
+        let other = Arc::new(Recorder::default());
+        let _other = midi.attach(other.clone());
+        assert!(other.pedals().is_empty());
     }
 
     #[test]
@@ -645,7 +688,7 @@ mod tests {
         listening(&midi, &[KEYSTATION]);
         ports.cannot_look();
         ports.unplug_input(KEYSTATION);
-        std::thread::sleep(EVERY * 10);
+        looked(&ports, 3);
         assert_eq!(midi.listening(), [KEYSTATION]);
         ports.can_look();
         listening(&midi, &[]);
@@ -686,12 +729,13 @@ mod tests {
         ports.refuse_inputs(true);
         let midi = start(&ports, None);
         until("a try", || ports.input_connections() == 1);
-        std::thread::sleep(EVERY * 10);
+        looked(&ports, 3);
         assert_eq!(ports.input_connections(), 1);
         // Plugged again, it is tried again.
         ports.refuse_inputs(false);
         ports.unplug_input(KEYSTATION);
-        std::thread::sleep(EVERY * 5);
+        // A whole look sees it gone.
+        looked(&ports, 2);
         ports.plug_input(KEYSTATION, "40:0");
         listening(&midi, &[KEYSTATION]);
         assert_eq!(ports.input_connections(), 2);
