@@ -60,8 +60,9 @@ The last three are CI's `verify` job (`.github/workflows/ci.yml`), on Rust 1.95,
 | `update.rs` | `gamme update`: the channel's latest build, its sum checked, the binary replaced |
 | `desktop.rs` | The launcher entry and the icon, written by `update` as `install.sh` writes them |
 | `paths.rs` | `$XDG_STATE_HOME/gamme`, `$XDG_CONFIG_HOME/gamme`, `$XDG_CACHE_HOME/gamme`, `$XDG_DATA_HOME`, `$XDG_DATA_HOME/gamme` and the library's folder |
-| `config.rs` | The settings in `$XDG_CONFIG_HOME/gamme/settings.json` (piano, MIDI out and in), written atomically, and the output they choose (`Settings::audio`) |
+| `config.rs` | The settings in `$XDG_CONFIG_HOME/gamme/settings.json` (piano, MIDI out and in, touch), written atomically, and the output they choose (`Settings::audio`) |
 | `settings.rs` | The settings page, from the kit's components |
+| `touch.rs` | The touch of the player's keys on the built-in piano: the pure velocity curve (light, normal, heavy, fixed), applied before the keys enter `piano.rs`'s ring |
 | `theme.rs` | Gamme's palette, "Nocturne", light and dark, on the kit's tokens |
 | `appearance.rs` | Omarchy's colours or Gamme's: the choice, kept in the state folder, and its control |
 | `engraver.rs` | The one Verovio toolkit of the process, on its own thread; its resources unpacked once into the cache; a piece's pages, timemap, MIDI and written notes |

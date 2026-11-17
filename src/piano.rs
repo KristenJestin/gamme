@@ -17,7 +17,9 @@
 //!
 //! The keys the player strikes on a MIDI keyboard (`midi_in.rs`), and his sustain pedal, reach
 //! the callback through [`LiveKeys`], a ring of atomics made once: the callback plays them at the
-//! start of its next buffer, so the output is opened with a small one (`LIVE_FRAMES`). They are
+//! start of its next buffer, so the output is opened with a small one (`LIVE_FRAMES`). Their
+//! velocity is shaped by the player's touch (`touch.rs`) before they enter the ring, never in the
+//! callback. They are
 //! played on a channel of the synthesizer of their own (the same piano): the piece ending a note,
 //! a pause or a seek do not cut a key the player holds, the player letting a key go does not cut
 //! the piece's note on it, and his pedal holds his notes, not the piece's (a pause still silences
@@ -146,6 +148,18 @@ impl LiveKeys {
         let packed = ring.slots[read % LIVE_SLOTS].load(Relaxed);
         ring.read.store(read.wrapping_add(1), Release);
         Some(Live::unpack(packed))
+    }
+
+    /// The keys waiting (struck or let go, with their velocity), taken out of the ring; the
+    /// pedal's moves are left out.
+    #[cfg(test)]
+    pub fn take_keys(&self) -> Vec<(u8, u8)> {
+        std::iter::from_fn(|| self.pop())
+            .filter_map(|live| match live {
+                Live::Key(key, velocity) => Some((key, velocity)),
+                Live::Pedal(_) => None,
+            })
+            .collect()
     }
 
     /// Forgets what waits: struck before the output was there, it is not played late.

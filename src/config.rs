@@ -1,11 +1,13 @@
 //! What the player chose in the settings page, kept in `$XDG_CONFIG_HOME/gamme/settings.json`:
 //! which piano the built-in synthesizer plays (its SoundFont), whether the piece goes to a MIDI
-//! output instead, and which MIDI input the keys come from.
+//! output instead, which MIDI input the keys come from, and the touch of the player's keys on the
+//! built-in piano.
 //!
 //! The colours are the kit's appearance state and stay in the state folder (`appearance.rs`).
 //!
 //! The file is written beside and renamed over the old one, the folder `0700` and the file `0600`.
-//! Absent, or a key missing: the defaults (the small piano, no MIDI out, every input port).
+//! Absent, or a key missing: the defaults (the small piano, no MIDI out, every input port, a light
+//! touch).
 
 use std::io::Write as _;
 use std::os::unix::fs::{DirBuilderExt as _, OpenOptionsExt as _, PermissionsExt as _};
@@ -18,6 +20,7 @@ use crate::midi_out::{MidiOut, Ports};
 use crate::paths;
 use crate::player::{Audio, Builtin};
 use crate::soundfont::{self, Font};
+use crate::touch::Touch;
 
 /// The settings, as they are kept.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -32,6 +35,9 @@ pub struct Settings {
     /// The only MIDI input port the player's keys are read from (`midi_in.rs`). None: every port,
     /// as it appears.
     pub midi_in: Option<String>,
+    /// How the player's keys are struck on the built-in piano (`touch.rs`). A value this version
+    /// does not know is the default, and the file is read all the same.
+    pub touch: Touch,
 }
 
 impl Default for Settings {
@@ -40,6 +46,7 @@ impl Default for Settings {
             piano: soundfont::SMALL_PIANO.id.to_owned(),
             midi_out: None,
             midi_in: None,
+            touch: Touch::default(),
         }
     }
 }
@@ -59,7 +66,7 @@ impl Settings {
     /// the built-in piano otherwise (and when the MIDI output cannot be used: see
     /// [`Audio::fallback`]).
     pub fn audio(&self, ports: Arc<dyn Ports>) -> (Arc<dyn Audio>, Font) {
-        let builtin: Arc<dyn Audio> = Arc::new(Builtin::default());
+        let builtin: Arc<dyn Audio> = Arc::new(Builtin::new(self.touch));
         let audio: Arc<dyn Audio> = match &self.midi_out {
             Some(port) => Arc::new(MidiOut::new(ports, port.clone(), builtin)),
             None => builtin,
@@ -174,7 +181,51 @@ mod tests {
         assert_eq!(settings.piano, soundfont::SMALL_PIANO.id);
         assert_eq!(settings.midi_out, None);
         assert_eq!(settings.midi_in, None);
+        assert_eq!(settings.touch, Touch::Light);
         assert_eq!(settings.font().id, soundfont::SMALL_PIANO.id);
+    }
+
+    #[test]
+    fn a_touch_is_kept_with_the_other_settings_as_they_are() {
+        let config = Temp::new("touch");
+        let kept = Settings {
+            piano: soundfont::CONCERT_GRAND.id.into(),
+            midi_out: Some("Digital Piano MIDI 1".into()),
+            midi_in: Some("Keystation 49".into()),
+            touch: Touch::Normal,
+        };
+        save(&config.0, &kept).unwrap();
+        // The touch changes, the rest of what was kept does not.
+        let mut read_back = read(&config.0).unwrap();
+        read_back.touch = Touch::Heavy;
+        save(&config.0, &read_back).unwrap();
+        assert_eq!(
+            read(&config.0).unwrap(),
+            Settings {
+                touch: Touch::Heavy,
+                ..kept
+            }
+        );
+        let text = std::fs::read_to_string(file(&config.0)).unwrap();
+        assert!(text.contains("\"touch\": \"heavy\""), "{text}");
+    }
+
+    #[test]
+    fn a_touch_missing_or_unknown_is_light_and_the_rest_is_kept() {
+        let config = Temp::new("touch-unknown");
+        std::fs::create_dir_all(&config.0).unwrap();
+        for text in [
+            r#"{"piano":"grand","midi_in":"Keystation 49"}"#,
+            r#"{"piano":"grand","midi_in":"Keystation 49","touch":"firm"}"#,
+            r#"{"piano":"grand","midi_in":"Keystation 49","touch":7}"#,
+            r#"{"piano":"grand","midi_in":"Keystation 49","touch":null}"#,
+        ] {
+            std::fs::write(file(&config.0), text).unwrap();
+            let settings = read(&config.0).unwrap();
+            assert_eq!(settings.touch, Touch::Light, "{text}");
+            assert_eq!(settings.piano, "grand", "{text}");
+            assert_eq!(settings.midi_in.as_deref(), Some("Keystation 49"), "{text}");
+        }
     }
 
     #[test]
@@ -184,6 +235,7 @@ mod tests {
             piano: soundfont::CONCERT_GRAND.id.into(),
             midi_out: Some("Digital Piano MIDI 1".into()),
             midi_in: Some("Keystation 49".into()),
+            touch: Touch::Heavy,
         };
         save(&config.0, &chosen).unwrap();
         assert_eq!(read(&config.0).unwrap(), chosen);
@@ -265,6 +317,7 @@ mod tests {
             piano: soundfont::CONCERT_GRAND.id.into(),
             midi_out: Some("Digital Piano".into()),
             midi_in: None,
+            touch: Touch::Fixed,
         };
         let (midi, font) = chosen.audio(ports);
         assert_eq!(midi.label().unwrap(), "MIDI output “Digital Piano”");
