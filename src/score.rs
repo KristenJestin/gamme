@@ -6,12 +6,11 @@
 //! empty groups of notes and measures pulling boxes to the origin).
 
 use std::collections::{HashMap, HashSet};
-use std::path::Path;
 use std::sync::{Arc, OnceLock};
 
 use resvg::usvg::{self, fontdb, roxmltree};
 
-use crate::engraver::{self, Engraved, Event, Result};
+use crate::engraver::{Engraved, Event, Result};
 
 /// A box on a page, in the page's own units (those of [`Score::page_size`]).
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -115,11 +114,6 @@ pub struct Score {
 }
 
 impl Score {
-    /// Engraves `piece` with the process's engraver and places it. Slow: off the main thread.
-    pub fn open(piece: &Path) -> Result<Self> {
-        Self::place(engraver::shared().engrave(piece)?)
-    }
-
     /// Reads the pages Verovio drew and places its timemap on them.
     pub fn place(engraved: Engraved) -> Result<Self> {
         let options = usvg::Options {
@@ -233,10 +227,6 @@ impl Score {
     }
 
     /// The measures in the order they are played.
-    #[cfg_attr(
-        not(test),
-        expect(dead_code, reason = "seeking by measure comes with the clock")
-    )]
     pub fn measures(&self) -> &[Measure] {
         &self.measures
     }
@@ -466,7 +456,10 @@ fn ink(node: &usvg::Node, parent: usvg::Transform) -> Option<Area> {
 
 #[cfg(test)]
 mod tests {
+    use std::path::Path;
+
     use super::*;
+    use crate::engraver;
 
     /// A page shaped as Verovio draws one: a nested, scaled `<svg>`, a page margin moved by a
     /// transform, glyphs placed by `<use>` with an offset, and an empty group.
@@ -518,6 +511,8 @@ mod tests {
             pages: vec![PAGE.to_owned()],
             events,
             numbers: HashMap::from([("m1".to_owned(), "1".to_owned())]),
+            midi: Vec::new(),
+            written: HashMap::new(),
         })
         .unwrap()
     }

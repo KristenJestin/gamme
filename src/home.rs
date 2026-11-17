@@ -1,5 +1,6 @@
 //! The home screen: the pieces of the library, the last played first, with the means to import
-//! one (a file picker, or a file dropped on the window) and to remove one.
+//! one (a file picker, or a file dropped on the window), to remove one, and to open one: a click
+//! on its row asks the window for its play screen ([`Open`]).
 //!
 //! The library's work (reading, copying, listing) is blocking and runs off the main thread; the
 //! screen only puts its results in place and says them in toasts.
@@ -26,6 +27,9 @@ struct Row {
     menu: Entity<Menu>,
 }
 
+/// The home screen asks to play a piece of its library.
+pub struct Open(pub Library, pub Piece);
+
 pub struct Home {
     /// `None` when there is no home folder to keep a library in.
     library: Option<Library>,
@@ -42,20 +46,12 @@ pub struct Home {
     toasts: Entity<ToastStack>,
 }
 
+impl EventEmitter<Open> for Home {}
+
 impl Home {
     pub fn new(cx: &mut Context<Self>) -> Self {
         let library = Library::open();
-        if let Some(library) = library.clone() {
-            cx.spawn(async move |this, cx| {
-                let pieces = cx
-                    .background_executor()
-                    .spawn(async move { library.list() })
-                    .await;
-                this.update(cx, |this, cx| this.set_pieces(pieces, cx)).ok();
-            })
-            .detach();
-        }
-        Self {
+        let home = Self {
             // With no library there is nothing to read: the list is empty, and importing says why
             // it cannot.
             loaded: library.is_none(),
@@ -66,6 +62,30 @@ impl Home {
             asking: None,
             importing: 0,
             toasts: cx.new(ToastStack::new),
+        };
+        home.refresh(cx);
+        home
+    }
+
+    /// Reads the library again, off the main thread: a piece played comes first.
+    pub fn refresh(&self, cx: &mut Context<Self>) {
+        let Some(library) = self.library.clone() else {
+            return;
+        };
+        cx.spawn(async move |this, cx| {
+            let pieces = cx
+                .background_executor()
+                .spawn(async move { library.list() })
+                .await;
+            this.update(cx, |this, cx| this.set_pieces(pieces, cx)).ok();
+        })
+        .detach();
+    }
+
+    fn open(&mut self, id: &str, cx: &mut Context<Self>) {
+        let piece = self.pieces.iter().find(|piece| piece.id == id);
+        if let (Some(library), Some(piece)) = (self.library.clone(), piece) {
+            cx.emit(Open(library, piece.clone()));
         }
     }
 
@@ -201,8 +221,9 @@ impl Home {
         .detach();
     }
 
-    fn row(row: &Row, ink: Hsla, now: u64) -> ListRow {
+    fn row(row: &Row, ink: Hsla, now: u64, home: WeakEntity<Self>) -> ListRow {
         let piece = &row.piece;
+        let id = piece.id.clone();
         let played = match piece.last_played {
             Some(at) => format!("played {}", ago(now, at)),
             None => "not played yet".to_owned(),
@@ -222,6 +243,9 @@ impl Home {
         .when_some(line, |row, line| row.line(line))
         .meta(played)
         .more(row.menu.clone())
+        .on_click(move |_, _, cx| {
+            home.update(cx, |home, cx| home.open(&id, cx)).ok();
+        })
     }
 }
 
@@ -284,7 +308,7 @@ impl Render for Home {
             list = list.item(
                 ElementId::Name(format!("piece-{}-item", slot.key).into()),
                 slot.placement,
-                Self::row(slot.value, p.faint, now),
+                Self::row(slot.value, p.faint, now, home.clone()),
             );
         }
         let empty = self.loaded && self.listing.rows().next().is_none();

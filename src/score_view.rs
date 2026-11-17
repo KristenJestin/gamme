@@ -1,19 +1,18 @@
-//! The score on screen: its pages as images, and over them, drawn every frame, the measure being
-//! played, the cursor and the notes that sound.
+//! The score on screen, as the play screen holds it: its pages as images, and over them, drawn
+//! every frame, the measure being played, the cursor and the notes that sound.
 //!
 //! The pages are rasterized off the main thread, again when the window's width, the zoom or the
 //! theme's ink changes; meanwhile the images already there are drawn at the new size, so a
-//! resize never waits for them. Keys: `+` and `-` zoom out and back, `0` fits the width.
+//! resize never waits for them. The play screen passes on `+` and `-` (zoom out and back) and
+//! `0` (fit the width).
 
-use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Instant;
 
 use gpui_design_system::theme::{radius, target_palette};
-use gpui_design_system::{EmptyLine, PageHeader, Skeleton, Type as _, awaiting, palette, space};
+use gpui_design_system::{Skeleton, awaiting, palette, space};
 use gpui_kit::*;
 
-use crate::icons;
 use crate::raster;
 use crate::score::{Cursor, Score};
 
@@ -35,94 +34,6 @@ pub trait Playhead: 'static {
     fn moving(&self) -> bool;
 }
 
-/// A position that does not move.
-pub struct Still(pub f64);
-
-impl Playhead for Still {
-    fn position(&self) -> f64 {
-        self.0
-    }
-
-    fn moving(&self) -> bool {
-        false
-    }
-}
-
-/// The piece played through at its own tempo from a position: a stand-in until the clock, to see
-/// the cursor move.
-pub struct Preview {
-    from: f64,
-    started: Instant,
-}
-
-impl Preview {
-    pub fn new(from: f64) -> Self {
-        Self {
-            from,
-            started: Instant::now(),
-        }
-    }
-}
-
-impl Playhead for Preview {
-    fn position(&self) -> f64 {
-        self.from + self.started.elapsed().as_secs_f64() * 1e3
-    }
-
-    fn moving(&self) -> bool {
-        true
-    }
-}
-
-/// A piece to open from the command line, until the library opens them:
-/// `gamme <piece> [--at <seconds>] [--play]`.
-#[derive(Debug, PartialEq)]
-pub struct Opening {
-    pub piece: PathBuf,
-    /// Where the cursor starts, in ms.
-    pub at: f64,
-    /// Whether the cursor moves from there at the piece's tempo.
-    pub play: bool,
-}
-
-impl Opening {
-    pub fn parse(piece: String, mut args: impl Iterator<Item = String>) -> Result<Self, String> {
-        let mut opening = Self {
-            piece: PathBuf::from(piece),
-            at: 0.,
-            play: false,
-        };
-        while let Some(arg) = args.next() {
-            match arg.as_str() {
-                "--play" => opening.play = true,
-                "--at" => {
-                    let seconds = args
-                        .next()
-                        .and_then(|s| s.parse::<f64>().ok())
-                        .filter(|s| s.is_finite() && *s >= 0.)
-                        .ok_or("--at takes a number of seconds")?;
-                    opening.at = seconds * 1e3;
-                }
-                other => return Err(format!("unknown argument {other} (see gamme --help)")),
-            }
-        }
-        Ok(opening)
-    }
-
-    fn playhead(&self) -> Box<dyn Playhead> {
-        match self.play {
-            true => Box::new(Preview::new(self.at)),
-            false => Box::new(Still(self.at)),
-        }
-    }
-}
-
-enum Piece {
-    Engraving,
-    Failed(SharedString),
-    Ready(Arc<Score>),
-}
-
 /// What the pages are rasterized for: their width in device pixels and their ink.
 #[derive(Clone, Copy, PartialEq)]
 struct Look {
@@ -131,9 +42,7 @@ struct Look {
 }
 
 pub struct ScoreView {
-    title: SharedString,
-    file: SharedString,
-    piece: Piece,
+    score: Arc<Score>,
     playhead: Box<dyn Playhead>,
     zoom: f32,
     images: Vec<Arc<RenderImage>>,
@@ -143,69 +52,48 @@ pub struct ScoreView {
     drawing: Option<Look>,
     /// Images replaced, given back to the window at the next frame.
     retired: Vec<Arc<RenderImage>>,
-    /// Whether the cursor was brought into view once.
+    /// Whether the cursor was brought into view since the score was shown.
     shown: bool,
+    /// The measure (its number in the order of play) the view was last at: a still cursor that
+    /// moves to another one (a seek) is brought into view.
+    followed: Option<usize>,
     scroll: ScrollHandle,
-    focus: FocusHandle,
 }
 
 impl ScoreView {
-    pub fn new(opening: Opening, window: &mut Window, cx: &mut Context<Self>) -> Self {
-        let focus = cx.focus_handle();
-        window.focus(&focus, cx);
-        let title = opening.piece.file_stem().map_or_else(
-            || "Piece".into(),
-            |stem| stem.to_string_lossy().into_owned(),
-        );
-        let file = opening
-            .piece
-            .file_name()
-            .map(|name| name.to_string_lossy().into_owned())
-            .unwrap_or_default();
-        let piece = opening.piece.clone();
-        cx.spawn(async move |this, cx| {
-            let started = Instant::now();
-            let opened = cx
-                .background_executor()
-                .spawn(async move { Score::open(&piece) })
-                .await;
-            this.update(cx, |this, cx| {
-                this.piece = match opened {
-                    Ok(score) => {
-                        timing(format_args!(
-                            "engraved {} pages in {} ms",
-                            score.pages().len(),
-                            started.elapsed().as_millis()
-                        ));
-                        Piece::Ready(Arc::new(score))
-                    }
-                    Err(error) => Piece::Failed(error.into()),
-                };
-                cx.notify();
-            })
-        })
-        .detach();
+    pub fn new(score: Arc<Score>, playhead: Box<dyn Playhead>) -> Self {
         Self {
-            title: title.into(),
-            file: file.into(),
-            piece: Piece::Engraving,
-            playhead: opening.playhead(),
+            score,
+            playhead,
             zoom: 1.,
             images: Vec::new(),
             drawn: None,
             drawing: None,
             retired: Vec::new(),
             shown: false,
+            followed: None,
             scroll: ScrollHandle::new(),
-            focus,
         }
     }
 
-    /// Hands the score another playhead: the clock, when a piece is played.
-    #[expect(dead_code, reason = "the clock is not there yet")]
-    pub fn set_playhead(&mut self, playhead: Box<dyn Playhead>, cx: &mut Context<Self>) {
-        self.playhead = playhead;
+    /// Brings the cursor into view at the next frame, as when the score is first shown: the
+    /// score comes back from another view, or the cursor jumped while it was still.
+    pub fn reveal(&mut self, cx: &mut Context<Self>) {
+        self.shown = false;
         cx.notify();
+    }
+
+    /// `+` or `=`, `-`, `0`: zooms, and says whether the key was one of them.
+    pub fn zoom_key(&mut self, key: &str, cx: &mut Context<Self>) -> bool {
+        let zoom = match key {
+            "+" | "=" => self.zoom * ZOOM_STEP,
+            "-" => self.zoom / ZOOM_STEP,
+            "0" => 1.,
+            _ => return false,
+        };
+        self.zoom = zoom.clamp(ZOOM_MIN, 1.);
+        cx.notify();
+        true
     }
 
     /// The width a page is drawn at, in logical pixels.
@@ -216,12 +104,12 @@ impl ScoreView {
 
     /// Rasterizes the pages for `look` unless they are, or are being: one at a time, the last
     /// look asked for drawn once the one under way is done.
-    fn redraw(&mut self, score: &Arc<Score>, look: Look, cx: &mut Context<Self>) {
+    fn redraw(&mut self, look: Look, cx: &mut Context<Self>) {
         if self.drawn == Some(look) || self.drawing.is_some() {
             return;
         }
         self.drawing = Some(look);
-        let score = score.clone();
+        let score = self.score.clone();
         cx.spawn(async move |this, cx| {
             let started = Instant::now();
             let images = cx
@@ -244,20 +132,10 @@ impl ScoreView {
         .detach();
     }
 
-    fn on_key(&mut self, event: &KeyDownEvent, _: &mut Window, cx: &mut Context<Self>) {
-        let zoom = match event.keystroke.key.as_str() {
-            "+" | "=" => self.zoom * ZOOM_STEP,
-            "-" => self.zoom / ZOOM_STEP,
-            "0" => 1.,
-            _ => return,
-        };
-        self.zoom = zoom.clamp(ZOOM_MIN, 1.);
-        cx.notify();
-    }
-
     /// Scrolls toward the cursor's system, a third of the way down the view: at once with
     /// `jump`, a step of the way otherwise. Whether the view is there.
-    fn follow(&self, score: &Score, cursor: Cursor, page_width: f32, jump: bool) -> bool {
+    fn follow(&self, cursor: Cursor, page_width: f32, jump: bool) -> bool {
+        let score = &self.score;
         let gap = f32::from(PAGE_GAP);
         let height = |page: usize| {
             let (width, height) = score.page_size(page);
@@ -284,23 +162,23 @@ impl ScoreView {
         false
     }
 
-    fn pages(
-        &mut self,
-        score: &Score,
-        page_width: f32,
-        window: &Window,
-        cx: &App,
-    ) -> Vec<AnyElement> {
+    fn pages(&mut self, page_width: f32, window: &Window, cx: &App) -> Vec<AnyElement> {
         let p = palette(cx);
+        let score = self.score.clone();
         let position = self.playhead.position();
         let moment = score.at(position);
+        let measure = moment.measure.map(|m| m.number);
+        if measure != self.followed {
+            self.followed = measure;
+            self.shown &= self.playhead.moving();
+        }
         if let Some(cursor) = moment.cursor
             && !self.images.is_empty()
             && (self.playhead.moving() || !self.shown)
         {
             // The first jump is tried again until it lands: while the pages fade in, the
             // room they take grows, and an offset beyond it is cut short.
-            let there = self.follow(score, cursor, page_width, !self.shown);
+            let there = self.follow(cursor, page_width, !self.shown);
             self.shown |= there;
             if !self.shown {
                 window.request_animation_frame();
@@ -374,45 +252,18 @@ impl Render for ScoreView {
         for old in self.retired.drain(..) {
             cx.drop_image(old, Some(window));
         }
-        let p = palette(cx);
         let page_width = self.page_width(window);
-        let mut status = "Engraving…".to_owned();
-        let mut pages = Vec::new();
-        let mut failed = None;
-        match &self.piece {
-            Piece::Engraving => {}
-            Piece::Failed(error) => {
-                failed = Some(error.clone());
-                status = "Not engraved".into();
-            }
-            Piece::Ready(score) => {
-                let score = score.clone();
-                let look = Look {
-                    width: (page_width * window.scale_factor()).round() as u32,
-                    // The ink the theme heads to: a theme's fade is not rasterized frame by frame.
-                    ink: target_palette(cx).text.to_rgb(),
-                };
-                self.redraw(&score, look, cx);
-                pages = self.pages(&score, page_width, window, cx);
-                let position = self.playhead.position().clamp(0., score.duration());
-                let measure = score.at(position).measure.map(|m| m.name.clone());
-                status = match measure {
-                    Some(name) => format!(
-                        "Measure {name}  ·  {} / {}",
-                        clock(position),
-                        clock(score.duration())
-                    ),
-                    None => clock(score.duration()),
-                };
-                if self.playhead.moving() && self.playhead.position() <= score.duration() {
-                    window.request_animation_frame();
-                }
-            }
+        let look = Look {
+            width: (page_width * window.scale_factor()).round() as u32,
+            // The ink the theme heads to: a theme's fade is not rasterized frame by frame.
+            ink: target_palette(cx).text.to_rgb(),
+        };
+        self.redraw(look, cx);
+        let pages = self.pages(page_width, window, cx);
+        if self.playhead.moving() && self.playhead.position() <= self.score.duration() {
+            window.request_animation_frame();
         }
-        let pending = failed.is_none() && pages.is_empty();
-        let header = PageHeader::new("score-header", self.title.clone())
-            .path(self.file.clone())
-            .below(div().ui_text().text_color(p.mute).child(status));
+        let pending = pages.is_empty();
         let skeleton = div().flex().flex_col().items_center().py(PAGE_GAP).child(
             Skeleton::new("score-skeleton")
                 .w(px(page_width))
@@ -425,94 +276,18 @@ impl Render for ScoreView {
             .gap(PAGE_GAP)
             .py(PAGE_GAP)
             .children(pages);
-        let body = match failed {
-            Some(error) => div()
-                .px(PAGE_GAP)
-                .py(PAGE_GAP)
-                .child(EmptyLine::new("score-failed", icons::MUSIC, error))
-                .into_any_element(),
-            None => awaiting("score-pages", pending, skeleton, content).into_any_element(),
-        };
         div()
+            .id("score-scroll")
             .size_full()
-            .bg(p.bg)
-            .flex()
-            .flex_col()
-            .track_focus(&self.focus)
-            .on_key_down(cx.listener(Self::on_key))
-            .child(
-                div()
-                    .flex_none()
-                    .px(space::XXL)
-                    .pt(space::XL)
-                    .pb(space::LG)
-                    .border_b_1()
-                    .border_color(p.line)
-                    .child(header),
-            )
-            .child(
-                div()
-                    .id("score-scroll")
-                    .flex_1()
-                    .min_h_0()
-                    .overflow_y_scroll()
-                    .track_scroll(&self.scroll)
-                    .child(body),
-            )
+            .overflow_y_scroll()
+            .track_scroll(&self.scroll)
+            .child(awaiting("score-pages", pending, skeleton, content))
     }
-}
-
-/// `m:ss`.
-fn clock(ms: f64) -> String {
-    let seconds = (ms / 1e3).max(0.).floor() as u64;
-    format!("{}:{:02}", seconds / 60, seconds % 60)
 }
 
 /// What `tools/capture.sh` prints of a run (`GAMME_TIMING`).
-fn timing(what: std::fmt::Arguments) {
+pub fn timing(what: std::fmt::Arguments) {
     if std::env::var_os("GAMME_TIMING").is_some() {
         eprintln!("gamme: {what}");
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    // Not `super::*`: gpui_kit's own `test` attribute would come with it.
-    use super::{Opening, Playhead, Preview, Still, clock};
-
-    fn parse(line: &str) -> Result<Opening, String> {
-        let mut words = line.split_whitespace().map(str::to_owned);
-        Opening::parse(words.next().unwrap(), words)
-    }
-
-    #[test]
-    fn a_piece_opens_at_a_position_still_or_playing() {
-        assert_eq!(
-            parse("piece.musicxml").unwrap(),
-            Opening {
-                piece: "piece.musicxml".into(),
-                at: 0.,
-                play: false
-            }
-        );
-        let playing = parse("piece.mxl --at 12.5 --play").unwrap();
-        assert_eq!((playing.at, playing.play), (12_500., true));
-        for bad in ["p --at", "p --at -1", "p --at soon", "p --loud"] {
-            assert!(parse(bad).is_err(), "{bad}");
-        }
-    }
-
-    #[test]
-    fn a_still_playhead_stays_and_a_preview_moves_on() {
-        let still = Still(1_000.);
-        assert_eq!((still.position(), still.moving()), (1_000., false));
-        let preview = Preview::new(2_000.);
-        assert!(preview.moving() && preview.position() >= 2_000.);
-    }
-
-    #[test]
-    fn the_clock_reads_minutes_and_seconds() {
-        assert_eq!(clock(0.), "0:00");
-        assert_eq!(clock(65_400.), "1:05");
     }
 }

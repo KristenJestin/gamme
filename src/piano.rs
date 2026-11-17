@@ -197,6 +197,8 @@ impl<S: Sink> Renderer<S> {
     /// Fills `left` and `right` (the same length) with the next frames of sound.
     pub fn render(&mut self, left: &mut [f32], right: &mut [f32]) {
         debug_assert_eq!(left.len(), right.len());
+        // From the first buffer on, the clock is this output's: the wall clock stops moving it.
+        self.clock.claim();
         let snapshot = self.clock.snapshot();
         if snapshot.seeks != self.seeks {
             // The position jumped: what sounded belongs to the old one.
@@ -402,6 +404,9 @@ mod tests {
             on_ms,
             off_ms,
             hand,
+            part: 0,
+            measure: 0,
+            element: None,
         }
     }
 
@@ -429,6 +434,25 @@ mod tests {
         for _ in 0..buffers {
             renderer.render(&mut l, &mut r);
         }
+    }
+
+    /// The seam with the wall clock (`wall_clock.rs`): it moves the clock until the output's
+    /// first buffer, and never after.
+    #[test]
+    fn the_first_buffer_takes_the_clock_from_the_wall_clock() {
+        let (mut renderer, clock, _) = rig(vec![]);
+        clock.play();
+        let wall = clock.snapshot();
+        assert!(clock.advance_unclaimed(&wall, 100_000));
+        assert!(!clock.claimed());
+        // A tick read before the buffer and ending after it moves nothing.
+        let late = clock.snapshot();
+        run(&mut renderer, 1, 100);
+        assert!(clock.claimed());
+        assert!(!clock.advance_unclaimed(&late, 50_000));
+        assert!(!clock.advance_unclaimed(&clock.snapshot(), 50_000));
+        // A hundred frames at 1000 a second: 100 ms of the piece, after the wall clock's 100.
+        assert_eq!(clock.snapshot().position_us, 200_000);
     }
 
     #[test]

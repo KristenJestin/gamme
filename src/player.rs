@@ -189,6 +189,9 @@ impl Player {
         // A new job: what the last one met does not apply to it.
         self.shared.progress.reset();
         self.shared.device_lost.store(false, Relaxed);
+        // An output lost or never made drives the clock no more: the wall clock does until the
+        // new one renders.
+        self.clock.release();
         let (stop, stopped) = mpsc::channel::<()>();
         self.stop = Some(stop);
         let job = Job {
@@ -384,6 +387,9 @@ mod tests {
             on_ms: 0.,
             off_ms: 500.,
             hand: Hand::Right,
+            part: 0,
+            measure: 0,
+            element: None,
         };
         Timeline::new(vec![note], vec![0., 2000.], 4000.)
     }

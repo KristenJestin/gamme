@@ -12,8 +12,8 @@ pub const ID: &str = "nocturne";
 pub const ACCENT: u32 = 0x7C5CFF;
 /// The second colour: cyan.
 pub const SECOND: u32 = 0x20B2C8;
-/// A note that was hit: pink. The kit's palette has no role for it, so it is not in `nocturne`.
-#[allow(dead_code)] // the play screen draws it
+/// A note that was hit: pink. The kit's palette has no role for it, so it is not in `nocturne`;
+/// the keyboard lights the keys the player strikes with it (`falling.rs`).
 pub const HIT: u32 = 0xFF7AB6;
 /// The light shade's page.
 pub const PAPER: u32 = 0xF6F5FB;
