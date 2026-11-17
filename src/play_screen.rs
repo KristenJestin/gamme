@@ -19,6 +19,8 @@
 //! - The end of a run (`run_end.rs`), made by the transport when the piece reaches its end, is
 //!   shown over the piece: its score, its stars, the measures most missed, and Rework. The
 //!   transport is told whether the falling notes are shown: the third star is earned without.
+//! - A run that ended is kept with the piece of the library, in its progress (`progress.rs`: the
+//!   stars, the best scores, the history), and the end says when the run beat what was kept.
 //!
 //! Keys: Space plays and pauses, `v` changes the view, Left and Right move by measure, `+`, `-`
 //! and `0` zoom the score, `h` changes the hands played, `w` waits or not, `a` and `b` set the
@@ -47,12 +49,13 @@ use crate::midi_out::{PortInfo, Ports};
 use crate::paths;
 use crate::player::{self, Player};
 use crate::practice::{Choice, Practice};
-use crate::run_end;
+use crate::progress::{Outcome, Progress, Run, Store};
+use crate::run_end::{self, Summary};
 use crate::score::Score;
 use crate::score_view::{Playhead, ScoreView, timing};
 use crate::soundfont::{self, Font};
 use crate::timeline::{PartHand, Timeline};
-use crate::transport::Transport;
+use crate::transport::{Ended, Transport};
 
 /// What the play screen shows of a piece.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -293,6 +296,8 @@ struct Ready {
     _observe: Subscription,
     /// The practice chosen, kept with the piece.
     _keep: Subscription,
+    /// The runs that end, kept with the piece.
+    _ended: Subscription,
 }
 
 enum State {
@@ -327,6 +332,11 @@ pub struct PlayScreen {
     hands_open: bool,
     /// The practice on its way to the library.
     kept: Arc<Kept>,
+    /// What was kept of the piece's runs, read with it and brought up to date as they end: what
+    /// a run is compared with (empty for a piece that is not of the library).
+    progress: Progress,
+    /// What the run that ended last did to `progress`, for its end to say.
+    outcome: Option<Outcome>,
     /// Whether a keyboard is listened to, for the wait.
     midi_in: MidiIn,
     focus: FocusHandle,
@@ -374,22 +384,26 @@ impl PlayScreen {
             .as_ref()
             .and_then(|(_, piece)| piece.hands.clone());
         let asked = opening.font;
+        let id = opening.library.as_ref().map(|(_, piece)| piece.id.clone());
         cx.spawn(async move |this, cx| {
             let started = Instant::now();
             // The kept settings and the piano's file are a read: with the piece, off the main
             // thread.
-            let (loaded, (settings, unreadable), installed) = cx
+            let (loaded, (settings, unreadable), installed, progress) = cx
                 .background_executor()
                 .spawn(async move {
                     let loaded = load(&piece, engraved, hands.as_deref());
                     let (settings, unreadable) = config::load();
                     let font = asked.unwrap_or_else(|| settings.font());
                     let installed = paths::data().is_some_and(|data| font.installed(&data));
-                    (loaded, (settings, unreadable), installed)
+                    // What the piece's runs kept: what the first run to end is compared with.
+                    let progress = id.and_then(|id| Some(Store::open()?.load(&id)));
+                    (loaded, (settings, unreadable), installed, progress)
                 })
                 .await;
             this.update(cx, |this, cx| {
                 this.settings = settings;
+                this.progress = progress.unwrap_or_default();
                 this.sound_wanted |= installed;
                 if let Some(why) = unreadable {
                     toast(
@@ -450,6 +464,8 @@ impl PlayScreen {
             marked: false,
             hands_open: false,
             kept: Arc::default(),
+            progress: Progress::default(),
+            outcome: None,
             midi_in: midi_in.clone(),
             focus,
         }
@@ -569,6 +585,9 @@ impl PlayScreen {
         let keep = cx.subscribe(&transport, |this, _, choice: &Choice, cx| {
             this.keep_practice(*choice, cx);
         });
+        let ended = cx.subscribe(&transport, |this, _, ended: &Ended, cx| {
+            this.keep_run(&ended.0, cx);
+        });
         let flashes = transport.read(cx).flashes().clone();
         let score = loaded.score.map(|score| {
             let head = Box::new(ClockHead(clock.clone()));
@@ -591,7 +610,34 @@ impl PlayScreen {
             keyboard,
             _observe: observe,
             _keep: keep,
+            _ended: ended,
         });
+    }
+
+    /// A run ended: added to the piece's progress, and kept off the main thread. What it did to
+    /// the progress (a new best) is what its end says; none for a file that is not a piece of the
+    /// library, which keeps nothing.
+    fn keep_run(&mut self, summary: &Summary, cx: &mut Context<Self>) {
+        self.outcome = None;
+        let Some((_, piece)) = &self.opening.library else {
+            return;
+        };
+        let id = piece.id.clone();
+        let at = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map_or(0, |since| since.as_secs());
+        let run = Run::of(summary, at);
+        self.outcome = Some(self.progress.add(run.clone()));
+        cx.background_executor()
+            .spawn(async move {
+                let Some(store) = Store::open() else {
+                    return;
+                };
+                if let Err(error) = store.record(&id, run) {
+                    eprintln!("gamme: the run was not kept: {error}");
+                }
+            })
+            .detach();
     }
 
     /// The hands played and the wait, kept with the piece, off the main thread: only the latest
@@ -948,7 +994,14 @@ impl Render for PlayScreen {
                 again: act(Transport::play_again),
                 close: act(Transport::close_end),
             };
-            Some(run_end::view(summary, names, shown, actions, cx))
+            Some(run_end::view(
+                summary,
+                names,
+                self.outcome.as_ref(),
+                shown,
+                actions,
+                cx,
+            ))
         });
         div()
             .id("play")

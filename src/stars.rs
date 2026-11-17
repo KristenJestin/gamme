@@ -1,5 +1,5 @@
 //! The stars a run earns (design §5.3), pure: what the end of a run shows (`run_end.rs`), and what
-//! the progress of a piece keeps (#20) from the same [`Feat`].
+//! the progress of a piece keeps (`progress.rs`) from the same [`Feat`].
 //!
 //! - **One** star at 50 % speed, **two** at 75 %, **three** at 100 % with the aid gone (the
 //!   falling notes not shown: the score alone); each needs at least [`ACCURACY`] % accuracy with

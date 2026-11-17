@@ -19,6 +19,7 @@ mod piece_file;
 mod play_screen;
 mod player;
 mod practice;
+mod progress;
 mod raster;
 mod run_end;
 mod score;

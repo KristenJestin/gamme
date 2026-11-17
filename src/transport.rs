@@ -14,7 +14,8 @@
 //! and flashed (`flash.rs`: drawn by the play screen on the notes and the keys).
 //!
 //! When a run ends at the end of the piece, its end (`run_end.rs`) is made here, for the play
-//! screen to show over the piece: what it says, its stars, its Rework. Whether the falling notes
+//! screen to show over the piece (and to keep with it: [`Ended`]): what it says, its stars, its
+//! Rework. Whether the falling notes
 //! were shown while the run played (the aid, which the third star asks to be gone) is followed
 //! here too, the play screen saying what it shows.
 
@@ -85,7 +86,12 @@ pub struct Transport {
     _refresh: Task<()>,
 }
 
+/// A run ended and its end was made: said once, for the play screen to keep it with the piece
+/// (`progress.rs`).
+pub struct Ended(pub Summary);
+
 impl EventEmitter<Choice> for Transport {}
+impl EventEmitter<Ended> for Transport {}
 
 impl Transport {
     /// `practice` is put on the player at once; `latency_ms` is the settings'; `engraved` whether
@@ -120,7 +126,7 @@ impl Transport {
                             cx.notify();
                         }
                         this.follow_aid();
-                        if this.look_for_the_end() {
+                        if this.look_for_the_end(cx) {
                             cx.notify();
                         }
                         // A keyboard plugged in or out: the wait can be had, or not.
@@ -193,7 +199,7 @@ impl Transport {
 
     /// Makes the end of a run that just ended, and shows it; hides the one shown once another
     /// run started. Whether anything changed.
-    fn look_for_the_end(&mut self) -> bool {
+    fn look_for_the_end(&mut self, cx: &mut Context<Self>) -> bool {
         let Some(judge) = &self.judge else {
             return false;
         };
@@ -218,6 +224,7 @@ impl Transport {
             self.engraved,
             &SPEEDS,
         );
+        cx.emit(Ended(summary.clone()));
         self.end = Some(End {
             summary,
             run,
