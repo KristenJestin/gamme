@@ -8,6 +8,14 @@
 //! The file is written beside and renamed over the old one, the folder `0700` and the file `0600`.
 //! Absent, or a key missing: the defaults (the small piano, no MIDI out, every input port, a light
 //! touch, no latency).
+//!
+//! What this version does not understand is not lost by saving:
+//! - a key it does not know (written by a newer Gamme, or by hand) is kept as it is, in
+//!   [`Settings::extra`];
+//! - a `touch` or a `latency_ms` it cannot read is the default for what Gamme does, but its value
+//!   in the file is written back as it was until the player changes that setting;
+//! - a file it cannot read at all (not JSON, or a `piano`, `midi_out` or `midi_in` of the wrong
+//!   type) is put aside as `settings.json.unreadable` before the first save replaces it.
 
 use std::io::Write as _;
 use std::os::unix::fs::{DirBuilderExt as _, OpenOptionsExt as _, PermissionsExt as _};
@@ -15,6 +23,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use serde::{Deserialize, Serialize};
+use serde_json::{Map, Value};
 
 use crate::latency;
 use crate::midi_out::{MidiOut, Ports};
@@ -30,8 +39,9 @@ pub struct Settings {
     /// The SoundFont the built-in piano plays, by its `Font::id`: the small upright (the
     /// default) or the concert grand.
     pub piano: String,
-    /// The MIDI output the piece sounds on, by the port's name (`midi_out::key`), instead of the
-    /// built-in piano. None: the built-in piano.
+    /// The MIDI output the piece sounds on, by the port's key (`midi_out::keys`: its name, and
+    /// "Name (2)"... for identical devices), instead of the built-in piano. None: the built-in
+    /// piano.
     pub midi_out: Option<String>,
     /// The only MIDI input port the player's keys are read from (`midi_in.rs`). None: every port,
     /// as it appears.
@@ -44,6 +54,13 @@ pub struct Settings {
     /// ±[`latency::LIMIT_MS`], it is 0.
     #[serde(default, deserialize_with = "latency_or_none")]
     pub latency_ms: i32,
+    /// The keys of the file this version does not know, as they were read: they are written
+    /// back unchanged, so that an older Gamme does not undo what a newer one kept.
+    #[serde(flatten)]
+    pub extra: Map<String, Value>,
+    /// The values this version could not read (see [`Unread`]), to be written back.
+    #[serde(skip)]
+    unread: Vec<Unread>,
 }
 
 impl Default for Settings {
@@ -54,8 +71,23 @@ impl Default for Settings {
             midi_in: None,
             touch: Touch::default(),
             latency_ms: 0,
+            extra: Map::new(),
+            unread: Vec::new(),
         }
     }
+}
+
+/// The keys read as a default when their value cannot be read.
+const TOLERANT: [&str; 2] = ["touch", "latency_ms"];
+
+/// A value in the file that was read as something else: `raw` as the file had it, `read_as` what
+/// it came to. The file keeps `raw` for as long as the setting is still `read_as`: the player
+/// changing it is what replaces it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct Unread {
+    key: &'static str,
+    raw: Value,
+    read_as: Value,
 }
 
 /// A latency this version cannot take (a text, a value out of range, a file edited by hand) is
@@ -69,6 +101,31 @@ fn latency_or_none<'de, D: serde::Deserializer<'de>>(read: D) -> Result<i32, D::
 }
 
 impl Settings {
+    /// What `key` holds now, as it is written in the file.
+    fn written(&self, key: &str) -> Option<Value> {
+        match key {
+            "touch" => Some(Value::from(self.touch.id())),
+            "latency_ms" => Some(Value::from(self.latency_ms)),
+            _ => None,
+        }
+    }
+
+    /// Notes the values of `file` (the whole file as read) that were read as something else.
+    fn note_unread(&mut self, file: &Value) {
+        for key in TOLERANT {
+            let (Some(raw), Some(read_as)) = (file.get(key), self.written(key)) else {
+                continue;
+            };
+            if *raw != read_as {
+                self.unread.push(Unread {
+                    key,
+                    raw: raw.clone(),
+                    read_as,
+                });
+            }
+        }
+    }
+
     /// The SoundFont chosen; one this version does not know (a file edited by hand, or written by
     /// another version) is the default.
     pub fn font(&self) -> Font {
@@ -106,7 +163,11 @@ pub fn read(config: &Path) -> Result<Settings, String> {
         }
         Err(error) => return Err(format!("settings.json: {error}")),
     };
-    serde_json::from_slice(&bytes).map_err(|error| format!("settings.json: {error}"))
+    let why = |error: serde_json::Error| format!("settings.json: {error}");
+    let file: Value = serde_json::from_slice(&bytes).map_err(why)?;
+    let mut settings: Settings = serde_json::from_value(file.clone()).map_err(why)?;
+    settings.note_unread(&file);
+    Ok(settings)
 }
 
 /// The settings kept, for a start: the defaults when none are kept, or when they cannot be read,
@@ -125,13 +186,32 @@ pub fn load() -> (Settings, Option<String>) {
     }
 }
 
-/// Keeps `settings`.
+/// Keeps `settings`: what it was read with that this version does not know is written back too
+/// (see the module's notes).
 pub fn save(config: &Path, settings: &Settings) -> std::io::Result<()> {
-    write_private(
-        config,
-        "settings.json",
-        &serde_json::to_vec_pretty(settings)?,
-    )
+    let mut file = serde_json::to_value(settings)?;
+    if let Value::Object(keys) = &mut file {
+        for unread in &settings.unread {
+            // Not changed since it was read: the file's own value stays.
+            if keys.get(unread.key) == Some(&unread.read_as) {
+                keys.insert(unread.key.to_owned(), unread.raw.clone());
+            }
+        }
+    }
+    put_aside_if_unreadable(config);
+    write_private(config, "settings.json", &serde_json::to_vec_pretty(&file)?)
+}
+
+/// A file that is there and cannot be read as settings is about to be replaced by what the page
+/// shows (the defaults): its content is kept beside it first, for the player to get back.
+fn put_aside_if_unreadable(config: &Path) {
+    let Ok(bytes) = std::fs::read(file(config)) else {
+        return;
+    };
+    if serde_json::from_slice::<Settings>(&bytes).is_err() {
+        // Best effort: the save goes on whether or not it worked.
+        let _ = write_private(config, "settings.json.unreadable", &bytes);
+    }
 }
 
 /// Writes `name` in `folder` (made `0700` if it is new) as `0600`, beside and then renamed over
@@ -211,6 +291,7 @@ mod tests {
             midi_in: Some("Keystation 49".into()),
             touch: Touch::Normal,
             latency_ms: 35,
+            ..Settings::default()
         };
         save(&config.0, &kept).unwrap();
         // The touch changes, the rest of what was kept does not.
@@ -288,6 +369,7 @@ mod tests {
             midi_in: Some("Keystation 49".into()),
             touch: Touch::Heavy,
             latency_ms: -20,
+            ..Settings::default()
         };
         save(&config.0, &chosen).unwrap();
         assert_eq!(read(&config.0).unwrap(), chosen);
@@ -350,11 +432,120 @@ mod tests {
         let unknown = read(&config.0).unwrap();
         assert_eq!(unknown.piano, "giant");
         assert_eq!(unknown.font().id, soundfont::SMALL_PIANO.id);
-        for text in ["not json", r#"{"midi_out":3}"#, r#"{"piano":null}"#] {
+        for text in [
+            "not json",
+            r#"{"midi_out":3}"#,
+            r#"{"piano":null}"#,
+            "[1]",
+            "\"text\"",
+        ] {
             std::fs::write(file(&config.0), text).unwrap();
             let why = read(&config.0).unwrap_err();
             assert!(why.starts_with("settings.json: "), "{text}: {why}");
         }
+    }
+
+    /// The file as a JSON value.
+    fn kept_file(config: &Path) -> Value {
+        serde_json::from_slice(&std::fs::read(file(config)).unwrap()).unwrap()
+    }
+
+    #[test]
+    fn keys_this_version_does_not_know_are_kept_through_a_change() {
+        let config = Temp::new("extra");
+        std::fs::create_dir_all(&config.0).unwrap();
+        std::fs::write(
+            file(&config.0),
+            r#"{"piano":"grand","metronome":{"on":true,"bpm":[60,72]},"theme":"dusk","gain":0.5,"later":null}"#,
+        )
+        .unwrap();
+        let mut settings = read(&config.0).unwrap();
+        assert_eq!(settings.piano, "grand");
+        assert_eq!(settings.extra.len(), 4);
+        // A change made in the page, and kept.
+        settings.touch = Touch::Heavy;
+        settings.midi_in = Some("Keystation 49".into());
+        save(&config.0, &settings).unwrap();
+        let after = kept_file(&config.0);
+        assert_eq!(
+            after["metronome"],
+            serde_json::json!({"on": true, "bpm": [60, 72]})
+        );
+        assert_eq!(after["theme"], "dusk");
+        assert_eq!(after["gain"], 0.5);
+        assert!(after["later"].is_null() && after.get("later").is_some());
+        assert_eq!(after["touch"], "heavy");
+        assert_eq!(after["midi_in"], "Keystation 49");
+        // And they are read again, and kept again.
+        let again = read(&config.0).unwrap();
+        assert_eq!(again, settings);
+        save(&config.0, &again).unwrap();
+        assert_eq!(kept_file(&config.0), after);
+        // The defaults have none.
+        assert!(Settings::default().extra.is_empty());
+    }
+
+    #[test]
+    fn a_touch_or_latency_that_cannot_be_read_is_written_back_until_it_is_changed() {
+        let config = Temp::new("unread");
+        std::fs::create_dir_all(&config.0).unwrap();
+        std::fs::write(
+            file(&config.0),
+            r#"{"piano":"grand","touch":"firm","latency_ms":"fast"}"#,
+        )
+        .unwrap();
+        let mut settings = read(&config.0).unwrap();
+        assert_eq!(settings.touch, Touch::Light);
+        assert_eq!(settings.latency_ms, 0);
+        // Something else is changed: the two values are as the file had them.
+        settings.piano = "upright".into();
+        save(&config.0, &settings).unwrap();
+        let after = kept_file(&config.0);
+        assert_eq!(after["piano"], "upright");
+        assert_eq!(after["touch"], "firm");
+        assert_eq!(after["latency_ms"], "fast");
+        // The touch is chosen: it is the file's no more, the latency's is still.
+        settings.touch = Touch::Normal;
+        save(&config.0, &settings).unwrap();
+        let after = kept_file(&config.0);
+        assert_eq!(after["touch"], "normal");
+        assert_eq!(after["latency_ms"], "fast");
+        // A calibration measures it: the same.
+        settings.latency_ms = 31;
+        save(&config.0, &settings).unwrap();
+        assert_eq!(kept_file(&config.0)["latency_ms"], 31);
+        // Read again, nothing is left to write back.
+        assert!(read(&config.0).unwrap().unread.is_empty());
+        // A value that is read as it is, is not held back.
+        std::fs::write(file(&config.0), r#"{"touch":"heavy","latency_ms":-17}"#).unwrap();
+        assert!(read(&config.0).unwrap().unread.is_empty());
+    }
+
+    #[test]
+    fn a_file_that_cannot_be_read_is_put_aside_before_the_page_replaces_it() {
+        let config = Temp::new("aside");
+        std::fs::create_dir_all(&config.0).unwrap();
+        for text in ["{ not json", r#"{"midi_out":3,"future":1}"#] {
+            std::fs::write(file(&config.0), text).unwrap();
+            assert!(read(&config.0).is_err());
+            // The page shows the defaults and saves a choice over the file.
+            save(&config.0, &Settings::default()).unwrap();
+            let aside = config.0.join("settings.json.unreadable");
+            assert_eq!(std::fs::read_to_string(&aside).unwrap(), text);
+            assert_eq!(mode(&aside), 0o600);
+            assert_eq!(read(&config.0).unwrap(), Settings::default());
+            // What is readable is not put aside, so the copy is not replaced by the defaults.
+            save(&config.0, &Settings::default()).unwrap();
+            assert_eq!(std::fs::read_to_string(&aside).unwrap(), text);
+            std::fs::remove_file(&aside).unwrap();
+        }
+        // A file that is fine, or none, leaves nothing beside it.
+        save(&config.0, &Settings::default()).unwrap();
+        let names: Vec<_> = std::fs::read_dir(&config.0)
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name())
+            .collect();
+        assert_eq!(names, ["settings.json"]);
     }
 
     #[test]
@@ -371,6 +562,7 @@ mod tests {
             midi_in: None,
             touch: Touch::Fixed,
             latency_ms: 0,
+            ..Settings::default()
         };
         let (midi, font) = chosen.audio(ports);
         assert_eq!(midi.label().unwrap(), "MIDI output “Digital Piano”");

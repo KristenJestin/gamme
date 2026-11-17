@@ -215,6 +215,11 @@ The choices apply at once and are kept in `$XDG_CONFIG_HOME/gamme/settings.json`
 the folder `0700`, the file `0600`, written atomically), except the colours, which stay in the state
 folder. `gamme play` uses them too.
 
+Saving never loses what this version does not understand: a key it does not know (one a newer
+Gamme wrote) is written back as it was, a `touch` or `latency_ms` it cannot read stays as the file
+had it until you change that setting, and a file it cannot read at all (broken JSON, a port of the
+wrong type) is kept as `settings.json.unreadable` before a choice replaces it with the defaults.
+
 ## Brand
 
 **The mark is a pixel note**, an 8-bit eighth note on a grid of 7 by 8 cells, crisp down to 16
