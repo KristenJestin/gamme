@@ -89,11 +89,19 @@ impl Playing {
     }
 }
 
-/// The hands and the wait, as a piece keeps them.
+/// The hands and the wait, as a piece keeps them. What is missing is its default, and what is
+/// not known (a later Gamme's) is listening: a piece is never lost for its practice.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Choice {
+    #[serde(default, deserialize_with = "playing_or_listen")]
     pub playing: Playing,
+    #[serde(default)]
     pub wait: bool,
+}
+
+fn playing_or_listen<'de, D: serde::Deserializer<'de>>(read: D) -> Result<Playing, D::Error> {
+    let value = serde_json::Value::deserialize(read)?;
+    Ok(Playing::deserialize(value).unwrap_or_default())
 }
 
 impl Choice {
@@ -846,6 +854,33 @@ mod tests {
         // Carried to the next player, the keyboard is still known.
         practice.choice.playing = Playing::Left;
         assert_eq!(practice.carried(Arc::default()).wait_now(), Wait::Left);
+    }
+
+    #[test]
+    fn a_choice_kept_with_missing_or_unknown_words_reads_as_its_defaults() {
+        let read = |json: &str| serde_json::from_str::<Choice>(json).unwrap();
+        assert_eq!(read("{}"), Choice::default());
+        assert_eq!(
+            read(r#"{"playing": "left"}"#),
+            Choice {
+                playing: Playing::Left,
+                wait: false,
+            }
+        );
+        assert_eq!(
+            read(r#"{"playing": "feet", "wait": true}"#),
+            Choice {
+                playing: Playing::Listen,
+                wait: true,
+            }
+        );
+        assert_eq!(read(r#"{"playing": 3}"#).playing, Playing::Listen);
+        let kept = serde_json::to_string(&Choice {
+            playing: Playing::Both,
+            wait: true,
+        })
+        .unwrap();
+        assert_eq!(kept, r#"{"playing":"both","wait":true}"#);
     }
 
     #[test]
