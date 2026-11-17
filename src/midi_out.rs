@@ -32,6 +32,7 @@
 //! no real port. [`Ports`] connects the input ports too, for MIDI in.
 
 use std::any::Any;
+use std::collections::{HashMap, HashSet};
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering::Relaxed};
 use std::sync::mpsc::{self, RecvTimeoutError, Sender};
@@ -69,15 +70,9 @@ pub struct PortInfo {
     pub name: String,
 }
 
-impl PortInfo {
-    /// What is kept of it in the settings: its name without the numbers ALSA changes.
-    pub fn key(&self) -> String {
-        key(&self.name)
-    }
-}
-
 /// A port's name as the settings keep it: ALSA ends the names with the "client:port" numbers
-/// ("Digital Piano MIDI 1 20:0"), which are not the same at the next start.
+/// ("Digital Piano MIDI 1 20:0"), which are not the same at the next start. Two identical
+/// devices have the same one: [`keys`] tells them apart.
 pub fn key(name: &str) -> String {
     let numbers = |text: &str| !text.is_empty() && text.bytes().all(|b| b.is_ascii_digit());
     match name.rsplit_once(' ') {
@@ -92,13 +87,60 @@ pub fn key(name: &str) -> String {
     }
 }
 
-/// The port a saved name stands for: the same name, or the same name past the numbers.
+/// A port's "client:port" numbers, to put the ports in ALSA's order; a port whose id is not of
+/// that form comes last (the sort is stable: the list's own order keeps it).
+fn address(id: &str) -> (u32, u32) {
+    let (client, port) = id.split_once(':').unwrap_or((id, ""));
+    (
+        client.parse().unwrap_or(u32::MAX),
+        port.parse().unwrap_or(u32::MAX),
+    )
+}
+
+/// What each of `ports` is kept as in the settings, in the same order: its name past the
+/// numbers ([`key`]), and, when several ports have the same one (two identical keyboards), the
+/// first by ALSA's client and port numbers keeps it as it is and the next ones are "Name (2)",
+/// "Name (3)"... A plain name saved before there were suffixes therefore still selects the first.
+///
+/// What this holds steady: the same devices plugged in the same order get the same keys at each
+/// start, however ALSA's numbers move, since the ordinal follows their order and not the numbers
+/// themselves. What it cannot: ALSA gives a device nothing of its own to tell it by, so when the
+/// first of two identical devices is unplugged, the second is the first of those listed and takes
+/// its key.
+pub fn keys(ports: &[PortInfo]) -> Vec<String> {
+    let plain: Vec<String> = ports.iter().map(|port| key(&port.name)).collect();
+    let mut order: Vec<usize> = (0..ports.len()).collect();
+    order.sort_by_key(|&at| address(&ports[at].id));
+    // A suffixed key never takes the place of a port's own name (a device that is called
+    // "Piano (2)" already).
+    let mut taken: HashSet<String> = plain.iter().cloned().collect();
+    let mut last: HashMap<&str, u32> = HashMap::new();
+    let mut keys = plain.clone();
+    for at in order {
+        let name = plain[at].as_str();
+        match last.get_mut(name) {
+            None => {
+                last.insert(name, 1);
+            }
+            Some(ordinal) => loop {
+                *ordinal += 1;
+                let suffixed = format!("{name} ({ordinal})");
+                if taken.insert(suffixed.clone()) {
+                    keys[at] = suffixed;
+                    break;
+                }
+            },
+        }
+    }
+    keys
+}
+
+/// The port a saved key stands for (see [`keys`]); a name with ALSA's numbers still on it, as an
+/// older version kept it, stands for the first of that name.
 pub fn find<'a>(ports: &'a [PortInfo], saved: &str) -> Option<&'a PortInfo> {
     let saved = key(saved);
-    ports
-        .iter()
-        .find(|port| port.name == saved)
-        .or_else(|| ports.iter().find(|port| port.key() == saved))
+    let at = keys(ports).iter().position(|key| *key == saved)?;
+    Some(&ports[at])
 }
 
 /// The client of a port, from its id ("20:0"): the device it belongs to.
@@ -781,6 +823,8 @@ pub mod testing {
         /// Whether the wires refuse what they are sent, as a port that went does.
         broken: Arc<AtomicBool>,
         connections: Mutex<u32>,
+        /// The id of each output connected to, in order.
+        connected: Mutex<Vec<String>>,
         /// Whether the system cannot be asked which ports are there.
         unknown: AtomicBool,
     }
@@ -805,6 +849,7 @@ pub mod testing {
                 sent: Arc::default(),
                 broken: Arc::default(),
                 connections: Mutex::new(0),
+                connected: Mutex::new(Vec::new()),
                 unknown: AtomicBool::new(false),
             }
         }
@@ -855,6 +900,16 @@ pub mod testing {
                 .collect()
         }
 
+        /// The ids of the inputs listened to now.
+        pub fn listened_ids(&self) -> Vec<String> {
+            let mut listening = self.listening.lock().unwrap();
+            listening.retain(|input| input.open.load(Relaxed));
+            listening
+                .iter()
+                .map(|input| input.port.id.clone())
+                .collect()
+        }
+
         /// The input port named so sends `message`, if it is listened to; whether it was.
         pub fn send_from(&self, name: &str, message: &[u8]) -> bool {
             let mut listening = self.listening.lock().unwrap();
@@ -864,6 +919,23 @@ pub mod testing {
             };
             (input.on_message)(message);
             true
+        }
+
+        /// As [`FakePorts::send_from`], for the input port with this id: identical devices share
+        /// a name.
+        pub fn send_from_id(&self, id: &str, message: &[u8]) -> bool {
+            let mut listening = self.listening.lock().unwrap();
+            listening.retain(|input| input.open.load(Relaxed));
+            let Some(input) = listening.iter_mut().find(|input| input.port.id == id) else {
+                return false;
+            };
+            (input.on_message)(message);
+            true
+        }
+
+        /// The id of each output connected to so far, in order.
+        pub fn connected(&self) -> Vec<String> {
+            self.connected.lock().unwrap().clone()
         }
 
         /// What was sent to the wires so far.
@@ -950,8 +1022,9 @@ pub mod testing {
             Some(self.outputs().contains(port))
         }
 
-        fn connect_output(&self, _: &PortInfo) -> Result<Box<dyn Wire>, String> {
+        fn connect_output(&self, port: &PortInfo) -> Result<Box<dyn Wire>, String> {
             *self.connections.lock().unwrap() += 1;
+            self.connected.lock().unwrap().push(port.id.clone());
             Ok(Box::new(FakeWire {
                 sent: self.sent.clone(),
                 broken: self.broken.clone(),
@@ -1077,6 +1150,113 @@ mod tests {
             "24:0"
         );
         assert!(find(&ports, "Other piano").is_none());
+    }
+
+    fn port(id: &str, name: &str) -> PortInfo {
+        PortInfo {
+            id: id.into(),
+            name: name.into(),
+        }
+    }
+
+    /// Two identical keyboards and a third that is not, as ALSA lists them.
+    fn twins() -> Vec<PortInfo> {
+        vec![
+            port("14:0", "Midi Through 14:0"),
+            port("24:0", "Twin Keys MIDI 1 24:0"),
+            port("32:0", "Twin Keys MIDI 1 32:0"),
+        ]
+    }
+
+    #[test]
+    fn identical_devices_are_told_apart_by_their_order() {
+        let ports = twins();
+        assert_eq!(
+            keys(&ports),
+            ["Midi Through", "Twin Keys MIDI 1", "Twin Keys MIDI 1 (2)"]
+        );
+        // Each can be found by its key, and a plain name selects the first, as it always did.
+        assert_eq!(find(&ports, "Twin Keys MIDI 1").unwrap().id, "24:0");
+        assert_eq!(find(&ports, "Twin Keys MIDI 1 (2)").unwrap().id, "32:0");
+        assert_eq!(find(&ports, "Twin Keys MIDI 1 99:0").unwrap().id, "24:0");
+        assert!(find(&ports, "Twin Keys MIDI 1 (3)").is_none());
+        // A key that was not suffixed (a single device) is not changed by the others.
+        assert_eq!(find(&ports, "Midi Through").unwrap().id, "14:0");
+    }
+
+    #[test]
+    fn the_keys_follow_alsas_order_not_the_lists_nor_the_numbers() {
+        // Listed the other way round, and at other numbers (100 sorts after 9 as a number, not as
+        // text): the first by number is still the first.
+        let ports = [
+            port("100:0", "Twin Keys MIDI 1 100:0"),
+            port("9:0", "Twin Keys MIDI 1 9:0"),
+            port("100:1", "Twin Keys MIDI 1 100:1"),
+        ];
+        assert_eq!(
+            keys(&ports),
+            [
+                "Twin Keys MIDI 1 (2)",
+                "Twin Keys MIDI 1",
+                "Twin Keys MIDI 1 (3)"
+            ]
+        );
+        // The same devices after a restart, at other numbers but in the same order.
+        let again = [
+            port("20:0", "Twin Keys MIDI 1 20:0"),
+            port("21:0", "Twin Keys MIDI 1 21:0"),
+            port("22:0", "Twin Keys MIDI 1 22:0"),
+        ];
+        assert_eq!(
+            keys(&again),
+            [
+                "Twin Keys MIDI 1",
+                "Twin Keys MIDI 1 (2)",
+                "Twin Keys MIDI 1 (3)"
+            ]
+        );
+    }
+
+    #[test]
+    fn a_key_made_is_never_one_a_port_has_already() {
+        let ports = [
+            port("20:0", "Piano 20:0"),
+            port("21:0", "Piano 21:0"),
+            port("22:0", "Piano (2) 22:0"),
+        ];
+        let keys = keys(&ports);
+        assert_eq!(keys[0], "Piano");
+        assert_eq!(keys[2], "Piano (2)");
+        assert_eq!(keys[1], "Piano (3)");
+    }
+
+    #[test]
+    fn the_second_twin_alone_takes_the_first_ones_key() {
+        // ALSA has nothing of its own to tell them by: the one left is the first of its name.
+        let ports = [port("32:0", "Twin Keys MIDI 1 32:0")];
+        assert_eq!(keys(&ports), ["Twin Keys MIDI 1"]);
+        assert!(find(&ports, "Twin Keys MIDI 1 (2)").is_none());
+    }
+
+    #[test]
+    fn an_output_chosen_among_identical_devices_is_the_one_connected_to() {
+        let ports = Arc::new(FakePorts::new(
+            &["Twin Keys MIDI 1 20:0", "Twin Keys MIDI 1 21:0"],
+            &[],
+        ));
+        let second = open_with(ports.clone(), "Twin Keys MIDI 1 (2)", Hands::both())
+            .ok()
+            .unwrap();
+        assert_eq!(
+            second.midi.label().unwrap(),
+            "MIDI output “Twin Keys MIDI 1 (2)”"
+        );
+        assert_eq!(second.ports.connected(), ["21:0"]);
+        drop(second);
+        let first = open_with(ports.clone(), "Twin Keys MIDI 1", Hands::both())
+            .ok()
+            .unwrap();
+        assert_eq!(first.ports.connected(), ["21:0", "20:0"]);
     }
 
     #[test]

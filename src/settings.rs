@@ -49,14 +49,15 @@ struct Choice {
     chosen: usize,
 }
 
-/// The ports as a select offers them: `none` first, then each port by its name, then the port
-/// saved when it is not among them (a piano that is unplugged is still the choice).
+/// The ports as a select offers them: `none` first, then each port by its key (identical devices
+/// are told apart, `midi_out::keys`), then the port saved when it is not among them (a piano that
+/// is unplugged is still the choice).
 fn port_choice(ports: &[PortInfo], saved: Option<&str>, none: &str) -> Choice {
     let mut values = vec![None];
     let mut titles = vec![none.to_owned()];
-    for port in ports {
-        values.push(Some(port.key()));
-        titles.push(port.key());
+    for key in midi_out::keys(ports) {
+        titles.push(key.clone());
+        values.push(Some(key));
     }
     let mut chosen = 0;
     if let Some(saved) = saved {
@@ -717,6 +718,37 @@ mod tests {
                 Some("Digital Piano MIDI 1".to_owned())
             ]
         );
+    }
+
+    #[test]
+    fn identical_devices_are_two_options_each_chosen_by_its_own_key() {
+        let twins = [
+            port("24:0", "Twin Keys MIDI 1 24:0"),
+            port("32:0", "Twin Keys MIDI 1 32:0"),
+        ];
+        let choice = port_choice(&twins, None, "Every port");
+        assert_eq!(
+            choice.titles,
+            ["Every port", "Twin Keys MIDI 1", "Twin Keys MIDI 1 (2)"]
+        );
+        assert_eq!(
+            choice.values[1..],
+            [
+                Some("Twin Keys MIDI 1".to_owned()),
+                Some("Twin Keys MIDI 1 (2)".to_owned())
+            ]
+        );
+        // What was kept is chosen again: the second one is not mistaken for the first.
+        let second = port_choice(&twins, Some("Twin Keys MIDI 1 (2)"), "Every port");
+        assert_eq!(second.chosen, 2);
+        assert_eq!(second.values.len(), 3);
+        // An older file's plain name is the first.
+        let first = port_choice(&twins, Some("Twin Keys MIDI 1"), "Every port");
+        assert_eq!(first.chosen, 1);
+        // One of them alone: the second is not connected, and says so.
+        let alone = port_choice(&twins[1..], Some("Twin Keys MIDI 1 (2)"), "Every port");
+        assert_eq!(alone.titles[2], "Twin Keys MIDI 1 (2) (not connected)");
+        assert_eq!(alone.chosen, 2);
     }
 
     #[test]

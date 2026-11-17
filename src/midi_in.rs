@@ -12,6 +12,10 @@
 //! connected to is not tried again until it is unplugged or the choice changes: trying each
 //! second would make a client each second.
 //!
+//! Identical keyboards (the same name past ALSA's numbers) are each listened to, and the one
+//! chosen is kept as `midi_out::keys` names it: the first by ALSA's numbers by its plain name, the
+//! next ones "Name (2)"...
+//!
 //! The sustain pedal (controller 64) is handed on too, as a [`Pedal`] of its own: down while it
 //! is down on any keyboard.
 //!
@@ -724,6 +728,51 @@ mod tests {
         // The settings keep the name past ALSA's numbers; a port is found by it.
         midi.choose(Some("Digital Piano:Digital Piano MIDI 1".into()));
         listening(&midi, &["Digital Piano:Digital Piano MIDI 1 24:0"]);
+    }
+
+    /// The ids of the inputs listened to, in order of id.
+    fn listening_ids(ports: &FakePorts, ids: &[&str]) {
+        until(&format!("listening to {ids:?}"), || {
+            let mut listened = ports.listened_ids();
+            listened.sort();
+            listened == ids
+        });
+    }
+
+    #[test]
+    fn identical_keyboards_are_each_listened_to_and_the_choice_picks_one_of_them() {
+        let first = "Twin Keys:Twin Keys MIDI 1 40:0";
+        let second = "Twin Keys:Twin Keys MIDI 1 44:0";
+        let ports = Arc::new(FakePorts::new(&[], &[]));
+        ports.plug_input(first, "40:0");
+        ports.plug_input(second, "44:0");
+        let midi = start(&ports, None);
+        let keys = Arc::new(Recorder::default());
+        let _attached = midi.attach(keys.clone());
+        listening_ids(&ports, &["40:0", "44:0"]);
+        // Each one's keys are its own.
+        assert!(ports.send_from_id("44:0", &[0x90, 60, 100]));
+        assert_eq!(keys.0.lock().unwrap()[0].1, second);
+
+        // The second is chosen by its key, the first by the plain name an older file kept.
+        midi.choose(Some("Twin Keys:Twin Keys MIDI 1 (2)".into()));
+        listening_ids(&ports, &["44:0"]);
+        midi.choose(Some("Twin Keys:Twin Keys MIDI 1".into()));
+        listening_ids(&ports, &["40:0"]);
+        midi.choose(Some("Twin Keys:Twin Keys MIDI 1 (2)".into()));
+        listening_ids(&ports, &["44:0"]);
+
+        // Unplugged and plugged back at another number, it is still the second.
+        ports.unplug_input(second);
+        listening_ids(&ports, &[]);
+        ports.plug_input("Twin Keys:Twin Keys MIDI 1 52:0", "52:0");
+        listening_ids(&ports, &["52:0"]);
+
+        // A start with the choice kept listens to the same one.
+        drop(midi);
+        let restarted = start(&ports, Some("Twin Keys:Twin Keys MIDI 1 (2)"));
+        listening_ids(&ports, &["52:0"]);
+        drop(restarted);
     }
 
     #[test]
