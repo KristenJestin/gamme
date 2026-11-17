@@ -1,7 +1,13 @@
 //! The settings page: MIDI (the output the piece sounds on, the input the keys come from), sound
-//! (which piano the built-in one plays, and the touch of your keys on it) and colours (Omarchy's or Gamme's), from the kit's
+//! (which piano the built-in one plays, and the touch of your keys on it), the latency of your keys
+//! and colours (Omarchy's or Gamme's), from the kit's
 //! components. Opened from the home screen's header (`screens.rs`), which it replaces until "Back"
 //! (or Escape).
+//!
+//! The latency is measured by playing along (`latency.rs`): "Calibrate" plays clicks on the output
+//! a piece plays on (a player of their own, the built-in piano made ready first if it must be),
+//! the keys of MIDI in come here meanwhile, each placed on the clicks' clock as it arrives, and at
+//! the last click what was measured is kept, or nothing when too few keys came.
 //!
 //! A choice is used and kept at once, in `$XDG_CONFIG_HOME/gamme/settings.json` (`config.rs`)
 //! and, for the colours, in the state folder (`appearance.rs`). Listing the MIDI ports talks to the
@@ -10,6 +16,7 @@
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use gpui_design_system::{
     Button, Field, Icon, PageHeader, Section, Select, SelectOption, Toast, Type as _, palette,
@@ -17,11 +24,16 @@ use gpui_design_system::{
 };
 use gpui_kit::*;
 
+use crate::clock::Clock;
 use crate::config::{self, Settings};
-use crate::midi_in::MidiIn;
+use crate::midi_in::{self, Attached, MidiIn, Pedal, Played};
 use crate::midi_out::{self, PortInfo, Ports};
+use crate::player::{Player, Sound};
 use crate::touch::Touch;
-use crate::{appearance, paths, soundfont};
+use crate::{appearance, latency, paths, soundfont};
+
+/// How often a calibration is looked at while its clicks play.
+const WATCH_EVERY: Duration = Duration::from_millis(33);
 
 /// Saves are numbered as they are asked for, so that one that comes late cannot be written
 /// over a newer one.
@@ -71,6 +83,44 @@ fn mib(bytes: u64) -> String {
 /// The way back is asked: the window shows the home screen again.
 pub struct Back;
 
+/// The keys struck during a calibration, on MIDI's threads: each placed on the clicks' clock as
+/// it arrived, once the clicks play. They are not sounded: the clicks are what is heard.
+struct Strikes {
+    clock: Clock,
+    struck: Arc<Mutex<Vec<f64>>>,
+}
+
+impl midi_in::Keys for Strikes {
+    fn played(&self, played: Played, _: &PortInfo) {
+        if played.velocity > 0 && self.clock.playing() {
+            let (_, ms) = self.clock.position_at(played.at);
+            self.struck.lock().expect("the strikes' lock").push(ms);
+        }
+    }
+
+    fn pedal(&self, _: Pedal, _: &PortInfo) {}
+}
+
+/// A calibration of the latency, while its clicks play.
+struct Calibration {
+    /// Told apart from one stopped and started again.
+    turn: u64,
+    /// The clicks, on the output the settings choose.
+    player: Player,
+    struck: Arc<Mutex<Vec<f64>>>,
+    /// The keys come to `struck` while it is there.
+    _attached: Attached,
+}
+
+/// What the latency's row says of a value: "+32 ms", "0 ms".
+fn latency_text(ms: i32) -> String {
+    if ms > 0 {
+        format!("+{ms} ms")
+    } else {
+        format!("{ms} ms")
+    }
+}
+
 pub struct SettingsPage {
     focus: FocusHandle,
     ports: Arc<dyn Ports>,
@@ -88,6 +138,10 @@ pub struct SettingsPage {
     listed: bool,
     /// Which pianos are downloaded already, as `soundfont::FONTS` lists them.
     downloaded: Vec<bool>,
+    calibration: Option<Calibration>,
+    calibrations: u64,
+    /// What the last calibration came to.
+    calibrated: Option<String>,
 }
 
 impl EventEmitter<Back> for SettingsPage {}
@@ -115,6 +169,9 @@ impl SettingsPage {
             looking: false,
             listed: false,
             downloaded: Vec::new(),
+            calibration: None,
+            calibrations: 0,
+            calibrated: None,
         };
         page.read_kept(cx);
         page.look(cx);
@@ -219,6 +276,152 @@ impl SettingsPage {
         if self.read && self.settings.touch != touch {
             self.settings.touch = touch;
             self.keep(cx);
+        }
+    }
+
+    /// Starts a calibration of the latency, or stops the one playing (nothing is kept then).
+    fn calibrate(&mut self, cx: &mut Context<Self>) {
+        cx.notify();
+        if self.calibration.take().is_some() {
+            self.calibrated = Some("Stopped: the latency is as it was.".into());
+            return;
+        }
+        if !self.read {
+            return;
+        }
+        let Some(data) = paths::data() else {
+            toast(
+                Toast::failure("Nowhere to keep the piano")
+                    .detail("Gamme found no home folder to keep its piano in."),
+                cx,
+            );
+            return;
+        };
+        let (audio, font) = self.settings.audio(self.ports.clone());
+        let mut player = Player::new(
+            latency::timeline(),
+            data,
+            font,
+            Arc::new(soundfont::Curl::new()),
+            audio,
+        );
+        let struck = Arc::new(Mutex::new(Vec::new()));
+        let attached = self.midi_in.attach(Arc::new(Strikes {
+            clock: player.clock.clone(),
+            struck: struck.clone(),
+        }));
+        // The clock starts once the output is ready.
+        player.play();
+        self.calibrations += 1;
+        let turn = self.calibrations;
+        self.calibration = Some(Calibration {
+            turn,
+            player,
+            struck,
+            _attached: attached,
+        });
+        self.calibrated = None;
+        cx.spawn(async move |this, cx| {
+            loop {
+                cx.background_executor().timer(WATCH_EVERY).await;
+                let going = this.update(cx, |this, cx| this.watch(turn, cx));
+                if !going.unwrap_or(false) {
+                    break;
+                }
+            }
+        })
+        .detach();
+    }
+
+    /// Looks at calibration `turn`: false once it is over. At its last click, what it measured is
+    /// kept.
+    fn watch(&mut self, turn: u64, cx: &mut Context<Self>) -> bool {
+        let Some(calibration) = self.calibration.as_ref().filter(|c| c.turn == turn) else {
+            return false;
+        };
+        // The count of keys moves on screen.
+        cx.notify();
+        let player = &calibration.player;
+        let sound = player.sound();
+        if let Sound::Failed(why) = sound {
+            self.calibration = None;
+            self.calibrated = Some(format!("The clicks could not be played: {why}"));
+            return false;
+        }
+        let clock = &player.clock;
+        let over = sound == Sound::Ready
+            && !player.wants_to_play()
+            && clock.position_ms() >= player.timeline.duration_ms();
+        if !over {
+            return true;
+        }
+        let struck = calibration
+            .struck
+            .lock()
+            .expect("the strikes' lock")
+            .clone();
+        // What was measured is that output's: the one chosen, or the built-in piano that took
+        // its place (and why).
+        let output = player
+            .output_label()
+            .unwrap_or_else(|| "built-in piano".to_owned());
+        let notice = player
+            .notice()
+            .map(|notice| format!(" {notice}"))
+            .unwrap_or_default();
+        // Its output is closed with it.
+        self.calibration = None;
+        let counted = &latency::clicks()[latency::COUNT_IN..];
+        match latency::measure(counted, &struck) {
+            Some(ms) => {
+                self.calibrated = Some(format!(
+                    "Measured {} on the {output}, and kept.{notice}",
+                    latency_text(ms)
+                ));
+                if self.settings.latency_ms != ms {
+                    self.settings.latency_ms = ms;
+                    self.keep(cx);
+                }
+            }
+            None => {
+                self.calibrated = Some(format!(
+                    "Too few keys struck with the clicks (at least {} are needed): the latency \
+                     is as it was.{notice}",
+                    latency::ENOUGH
+                ));
+            }
+        }
+        false
+    }
+
+    /// What the latency's row says under it.
+    fn latency_hint(&self) -> String {
+        let Some(calibration) = &self.calibration else {
+            if !self.midi_in.listening_to_any() {
+                return "Plug in a MIDI keyboard, then press Look again: the calibration listens \
+                        to it."
+                    .to_owned();
+            }
+            return self.calibrated.clone().unwrap_or_else(|| {
+                "Strike any key with each click. Your own offset, early or late (the sound, \
+                 your hand, the keyboard), is taken away when your keys are judged. Measure it \
+                 again when you change your keyboard, your output or your speakers."
+                    .to_owned()
+            });
+        };
+        let player = &calibration.player;
+        if player.sound() != Sound::Ready {
+            return "Getting the sound ready…".to_owned();
+        }
+        let struck = calibration.struck.lock().expect("the strikes' lock").len();
+        let beat = (player.clock.position_ms() / latency::CLICK_EVERY_MS) as usize;
+        if beat <= latency::COUNT_IN {
+            format!(
+                "Listen to {} clicks, then strike a key with each click.",
+                latency::COUNT_IN
+            )
+        } else {
+            format!("Strike a key with each click: {struck} so far.")
         }
     }
 
@@ -364,6 +567,18 @@ impl Render for SettingsPage {
              Heavy asks for a firmer touch, Fixed plays every key at one volume. It does not \
              change the piece, nor a MIDI output, whose own touch setting applies.";
 
+        let calibrate = Button::secondary(
+            "settings-calibrate",
+            if self.calibration.is_some() {
+                "Stop"
+            } else {
+                "Calibrate"
+            },
+        )
+        .disabled(!self.read || (self.calibration.is_none() && !self.midi_in.listening_to_any()))
+        .on_click(cx.listener(|this, _, _, cx| this.calibrate(cx)));
+        let latency_hint = self.latency_hint();
+
         let back = {
             let this = cx.entity().downgrade();
             Button::quiet("settings-back", "Pieces")
@@ -438,6 +653,27 @@ impl Render for SettingsPage {
                             ),
                     )
                     .child(
+                        Section::new("settings-latency", "Latency")
+                            .sentence(
+                                "Your own offset from the beat, taken away when your keys are \
+                                 judged.",
+                            )
+                            .action(calibrate)
+                            .child(
+                                div()
+                                    .flex()
+                                    .flex_col()
+                                    .gap(space::SM)
+                                    .child(
+                                        div()
+                                            .ui_text()
+                                            .text_color(p.text)
+                                            .child(latency_text(self.settings.latency_ms)),
+                                    )
+                                    .child(hint(latency_hint)),
+                            ),
+                    )
+                    .child(
                         Section::new("settings-colours", "Colours")
                             .sentence("Gamme's own colours, or your desktop's theme as it changes.")
                             .child(appearance::control(cx)),
@@ -449,7 +685,7 @@ impl Render for SettingsPage {
 #[cfg(test)]
 mod tests {
     // Not `super::*`: gpui_kit's own `test` attribute would come with it.
-    use super::{PortInfo, mib, port_choice};
+    use super::{PortInfo, latency_text, mib, port_choice};
     use crate::soundfont;
 
     fn port(id: &str, name: &str) -> PortInfo {
@@ -498,6 +734,13 @@ mod tests {
         assert_eq!(choice.titles[3], "Old piano (not connected)");
         let none = port_choice(&[], Some("Old piano"), "Built-in piano");
         assert_eq!(none.chosen, 1);
+    }
+
+    #[test]
+    fn a_latency_is_said_with_its_sign() {
+        assert_eq!(latency_text(32), "+32 ms");
+        assert_eq!(latency_text(0), "0 ms");
+        assert_eq!(latency_text(-15), "-15 ms");
     }
 
     #[test]

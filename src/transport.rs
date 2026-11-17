@@ -7,6 +7,10 @@
 //! (`wall_clock.rs`): a piece played before its SoundFont is there, or with no audio output,
 //! goes on in silence. A change of the hands or of the wait is said ([`Choice`] as an event),
 //! for the play screen to keep it with the piece.
+//!
+//! It holds the judge of the run too (`judge.rs`): each key from MIDI in goes to it with the
+//! instant it arrived, and each tick tells it time moved on. Hands changed, the run starts again.
+//! Its tally is a line of the practice row until the live judgements come (#18).
 
 use std::time::Duration;
 
@@ -16,7 +20,8 @@ use gpui_design_system::{
 use gpui_kit::*;
 
 use crate::icons;
-use crate::midi_in::MidiIn;
+use crate::judge::{Grade, Live};
+use crate::midi_in::{MidiIn, Played};
 use crate::player::{Player, Sound};
 use crate::practice::{self, Choice, Playing, Practice};
 use crate::soundfont::Stage;
@@ -42,18 +47,23 @@ pub struct Transport {
     wall: WallClock,
     /// What the player said last about its output (it was replaced), kept on screen.
     notice: Option<String>,
+    /// The judge of the run; none while the player listens.
+    judge: Option<Live>,
+    /// What the settings measured, taken away from each key.
+    latency_ms: f64,
     _refresh: Task<()>,
 }
 
 impl EventEmitter<Choice> for Transport {}
 
 impl Transport {
-    /// `practice` is put on the player at once.
+    /// `practice` is put on the player at once; `latency_ms` is the settings'.
     pub fn new(
         player: Player,
         names: Vec<SharedString>,
         mut practice: Practice,
         midi_in: MidiIn,
+        latency_ms: i32,
         cx: &mut Context<Self>,
     ) -> Self {
         practice.set_keyboard(midi_in.listening_to_any(), &player);
@@ -70,6 +80,11 @@ impl Transport {
                             cx.notify();
                         }
                         this.wall.tick(&this.player.clock);
+                        if let Some(judge) = &mut this.judge
+                            && !judge.tick(&this.player.clock).is_empty()
+                        {
+                            cx.notify();
+                        }
                         // A keyboard plugged in or out: the wait can be had, or not.
                         let keyboard = this.midi_in.listening_to_any();
                         if this.practice.set_keyboard(keyboard, &this.player) {
@@ -93,6 +108,13 @@ impl Transport {
             async {}
         })
         .detach();
+        let latency_ms = f64::from(latency_ms);
+        let judge = Live::new(
+            &player.timeline,
+            practice.choice().playing,
+            latency_ms,
+            &player.clock,
+        );
         Self {
             player,
             names,
@@ -100,6 +122,8 @@ impl Transport {
             midi_in,
             wall: WallClock::default(),
             notice: None,
+            judge,
+            latency_ms,
             _refresh: refresh,
         }
     }
@@ -112,15 +136,30 @@ impl Transport {
         &self.practice
     }
 
-    /// A key from MIDI in, for the wait.
-    pub fn key(&mut self, key: u8, velocity: u8, cx: &mut Context<Self>) {
-        if self.practice.key(key, velocity, &self.player.clock) {
+    /// A key from MIDI in, for the judge and the wait. The judge reads the clock first: the
+    /// wait's release moves it on.
+    pub fn key(&mut self, played: Played, cx: &mut Context<Self>) {
+        let judged = self
+            .judge
+            .as_mut()
+            .and_then(|judge| judge.key(played, &self.player.clock));
+        let released =
+            self.practice
+                .key(played.key, played.velocity, played.at, &self.player.clock);
+        if judged.is_some() || released {
             cx.notify();
         }
     }
 
     pub fn set_playing(&mut self, playing: Playing, cx: &mut Context<Self>) {
         self.practice.set_playing(playing, &self.player);
+        // Other notes owed: another run, from where the piece stands.
+        self.judge = Live::new(
+            &self.player.timeline,
+            playing,
+            self.latency_ms,
+            &self.player.clock,
+        );
         cx.emit(self.practice.choice());
         cx.notify();
     }
@@ -245,6 +284,24 @@ impl Transport {
         };
         let (looped, half) = (self.practice.looped(), self.practice.half_loop());
         let label = practice::loop_text(looped, half, names);
+        // Until the live judgements (#18): how many of each, once there is one.
+        let tally = self
+            .judge
+            .as_ref()
+            .map(Live::run)
+            .filter(|run| !run.is_empty())
+            .map(|run| {
+                let words: Vec<String> = Grade::ALL
+                    .iter()
+                    .map(|&grade| format!("{} {}", run.count(grade), grade.word()))
+                    .collect();
+                div()
+                    .id("transport-judged")
+                    .ui_text()
+                    .text_color(p.mute)
+                    .whitespace_nowrap()
+                    .child(words.join(" · "))
+            });
         let set_a = {
             let this = this.clone();
             Button::secondary("transport-loop-a", "A")
@@ -277,6 +334,7 @@ impl Transport {
             .child(hands)
             .child(wait)
             .children(waiting)
+            .children(tally)
             .child(div().flex_1())
             .child(
                 div()

@@ -17,6 +17,7 @@
 //! The choice of hands and the wait are kept with a piece of the library; the loop is not.
 
 use std::sync::Arc;
+use std::time::Instant;
 
 use serde::{Deserialize, Serialize};
 
@@ -194,15 +195,22 @@ impl Waiter {
         }
     }
 
-    /// A key struck (`velocity` above 0) or let go. True when it was the last one of the chord
-    /// owed, which the clock is told.
+    /// [`Waiter::key_at`], the key arrived now.
+    #[cfg(test)]
     pub fn key(&mut self, key: u8, velocity: u8, clock: &Clock) -> bool {
+        self.key_at(key, velocity, Instant::now(), clock)
+    }
+
+    /// A key struck (`velocity` above 0) or let go, arrived at `at`. True when it was the last
+    /// one of the chord owed, which the clock is told. How early it is is read from where the
+    /// piece stood when it arrived, as the judge reads it (`judge.rs`).
+    pub fn key_at(&mut self, key: u8, velocity: u8, at: Instant, clock: &Clock) -> bool {
         let key = key & 127;
         self.down[usize::from(key)] = velocity > 0;
         if velocity == 0 || !clock.playing() {
             return false;
         }
-        let Some(owed) = clock.owed() else {
+        let Some(owed) = clock.owed_at(at) else {
             return false;
         };
         // Too early: for nothing.
@@ -378,9 +386,9 @@ impl Practice {
         }
     }
 
-    /// A key from MIDI in; true when it released the chord the clock waited for.
-    pub fn key(&mut self, key: u8, velocity: u8, clock: &Clock) -> bool {
-        self.waiter.key(key, velocity, clock)
+    /// A key from MIDI in, arrived at `at`; true when it released the chord the clock waited for.
+    pub fn key(&mut self, key: u8, velocity: u8, at: Instant, clock: &Clock) -> bool {
+        self.waiter.key_at(key, velocity, at, clock)
     }
 }
 

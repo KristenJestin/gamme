@@ -454,7 +454,7 @@ impl PlayScreen {
     /// The keys played last, oldest first, each with the instant it arrived.
     #[expect(
         dead_code,
-        reason = "the game's judgement reads the keys played with their instants; the wait takes each as it comes"
+        reason = "the keys played last, for what comes after the judge; the judge and the wait take each as it comes"
     )]
     pub fn played(&self) -> &VecDeque<Played> {
         &self.played
@@ -482,7 +482,7 @@ impl PlayScreen {
         self.played.push_back(played);
         if let State::Ready(ready) = &self.state {
             ready.transport.update(cx, |transport, cx| {
-                transport.key(played.key, played.velocity, cx);
+                transport.key(played, cx);
             });
         }
         if played.velocity > 0 {
@@ -542,7 +542,9 @@ impl PlayScreen {
             ),
         };
         let midi_in = self.midi_in.clone();
-        let transport = cx.new(|cx| Transport::new(player, names, practice, midi_in, cx));
+        let latency_ms = self.settings.latency_ms;
+        let transport =
+            cx.new(|cx| Transport::new(player, names, practice, midi_in, latency_ms, cx));
         let observe = cx.observe(&transport, |_, _, cx| cx.notify());
         let keep = cx.subscribe(&transport, |this, _, choice: &Choice, cx| {
             this.keep_practice(*choice, cx);

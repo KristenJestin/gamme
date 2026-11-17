@@ -1,13 +1,13 @@
 //! What the player chose in the settings page, kept in `$XDG_CONFIG_HOME/gamme/settings.json`:
 //! which piano the built-in synthesizer plays (its SoundFont), whether the piece goes to a MIDI
-//! output instead, which MIDI input the keys come from, and the touch of the player's keys on the
-//! built-in piano.
+//! output instead, which MIDI input the keys come from, the touch of the player's keys on the
+//! built-in piano, and the latency of his keys (`latency.rs`).
 //!
 //! The colours are the kit's appearance state and stay in the state folder (`appearance.rs`).
 //!
 //! The file is written beside and renamed over the old one, the folder `0700` and the file `0600`.
 //! Absent, or a key missing: the defaults (the small piano, no MIDI out, every input port, a light
-//! touch).
+//! touch, no latency).
 
 use std::io::Write as _;
 use std::os::unix::fs::{DirBuilderExt as _, OpenOptionsExt as _, PermissionsExt as _};
@@ -16,6 +16,7 @@ use std::sync::Arc;
 
 use serde::{Deserialize, Serialize};
 
+use crate::latency;
 use crate::midi_out::{MidiOut, Ports};
 use crate::paths;
 use crate::player::{Audio, Builtin};
@@ -38,6 +39,11 @@ pub struct Settings {
     /// How the player's keys are struck on the built-in piano (`touch.rs`). A value this version
     /// does not know is the default, and the file is read all the same.
     pub touch: Touch,
+    /// How late the player's keys land, in ms, as the settings' calibration measured it: the
+    /// judge takes it away from each key. Missing, or not a number within
+    /// ±[`latency::LIMIT_MS`], it is 0.
+    #[serde(default, deserialize_with = "latency_or_none")]
+    pub latency_ms: i32,
 }
 
 impl Default for Settings {
@@ -47,8 +53,19 @@ impl Default for Settings {
             midi_out: None,
             midi_in: None,
             touch: Touch::default(),
+            latency_ms: 0,
         }
     }
+}
+
+/// A latency this version cannot take (a text, a value out of range, a file edited by hand) is
+/// none: the file is read all the same.
+fn latency_or_none<'de, D: serde::Deserializer<'de>>(read: D) -> Result<i32, D::Error> {
+    let value = serde_json::Value::deserialize(read)?;
+    Ok(value
+        .as_f64()
+        .filter(|ms| ms.is_finite() && ms.abs() <= f64::from(latency::LIMIT_MS))
+        .map_or(0, |ms| ms.round() as i32))
 }
 
 impl Settings {
@@ -193,6 +210,7 @@ mod tests {
             midi_out: Some("Digital Piano MIDI 1".into()),
             midi_in: Some("Keystation 49".into()),
             touch: Touch::Normal,
+            latency_ms: 35,
         };
         save(&config.0, &kept).unwrap();
         // The touch changes, the rest of what was kept does not.
@@ -229,6 +247,39 @@ mod tests {
     }
 
     #[test]
+    fn a_latency_missing_or_unknown_is_none_and_the_rest_is_kept() {
+        let config = Temp::new("latency");
+        std::fs::create_dir_all(&config.0).unwrap();
+        for (text, latency) in [
+            (r#"{"piano":"grand"}"#, 0),
+            (r#"{"piano":"grand","latency_ms":42}"#, 42),
+            (r#"{"piano":"grand","latency_ms":-17}"#, -17),
+            (r#"{"piano":"grand","latency_ms":12.6}"#, 13),
+            (r#"{"piano":"grand","latency_ms":250}"#, 250),
+            (r#"{"piano":"grand","latency_ms":-250}"#, -250),
+            (r#"{"piano":"grand","latency_ms":251}"#, 0),
+            (r#"{"piano":"grand","latency_ms":-9000}"#, 0),
+            (r#"{"piano":"grand","latency_ms":"fast"}"#, 0),
+            (r#"{"piano":"grand","latency_ms":null}"#, 0),
+            (r#"{"piano":"grand","latency_ms":[3]}"#, 0),
+        ] {
+            std::fs::write(file(&config.0), text).unwrap();
+            let settings = read(&config.0).unwrap();
+            assert_eq!(settings.latency_ms, latency, "{text}");
+            assert_eq!(settings.piano, "grand", "{text}");
+        }
+        // Kept as a number, and read back.
+        let kept = Settings {
+            latency_ms: 28,
+            ..Settings::default()
+        };
+        save(&config.0, &kept).unwrap();
+        let text = std::fs::read_to_string(file(&config.0)).unwrap();
+        assert!(text.contains("\"latency_ms\": 28"), "{text}");
+        assert_eq!(read(&config.0).unwrap(), kept);
+    }
+
+    #[test]
     fn what_is_chosen_is_kept_and_read_again() {
         let config = Temp::new("roundtrip");
         let chosen = Settings {
@@ -236,6 +287,7 @@ mod tests {
             midi_out: Some("Digital Piano MIDI 1".into()),
             midi_in: Some("Keystation 49".into()),
             touch: Touch::Heavy,
+            latency_ms: -20,
         };
         save(&config.0, &chosen).unwrap();
         assert_eq!(read(&config.0).unwrap(), chosen);
@@ -318,6 +370,7 @@ mod tests {
             midi_out: Some("Digital Piano".into()),
             midi_in: None,
             touch: Touch::Fixed,
+            latency_ms: 0,
         };
         let (midi, font) = chosen.audio(ports);
         assert_eq!(midi.label().unwrap(), "MIDI output “Digital Piano”");

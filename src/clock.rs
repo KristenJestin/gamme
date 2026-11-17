@@ -157,6 +157,12 @@ fn pass_mark(pass: u32) -> u32 {
     (pass & SEEKS_MASK as u32) + 1
 }
 
+/// Whether the counter of seeks went from `from` to `to` by one wrap of the loop and nothing else
+/// (a seek adds two).
+pub fn one_wrap(from: u32, to: u32) -> bool {
+    to == from.wrapping_add(1) & SEEKS_MASK as u32
+}
+
 /// A chord the player owes, as [`Clock::owed`] finds it.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct Owed {
@@ -227,6 +233,9 @@ struct Shared {
     /// The speed (percent) the position had advanced at then: the window runs ahead of it at
     /// that speed, so that a change of speed shows from the next buffer on, never as a jump.
     stamp_speed: AtomicU32,
+    /// When the window last set the position (a seek, a play), as `stamp_ns`: a key is never
+    /// placed back before it ([`Clock::position_at`]).
+    set_ns: AtomicU64,
 }
 
 fn micros(ms: f64) -> u64 {
@@ -265,6 +274,7 @@ impl Clock {
             origin: Instant::now(),
             stamp_ns: AtomicU64::new(0),
             stamp_speed: AtomicU32::new(Speed::FULL.percent()),
+            set_ns: AtomicU64::new(0),
         }));
         clock.stamp();
         clock
@@ -275,12 +285,14 @@ impl Clock {
         self.0
             .stamp_speed
             .store(self.0.speed.load(Relaxed), Relaxed);
-        self.stamp_now();
+        let ns = self.stamp_now();
+        self.0.set_ns.store(ns, Release);
     }
 
-    fn stamp_now(&self) {
+    fn stamp_now(&self) -> u64 {
         let ns = self.0.origin.elapsed().as_nanos().min(u128::from(u64::MAX)) as u64;
         self.0.stamp_ns.store(ns, Release);
+        ns
     }
 
     // ---- The window drives it.
@@ -406,15 +418,30 @@ impl Clock {
 
     /// The chord the player owes now: the one the clock stands on, or the next it will. Past the
     /// last one of the loop, the first of its next pass. None while nothing is waited for.
+    #[cfg(test)]
     pub fn owed(&self) -> Option<Owed> {
+        self.owed_seen(None)
+    }
+
+    /// [`Clock::owed`], how far ahead it is read from where the piece stood at `at` (a key's
+    /// arrival, [`Clock::position_at`]): what the judge reads too, so that the two agree on a key
+    /// struck early.
+    pub fn owed_at(&self, at: Instant) -> Option<Owed> {
+        self.owed_seen(Some(self.position_at(at).1))
+    }
+
+    fn owed_seen(&self, seen_ms: Option<f64>) -> Option<Owed> {
         let wait = self.wait();
         let gates = self.gates()?;
         let snapshot = self.snapshot();
         let position = snapshot.position_us;
         let looped = self.loop_us();
         let limit = self.limit_us(position, looped);
-        // The position the window sees: a buffer ahead of the published one.
-        let seen_us = (self.position_ms() * 1e3).max(position as f64);
+        // The position the window sees (a buffer ahead of the published one), or the one asked.
+        let seen_us = match seen_ms {
+            Some(ms) => ms * 1e3,
+            None => (self.position_ms() * 1e3).max(position as f64),
+        };
         if let Some(index) = gates.owed(position, limit, snapshot.seeks) {
             return Some(Owed {
                 wait,
@@ -485,6 +512,55 @@ impl Clock {
             ms = ms.min(stop as f64 / 1e3);
         }
         ms.min(shared.end_us as f64 / 1e3)
+    }
+
+    /// Where the piece stood at `at` (a key's arrival), in ms of its own tempo, and the counter of
+    /// seeks it is read against: the position published last, moved on or back by the real time
+    /// between its stamp and `at`, at the speed it advanced at, never past what stops it, nor back
+    /// before the window last set it (a seek, a play: before that was another line). Paused, the
+    /// position itself.
+    ///
+    /// Read back across the loop's seam (a key struck just before it, read just after), it lies
+    /// before the loop's start: on the same line as the pass before, which is what the judge
+    /// (`judge.rs`) needs.
+    pub fn position_at(&self, at: Instant) -> (u32, f64) {
+        let shared = &self.0;
+        let (mut state, mut stamp, mut speed, mut set) = (0, 0, Speed::FULL.percent(), 0);
+        for _ in 0..4 {
+            let before = shared.stamp_ns.load(Acquire);
+            state = shared.state.load(Acquire);
+            speed = shared.stamp_speed.load(Relaxed);
+            set = shared.set_ns.load(Acquire);
+            stamp = shared.stamp_ns.load(Acquire);
+            if before == stamp {
+                break;
+            }
+        }
+        let seeks = seeks_of(state) as u32;
+        let position = state & POSITION_MASK;
+        let mut ms = position as f64 / 1e3;
+        if self.playing() && position < shared.end_us {
+            let at_ns = match at.checked_duration_since(shared.origin) {
+                Some(since) => since.as_nanos().min(i64::MAX as u128) as i64,
+                None => {
+                    -(shared
+                        .origin
+                        .duration_since(at)
+                        .as_nanos()
+                        .min(i64::MAX as u128) as i64)
+                }
+            };
+            let stamp = stamp.min(i64::MAX as u64) as i64;
+            let set = set.min(i64::MAX as u64) as i64;
+            let ahead_ns = (at_ns - stamp)
+                .min(EXTRAPOLATION_LIMIT_NS as i64)
+                .max(set.min(stamp) - stamp);
+            ms = (ms + ahead_ns as f64 / 1e6 * Speed::new(speed).factor()).max(0.);
+            let limit = self.limit_us(position, self.loop_us());
+            let stop = self.hold_us(position, limit, seeks).unwrap_or(limit);
+            ms = ms.min(stop as f64 / 1e3);
+        }
+        (seeks, ms.min(shared.end_us as f64 / 1e3))
     }
 
     /// The measure the position falls in (0 is the first).
@@ -628,6 +704,92 @@ mod tests {
 
     fn seconds(s: f64) -> Duration {
         Duration::from_secs_f64(s)
+    }
+
+    #[test]
+    fn a_key_is_placed_where_the_piece_stood_when_it_arrived() {
+        // Instants read from the clock's own stamp: no real time between two reads counts.
+        let stamped = |clock: &Clock, ms: i64| {
+            let stamp = clock.0.origin + Duration::from_nanos(clock.0.stamp_ns.load(Acquire));
+            let by = Duration::from_millis(ms.unsigned_abs());
+            if ms < 0 { stamp - by } else { stamp + by }
+        };
+        let near = |got: f64, want: f64| assert!((got - want).abs() < 1e-6, "{got} for {want}");
+        let clock = Clock::new(10_000.);
+        // Paused: where the piece stands, whenever the key came; with the counter of seeks.
+        clock.seek_ms(1500.);
+        assert_eq!(
+            clock.position_at(stamped(&clock, -300)),
+            (clock.snapshot().seeks, 1500.)
+        );
+        // Real time behind the last buffer to go back into, from the clock's start.
+        std::thread::sleep(Duration::from_millis(150));
+        clock.play();
+        clock.tick(seconds(1.));
+        // As if the play were long ago: nothing bounds the way back.
+        clock.0.set_ns.store(0, Release);
+        near(clock.position_at(stamped(&clock, 0)).1, 2500.);
+        near(clock.position_at(stamped(&clock, 40)).1, 2540.);
+        // A key that arrived 100 ms before the last buffer: 100 ms back.
+        near(clock.position_at(stamped(&clock, -100)).1, 2400.);
+        // At half speed, 100 ms of real time are 50 of the piece.
+        clock.set_speed(Speed::new(50));
+        clock.tick(seconds(0.2));
+        near(clock.position_at(stamped(&clock, -100)).1, 2550.);
+        // Never past a chord owed.
+        let marks = Marks {
+            measures_ms: vec![],
+            gates_ms: [vec![1000.], vec![], vec![1000.]],
+        };
+        let held = Clock::with_marks(10_000., &marks);
+        held.set_wait(Wait::Right);
+        held.play();
+        held.tick(seconds(2.));
+        assert_eq!(held.position_at(Instant::now()).1, 1000.);
+    }
+
+    #[test]
+    fn a_key_is_never_placed_back_before_the_position_was_set() {
+        let clock = Clock::new(10_000.);
+        // Real time behind the last buffer, from the clock's start.
+        std::thread::sleep(Duration::from_millis(150));
+        clock.seek_ms(3000.);
+        clock.play();
+        // The seek and the play 30 ms before the last buffer, which moved the piece 30 ms on.
+        let snapshot = clock.snapshot();
+        clock.advance(&snapshot, 30_000);
+        let stamp = clock.0.stamp_ns.load(Acquire);
+        clock.0.set_ns.store(stamp - 30_000_000, Release);
+        let at = clock.0.origin + Duration::from_nanos(stamp) - Duration::from_millis(100);
+        let (_, ms) = clock.position_at(at);
+        assert!((ms - 3000.).abs() < 1e-6, "{ms}");
+    }
+
+    #[test]
+    fn how_early_a_key_is_for_the_chord_owed_is_read_when_it_arrived() {
+        let marks = Marks {
+            measures_ms: vec![],
+            gates_ms: [vec![1000.], vec![], vec![1000.]],
+        };
+        let clock = Clock::with_marks(10_000., &marks);
+        std::thread::sleep(Duration::from_millis(150));
+        clock.set_wait(Wait::Right);
+        clock.play();
+        clock.tick(seconds(0.79));
+        clock.0.set_ns.store(0, Release);
+        let stamp = clock.0.origin + Duration::from_nanos(clock.0.stamp_ns.load(Acquire));
+        let ahead = |at| clock.owed_at(at).unwrap().ahead_ms;
+        assert!((ahead(stamp) - 210.).abs() < 1e-6);
+        // Arrived 100 ms before the last buffer: 100 ms earlier, though read after it.
+        assert!((ahead(stamp - Duration::from_millis(100)) - 310.).abs() < 1e-6);
+    }
+
+    #[test]
+    fn one_wrap_is_one_more_on_the_counter_and_a_seek_two() {
+        assert!(one_wrap(4, 5));
+        assert!(!one_wrap(4, 6));
+        assert!(!one_wrap(4, 4));
+        assert!(one_wrap(SEEKS_MASK as u32, 0));
     }
 
     #[test]

@@ -126,7 +126,6 @@ impl Timeline {
     /// `notes` in any order, `measures` the start of each measure (a measure starting at 0 is
     /// added when none does), `duration_ms` at least as long as the last note. Each note's
     /// measure is found here.
-    #[cfg(test)]
     pub fn new(notes: Vec<Note>, measures: Vec<f64>, duration_ms: f64) -> Self {
         Self::with_parts(notes, measures, duration_ms, Vec::new(), Vec::new())
     }
