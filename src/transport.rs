@@ -226,6 +226,18 @@ impl Transport {
         true
     }
 
+    /// Rework of the run that ended, while its end is closed and no other run started: the
+    /// practice row offers it again.
+    fn rework_at_hand(&self) -> Option<&run_end::Plan> {
+        let judge = self.judge.as_ref()?;
+        let end = self.end.as_ref()?;
+        let at_hand = judge.ended()
+            && end.run == judge.runs()
+            && !end.shown
+            && self.practice.reworking().is_none();
+        end.summary.rework.as_ref().filter(|_| at_hand)
+    }
+
     /// The end of the run that ended last, and whether it is shown; none before one ended.
     pub fn end(&self) -> Option<(&Summary, bool)> {
         self.end.as_ref().map(|end| (&end.summary, end.shown))
@@ -477,6 +489,16 @@ impl Transport {
                         .child(div().text_color(p.text).semibold().child(value))
                 }))
         });
+        let rework = self.rework_at_hand().map(|plan| {
+            let this = this.clone();
+            Button::secondary("transport-rework", format!("Rework at {} %", plan.speed))
+                .leading(icons::REPEAT)
+                .tooltip(format!(
+                    "Loop {}, slowed",
+                    run_end::measures_text(&plan.measures, names)
+                ))
+                .on_click(move |_, _, cx| this.update(cx, |t, cx| t.rework(cx)))
+        });
         let set_a = {
             let this = this.clone();
             Button::secondary("transport-loop-a", "A")
@@ -519,6 +541,7 @@ impl Transport {
                     .whitespace_nowrap()
                     .child(label),
             )
+            .children(rework)
             .child(set_a)
             .child(set_b)
             .children(clear)

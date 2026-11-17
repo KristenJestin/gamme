@@ -7,8 +7,8 @@
 //!   the ladder counts both as faults (design §4.1). A late note weighs [`LATE`]: it keeps the
 //!   combo and scores a little, and is a fault only from the ladder's fourth step. The heaviest
 //!   [`MOST_MISSED`] are named, heaviest first, a tie in the order of play; a measure is named as
-//!   the score prints it, with the time it is played when a repeat names it again ("3, second
-//!   time").
+//!   the score prints it, with the time it is played when a repeat names it again ("3 (2nd
+//!   time)"). Late notes count, so the end says them "to rework" rather than "missed".
 //! - **Rework** loops those measures one after the other, in the order of play (`clock.rs`'s
 //!   spans: measures 3 and 7 play 3, 7, 3, 7…; measures that follow each other play as one span),
 //!   at the next speed below the run's among those the transport offers (100 % to 50 %, 50 % to
@@ -238,6 +238,26 @@ fn capitalised(text: &str) -> String {
     })
 }
 
+/// The sentence under the end's title: what to rework, and how.
+pub fn sentence(summary: &Summary, names: &[impl AsRef<str>]) -> String {
+    match &summary.rework {
+        Some(plan) => format!(
+            "{} to rework most: Rework loops {} at {} %.",
+            capitalised(&measures_text(&plan.measures, names)),
+            if plan.measures.len() == 1 {
+                "it"
+            } else {
+                "them"
+            },
+            plan.speed
+        ),
+        None if summary.standing.notes + summary.standing.waited > 0 => {
+            "Nothing to rework: no note missed, late or wrong.".to_owned()
+        }
+        None => "Nothing was judged.".to_owned(),
+    }
+}
+
 /// What a button of the end of a run does.
 pub type Action = Box<dyn Fn(&mut Window, &mut App)>;
 
@@ -323,7 +343,7 @@ pub fn view(
             .flex()
             .flex_col()
             .gap(space::XS)
-            .child(div().ui_text().semibold().child("The measures most missed"))
+            .child(div().ui_text().semibold().child("The measures to rework"))
             .children(summary.missed.iter().map(|faults| {
                 div()
                     .flex()
@@ -337,22 +357,7 @@ pub fn view(
                     .child(div().text_color(p.mute).child(faults_text(faults)))
             }))
     });
-    let sentence = match &summary.rework {
-        Some(plan) => format!(
-            "{} missed most: Rework loops {} at {} %.",
-            capitalised(&measures_text(&plan.measures, names)),
-            if plan.measures.len() == 1 {
-                "it"
-            } else {
-                "them"
-            },
-            plan.speed
-        ),
-        None if summary.standing.notes + summary.standing.waited > 0 => {
-            "Not a note missed.".to_owned()
-        }
-        None => "Nothing was judged.".to_owned(),
-    };
+    let sentence = sentence(summary, names);
     let Actions {
         rework,
         again,
@@ -388,7 +393,7 @@ mod tests {
     // Not `super::*`: gpui_kit's own `test` attribute would come with it.
     use super::{
         Faults, Grade, Judgement, MOST_MISSED, Summary, faults_text, measure_name, measures_text,
-        most_missed, ordinal, rework, rework_text,
+        most_missed, ordinal, rework, rework_text, sentence,
     };
 
     fn judged(grade: Grade, measure: u32, pass: u32, at_ms: f64) -> Judgement {
@@ -429,6 +434,10 @@ mod tests {
         assert_eq!(plan.spans.as_slice(), [(2, 2), (6, 6)]);
         assert_eq!(plan.speed, 50);
         assert_eq!(rework_text(plan, &names), "Rework: measures 3 and 7");
+        assert_eq!(
+            sentence(&summary, &names),
+            "Measures 3 and 7 to rework most: Rework loops them at 50 %."
+        );
         // 8 of 10 accurate: no star, and the end says why.
         assert_eq!(summary.standing.accuracy(), Some(80));
         assert_eq!(summary.stars, 0);
@@ -483,6 +492,11 @@ mod tests {
         assert_eq!(summary.rework, None);
         assert_eq!(summary.stars, 3);
         assert_eq!(summary.why_no_star(), None);
+        let none: [&str; 0] = [];
+        assert_eq!(
+            sentence(&summary, &none),
+            "Nothing to rework: no note missed, late or wrong."
+        );
     }
 
     #[test]

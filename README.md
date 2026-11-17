@@ -116,19 +116,21 @@ scored.
 ## The end of a run
 
 When the piece reaches its end, a dialog sums the run up: its score, its accuracy, its best combo,
-the stars it earned, and the measures you missed most.
+the stars it earned, and the measures to rework.
 
 - **Stars**: one at 50 % speed, two at 75 %, three at 100 % with the falling notes not shown (the
   **Score** view); each needs 90 % accuracy with **Wait for me** off, on the whole piece (every
   note of your hands judged, struck or missed). A run counts at the slowest speed it was played
   at. A MIDI piece has no score, so it stops at two. When no star came, the dialog says what they
   ask. They are not kept yet.
-- **The measures most missed**: the three that weigh most, a note missed or a wrong key weighing
+- **The measures to rework**: the three that weigh most, a note missed or a wrong key weighing
   two and a late note one, every time through the loop counted. They are named as the score prints
   them; a measure played again by a repeat says which time (“3 (2nd time)”).
 - **Rework** loops those measures, slowed one step (100 % to 50 %, 50 % to 25 %): measures 3 and 7
   play 3, 7, 3, 7… with no gap between them, measures side by side as one. It takes the loop's
-  place; **A**, **B** or **Clear** end it. **Play again** plays the piece from its start.
+  place; **A**, **B** or **Clear** end it. Its slower speed stays when it ends, and when you play
+  again: set the speed back yourself. Once the dialog is closed, **Rework** waits in the practice
+  row until you play again. **Play again** plays the piece from its start.
 
 ## Install
 

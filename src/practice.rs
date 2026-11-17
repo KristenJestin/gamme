@@ -394,6 +394,8 @@ impl Practice {
     }
 
     /// Loops `plan`'s measures at its speed, from the first of them, in the A–B loop's place.
+    /// The speed stays when Rework ends (A, B, Clear, Play again): the player sets it back, as
+    /// any speed he chose.
     pub fn rework(&mut self, plan: Plan, player: &Player) {
         self.a = None;
         self.b = None;
