@@ -29,8 +29,8 @@ pub struct Settings {
     /// The MIDI output the piece sounds on, by the port's name (`midi_out::key`), instead of the
     /// built-in piano. None: the built-in piano.
     pub midi_out: Option<String>,
-    /// The only MIDI input port the player's keys are read from (connecting it is MIDI in's, #14).
-    /// None: every port, as it appears.
+    /// The only MIDI input port the player's keys are read from (`midi_in.rs`). None: every port,
+    /// as it appears.
     pub midi_in: Option<String>,
 }
 
@@ -59,7 +59,7 @@ impl Settings {
     /// the built-in piano otherwise (and when the MIDI output cannot be used: see
     /// [`Audio::fallback`]).
     pub fn audio(&self, ports: Arc<dyn Ports>) -> (Arc<dyn Audio>, Font) {
-        let builtin: Arc<dyn Audio> = Arc::new(Builtin);
+        let builtin: Arc<dyn Audio> = Arc::new(Builtin::default());
         let audio: Arc<dyn Audio> = match &self.midi_out {
             Some(port) => Arc::new(MidiOut::new(ports, port.clone(), builtin)),
             None => builtin,

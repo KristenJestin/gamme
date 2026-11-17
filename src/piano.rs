@@ -8,9 +8,18 @@
 //!
 //! [`Renderer`] is the whole of the callback's logic, over a [`Sink`] instead of a synthesizer
 //! and a device, so that it is tested without either. [`start`] puts it on the output.
+//!
+//! The keys the player strikes on a MIDI keyboard (`midi_in.rs`), and his sustain pedal, reach
+//! the callback through [`LiveKeys`], a ring of atomics made once: the callback plays them at the
+//! start of its next buffer, so the output is opened with a small one (`LIVE_FRAMES`). They are
+//! played on a channel of the synthesizer of their own (the same piano): the piece ending a note,
+//! a pause or a seek do not cut a key the player holds, the player letting a key go does not cut
+//! the piece's note on it, and his pedal holds his notes, not the piece's (a pause still silences
+//! the piece).
 
-use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicU8, Ordering::Relaxed};
+use std::sync::atomic::Ordering::{Acquire, Release};
+use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU16, AtomicUsize, Ordering::Relaxed};
+use std::sync::{Arc, Mutex};
 
 use cpal::traits::{DeviceTrait as _, HostTrait as _, StreamTrait as _};
 use rustysynth::{SoundFont, Synthesizer, SynthesizerSettings};
@@ -20,8 +29,125 @@ use crate::timeline::{Hand, Timeline};
 
 /// The largest chunk the callback renders at once; a longer buffer is rendered in several.
 const MAX_FRAMES: usize = 4096;
-/// The channel of a MIDI synthesizer the piano is on.
+/// The channels of the synthesizer the piece and the player are on; both are the piano (preset
+/// 0 of bank 0, a channel's own until told otherwise).
 const CHANNEL: i32 = 0;
+const LIVE_CHANNEL: i32 = 1;
+/// The sustain pedal's controller.
+const PEDAL: i32 = 64;
+/// The buffer the output is asked for, in frames (5.3 ms at 48 kHz): a key struck sounds at the
+/// next buffer. Smaller would gain little and risk gaps on a busy machine; the device's own
+/// range has the last word.
+const LIVE_FRAMES: u32 = 256;
+/// How many keys struck and let go can wait for the callback: hundreds of buffers' worth.
+const LIVE_SLOTS: usize = 256;
+
+/// The keys the player strikes and his pedal, on their way to the audio callback: a ring of
+/// atomics, written on MIDI's threads and read by the callback, which neither locks nor waits.
+/// Clones share it.
+#[derive(Clone)]
+pub struct LiveKeys(Arc<Ring>);
+
+/// What the player does, as the callback reads it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Live {
+    /// A key struck (`velocity` above 0) or let go.
+    Key(u8, u8),
+    /// The sustain pedal's value (64 and above: down).
+    Pedal(u8),
+}
+
+impl Live {
+    /// `key << 8 | velocity` for a key; the pedal is the key byte's top bit, and its value.
+    const PEDAL: u16 = 0x80 << 8;
+
+    fn pack(self) -> u16 {
+        match self {
+            Live::Key(key, velocity) => u16::from(key & 127) << 8 | u16::from(velocity & 127),
+            Live::Pedal(value) => Self::PEDAL | u16::from(value & 127),
+        }
+    }
+
+    fn unpack(packed: u16) -> Self {
+        let low = (packed & 0x7F) as u8;
+        if packed & Self::PEDAL != 0 {
+            Live::Pedal(low)
+        } else {
+            Live::Key((packed >> 8) as u8 & 127, low)
+        }
+    }
+}
+
+struct Ring {
+    /// Each a [`Live`], packed.
+    slots: [AtomicU16; LIVE_SLOTS],
+    /// How many were ever written, and read: a slot is free once read.
+    written: AtomicUsize,
+    read: AtomicUsize,
+    /// The pedal as the player left it last: an output that opens later starts with it.
+    pedal: AtomicU8,
+    /// The writers take turns: the ring has one writer's index, and two writing at once would
+    /// claim the same slot. MIDI in hands the keys of every keyboard on one at a time already,
+    /// but `push` is open to any thread, and a lock is cheap there. Only writers take it; the
+    /// reader (the callback) never does, so the callback stays lock-free.
+    writing: Mutex<()>,
+}
+
+impl Default for LiveKeys {
+    fn default() -> Self {
+        Self(Arc::new(Ring {
+            slots: std::array::from_fn(|_| AtomicU16::new(0)),
+            written: AtomicUsize::new(0),
+            read: AtomicUsize::new(0),
+            pedal: AtomicU8::new(0),
+            writing: Mutex::new(()),
+        }))
+    }
+}
+
+impl LiveKeys {
+    /// A key struck (`velocity` above 0) or let go. Not for the audio callback. A ring that is
+    /// full (no output reads it) drops it: what is not heard now is not to be heard later.
+    pub fn push(&self, key: u8, velocity: u8) -> bool {
+        self.write(Live::Key(key, velocity))
+    }
+
+    /// The sustain pedal moved to `value`; as [`LiveKeys::push`].
+    pub fn push_pedal(&self, value: u8) -> bool {
+        self.0.pedal.store(value & 127, Relaxed);
+        self.write(Live::Pedal(value))
+    }
+
+    fn write(&self, live: Live) -> bool {
+        let ring = &*self.0;
+        let _turn = ring.writing.lock().expect("the live keys' lock");
+        let written = ring.written.load(Relaxed);
+        if written.wrapping_sub(ring.read.load(Acquire)) >= LIVE_SLOTS {
+            return false;
+        }
+        ring.slots[written % LIVE_SLOTS].store(live.pack(), Relaxed);
+        ring.written.store(written.wrapping_add(1), Release);
+        true
+    }
+
+    /// The next thing waiting, for the callback: no lock, no allocation.
+    fn pop(&self) -> Option<Live> {
+        let ring = &*self.0;
+        let read = ring.read.load(Relaxed);
+        if read == ring.written.load(Acquire) {
+            return None;
+        }
+        let packed = ring.slots[read % LIVE_SLOTS].load(Relaxed);
+        ring.read.store(read.wrapping_add(1), Release);
+        Some(Live::unpack(packed))
+    }
+
+    /// Forgets what waits: struck before the output was there, it is not played late.
+    fn discard(&self) {
+        let ring = &*self.0;
+        ring.read.store(ring.written.load(Acquire), Release);
+    }
+}
 
 /// Which hands the computer plays: the other ones are the player's.
 #[derive(Clone)]
@@ -61,8 +187,12 @@ impl Hands {
 pub trait Sink {
     fn note_on(&mut self, key: u8, velocity: u8);
     fn note_off(&mut self, key: u8);
-    /// Lets every sounding note go, with its release.
+    /// Lets every note of the piece go, with its release; none of the player's.
     fn release_all(&mut self);
+    /// The player's own keys and pedal, apart from the piece's.
+    fn live_on(&mut self, key: u8, velocity: u8);
+    fn live_off(&mut self, key: u8);
+    fn live_pedal(&mut self, value: u8);
     /// Fills both channels; they have the same length.
     fn render(&mut self, left: &mut [f32], right: &mut [f32]);
 }
@@ -77,7 +207,19 @@ impl Sink for Synthesizer {
     }
 
     fn release_all(&mut self) {
-        self.note_off_all(false);
+        self.note_off_all_channel(CHANNEL, false);
+    }
+
+    fn live_on(&mut self, key: u8, velocity: u8) {
+        Synthesizer::note_on(self, LIVE_CHANNEL, i32::from(key), i32::from(velocity));
+    }
+
+    fn live_off(&mut self, key: u8) {
+        Synthesizer::note_off(self, LIVE_CHANNEL, i32::from(key));
+    }
+
+    fn live_pedal(&mut self, value: u8) {
+        self.process_midi_message(LIVE_CHANNEL, 0xB0, PEDAL, i32::from(value));
     }
 
     fn render(&mut self, left: &mut [f32], right: &mut [f32]) {
@@ -149,6 +291,8 @@ pub struct Renderer<S: Sink> {
     /// Which notes were struck by the computer and not ended yet: the end of one the computer
     /// did not strike (a hand that is the player's) is none of its business. Made here, once.
     struck: Vec<bool>,
+    /// The keys the player strikes, when this output sounds them.
+    live: Option<LiveKeys>,
 }
 
 impl<S: Sink> Renderer<S> {
@@ -177,8 +321,34 @@ impl<S: Sink> Renderer<S> {
             carry: 0.,
             held: [0; 128],
             struck: vec![false; notes],
+            live: None,
         }
         .following()
+    }
+
+    /// Sounds the keys the player strikes too, from now on, his pedal as he holds it now.
+    pub fn with_live(mut self, live: LiveKeys) -> Self {
+        live.discard();
+        let pedal = live.0.pedal.load(Relaxed);
+        if pedal > 0 {
+            self.sink.live_pedal(pedal);
+        }
+        self.live = Some(live);
+        self
+    }
+
+    /// Plays what the player did since the last buffer, at its start.
+    fn play_live(&mut self) {
+        let Some(live) = &self.live else {
+            return;
+        };
+        while let Some(played) = live.pop() {
+            match played {
+                Live::Key(key, 0) => self.sink.live_off(key),
+                Live::Key(key, velocity) => self.sink.live_on(key, velocity),
+                Live::Pedal(value) => self.sink.live_pedal(value),
+            }
+        }
     }
 
     /// Puts `next` where the clock is.
@@ -188,6 +358,7 @@ impl<S: Sink> Renderer<S> {
         self
     }
 
+    /// Lets the piece's notes go, and none of the player's.
     fn release_all(&mut self) {
         self.held = [0; 128];
         self.struck.fill(false);
@@ -199,6 +370,8 @@ impl<S: Sink> Renderer<S> {
         debug_assert_eq!(left.len(), right.len());
         // From the first buffer on, the clock is this output's: the wall clock stops moving it.
         self.clock.claim();
+        // Playing or not, the keys struck sound.
+        self.play_live();
         let snapshot = self.clock.snapshot();
         if snapshot.seeks != self.seeks {
             // The position jumped: what sounded belongs to the old one.
@@ -265,14 +438,26 @@ pub struct Output {
     _stream: cpal::Stream,
 }
 
-/// Opens the default output and plays the piece on `font` as `clock` moves. Slow (it loads the
-/// synthesizer): not on the main thread.
+/// The buffer asked of a device: [`LIVE_FRAMES`] within what it takes, its own when it does not
+/// say.
+fn buffer_size(supported: &cpal::SupportedBufferSize) -> cpal::BufferSize {
+    match supported {
+        cpal::SupportedBufferSize::Range { min, max } if min <= max => {
+            cpal::BufferSize::Fixed(LIVE_FRAMES.clamp(*min, *max))
+        }
+        _ => cpal::BufferSize::Default,
+    }
+}
+
+/// Opens the default output and plays the piece on `font` as `clock` moves, and the keys the
+/// player strikes (`live`) as they come. Slow (it loads the synthesizer): not on the main thread.
 pub fn start(
     font: &Arc<SoundFont>,
     timeline: &Timeline,
     clock: &Clock,
     hands: &Hands,
     lost: &Arc<AtomicBool>,
+    live: &LiveKeys,
 ) -> Result<Output, String> {
     let device = cpal::default_host()
         .default_output_device()
@@ -282,33 +467,45 @@ pub fn start(
         .map_err(|e| format!("the audio output has no usable setup: {e}"))?;
     let sample_rate = supported.sample_rate();
     let channels = usize::from(supported.channels());
-    let config = cpal::StreamConfig {
-        channels: supported.channels(),
-        sample_rate,
-        // The device's own size: a small one is lower latency, but the clock and the cursor do
-        // not need it, and a size the device refuses is an error.
-        buffer_size: cpal::BufferSize::Default,
-    };
-    let synth = Synthesizer::new(font, &SynthesizerSettings::new(sample_rate as i32))
-        .map_err(|e| format!("cannot start the synthesizer: {e}"))?;
-    let renderer = Renderer::new(
-        synth,
-        events(timeline),
-        clock.clone(),
-        hands.clone(),
-        sample_rate,
-    );
-    let stream = match supported.sample_format() {
-        cpal::SampleFormat::F32 => build::<f32>(&device, config, channels, renderer, lost),
-        cpal::SampleFormat::I16 => build::<i16>(&device, config, channels, renderer, lost),
-        cpal::SampleFormat::U16 => build::<u16>(&device, config, channels, renderer, lost),
-        other => {
-            return Err(format!(
-                "the audio output's sample format ({other}) is not supported"
-            ));
-        }
+    let format = supported.sample_format();
+    if !matches!(
+        format,
+        cpal::SampleFormat::F32 | cpal::SampleFormat::I16 | cpal::SampleFormat::U16
+    ) {
+        return Err(format!(
+            "the audio output's sample format ({format}) is not supported"
+        ));
     }
-    .map_err(|e| format!("cannot open the audio output: {e}"))?;
+    let open = |buffer_size| -> Result<cpal::Stream, String> {
+        let config = cpal::StreamConfig {
+            channels: supported.channels(),
+            sample_rate,
+            buffer_size,
+        };
+        let synth = Synthesizer::new(font, &SynthesizerSettings::new(sample_rate as i32))
+            .map_err(|e| format!("cannot start the synthesizer: {e}"))?;
+        let renderer = Renderer::new(
+            synth,
+            events(timeline),
+            clock.clone(),
+            hands.clone(),
+            sample_rate,
+        )
+        .with_live(live.clone());
+        match format {
+            cpal::SampleFormat::I16 => build::<i16>(&device, config, channels, renderer, lost),
+            cpal::SampleFormat::U16 => build::<u16>(&device, config, channels, renderer, lost),
+            _ => build::<f32>(&device, config, channels, renderer, lost),
+        }
+        .map_err(|e| format!("cannot open the audio output: {e}"))
+    };
+    // A small buffer, for the keys struck to sound at once; the device's own if it refuses it.
+    let small = buffer_size(supported.buffer_size());
+    let stream = match open(small) {
+        Ok(stream) => stream,
+        Err(_) if small != cpal::BufferSize::Default => open(cpal::BufferSize::Default)?,
+        Err(error) => return Err(error),
+    };
     stream
         .play()
         .map_err(|e| format!("cannot start the audio output: {e}"))?;
@@ -370,6 +567,10 @@ mod tests {
         On(u8, usize),
         Off(u8, usize),
         Release(usize),
+        /// The player's, on his own channel.
+        LiveOn(u8, usize),
+        LiveOff(u8, usize),
+        Pedal(u8, usize),
     }
 
     /// Records what is played and at which frame of the whole run.
@@ -388,6 +589,15 @@ mod tests {
         }
         fn release_all(&mut self) {
             self.calls.push(Call::Release(self.frames));
+        }
+        fn live_on(&mut self, key: u8, _: u8) {
+            self.calls.push(Call::LiveOn(key, self.frames));
+        }
+        fn live_off(&mut self, key: u8) {
+            self.calls.push(Call::LiveOff(key, self.frames));
+        }
+        fn live_pedal(&mut self, value: u8) {
+            self.calls.push(Call::Pedal(value, self.frames));
         }
         fn render(&mut self, left: &mut [f32], right: &mut [f32]) {
             assert_eq!(left.len(), right.len());
@@ -623,6 +833,167 @@ mod tests {
         assert_eq!(
             renderer.sink.calls,
             [Call::On(62, 1000), Call::Off(62, 1100)]
+        );
+    }
+
+    fn live_rig(notes: Vec<Note>) -> (Renderer<Recorder>, Clock, LiveKeys) {
+        let (renderer, clock, _) = rig(notes);
+        let live = LiveKeys::default();
+        (renderer.with_live(live.clone()), clock, live)
+    }
+
+    #[test]
+    fn a_key_struck_sounds_at_the_next_buffer_with_no_piece_playing() {
+        let (mut renderer, clock, live) = live_rig(vec![]);
+        assert!(live.push(64, 100));
+        run(&mut renderer, 1, 100);
+        assert_eq!(renderer.sink.calls, [Call::LiveOn(64, 0)]);
+        live.push(64, 0);
+        run(&mut renderer, 1, 100);
+        assert_eq!(renderer.sink.calls[1..], [Call::LiveOff(64, 100)]);
+        // The clock did not move: nothing plays the piece.
+        assert_eq!(clock.snapshot().position_us, 0);
+    }
+
+    #[test]
+    fn the_piece_and_the_player_end_their_own_notes_on_one_key() {
+        let (mut renderer, clock, live) = live_rig(vec![note(60, 0., 150., Hand::Right)]);
+        clock.play();
+        run(&mut renderer, 1, 100);
+        live.push(60, 90);
+        run(&mut renderer, 1, 100);
+        // The piece's note ends at 150 ms, on its own channel: the player's key goes on.
+        assert_eq!(
+            renderer.sink.calls,
+            [Call::On(60, 0), Call::LiveOn(60, 100), Call::Off(60, 150)]
+        );
+        live.push(60, 0);
+        run(&mut renderer, 1, 100);
+        assert_eq!(renderer.sink.calls[3..], [Call::LiveOff(60, 200)]);
+    }
+
+    #[test]
+    fn a_pause_or_a_seek_lets_the_piece_go_and_not_the_player() {
+        let (mut renderer, clock, live) = live_rig(vec![note(60, 0., 900., Hand::Right)]);
+        clock.play();
+        live.push(72, 90);
+        live.push_pedal(127);
+        run(&mut renderer, 1, 100);
+        clock.pause();
+        run(&mut renderer, 1, 100);
+        clock.play();
+        clock.seek_ms(500.);
+        run(&mut renderer, 1, 100);
+        assert_eq!(
+            renderer.sink.calls,
+            [
+                Call::LiveOn(72, 0),
+                Call::Pedal(127, 0),
+                Call::On(60, 0),
+                Call::Release(100),
+                Call::Release(200),
+            ]
+        );
+    }
+
+    #[test]
+    fn the_pedal_goes_to_the_player_at_the_next_buffer() {
+        let (mut renderer, _, live) = live_rig(vec![]);
+        assert!(live.push_pedal(100));
+        live.push(60, 80);
+        live.push(60, 0);
+        run(&mut renderer, 1, 100);
+        live.push_pedal(0);
+        run(&mut renderer, 1, 100);
+        assert_eq!(
+            renderer.sink.calls,
+            [
+                Call::Pedal(100, 0),
+                Call::LiveOn(60, 0),
+                Call::LiveOff(60, 0),
+                Call::Pedal(0, 100),
+            ]
+        );
+    }
+
+    #[test]
+    fn an_output_that_opens_with_the_pedal_down_starts_with_it() {
+        let live = LiveKeys::default();
+        live.push_pedal(127);
+        let (renderer, _, _) = rig(vec![]);
+        let renderer = renderer.with_live(live.clone());
+        assert_eq!(renderer.sink.calls, [Call::Pedal(127, 0)]);
+        live.push_pedal(0);
+        let (renderer, _, _) = rig(vec![]);
+        assert_eq!(renderer.with_live(live).sink.calls, []);
+    }
+
+    #[test]
+    fn what_the_player_does_is_packed_and_read_back_whole() {
+        for live in [
+            Live::Key(0, 0),
+            Live::Key(127, 127),
+            Live::Key(60, 1),
+            Live::Pedal(0),
+            Live::Pedal(64),
+            Live::Pedal(127),
+        ] {
+            assert_eq!(Live::unpack(live.pack()), live);
+        }
+    }
+
+    #[test]
+    fn keys_struck_before_the_output_was_there_are_not_played_late() {
+        let live = LiveKeys::default();
+        live.push(60, 90);
+        let (renderer, _, _) = rig(vec![]);
+        let mut renderer = renderer.with_live(live.clone());
+        run(&mut renderer, 1, 100);
+        assert_eq!(renderer.sink.calls, []);
+        live.push(62, 90);
+        run(&mut renderer, 1, 100);
+        assert_eq!(renderer.sink.calls, [Call::LiveOn(62, 100)]);
+    }
+
+    #[test]
+    fn the_ring_drops_what_no_one_reads_and_goes_round() {
+        let live = LiveKeys::default();
+        for _ in 0..LIVE_SLOTS {
+            assert!(live.push(60, 90));
+        }
+        assert!(!live.push(61, 90), "full");
+        live.discard();
+        assert_eq!(live.pop(), None);
+        // Many times round, from other threads, nothing lost or changed.
+        let writer = live.clone();
+        let thread = std::thread::spawn(move || {
+            for n in 0..10_000u32 {
+                while !writer.push((n % 128) as u8, (n % 127 + 1) as u8) {
+                    std::thread::yield_now();
+                }
+            }
+        });
+        let mut n = 0u32;
+        while n < 10_000 {
+            if let Some(got) = live.pop() {
+                assert_eq!(got, Live::Key((n % 128) as u8, (n % 127 + 1) as u8));
+                n += 1;
+            }
+        }
+        thread.join().unwrap();
+        assert_eq!(live.pop(), None);
+    }
+
+    #[test]
+    fn the_buffer_asked_for_is_small_within_what_the_device_takes() {
+        use cpal::{BufferSize, SupportedBufferSize};
+        let range = |min, max| buffer_size(&SupportedBufferSize::Range { min, max });
+        assert_eq!(range(64, 8192), BufferSize::Fixed(LIVE_FRAMES));
+        assert_eq!(range(512, 8192), BufferSize::Fixed(512));
+        assert_eq!(range(16, 128), BufferSize::Fixed(128));
+        assert_eq!(
+            buffer_size(&SupportedBufferSize::Unknown),
+            BufferSize::Default
         );
     }
 

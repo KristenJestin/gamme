@@ -1,5 +1,5 @@
 //! The on-screen keyboard: which keys it shows, where each one is, and the keys lit from outside
-//! the piece, the ones the player strikes (MIDI in, #14), drawn in the hit colour.
+//! the piece, the ones the player strikes (MIDI in, `midi_in.rs`), drawn in the hit colour.
 //!
 //! [`Lights`] are atomics, so that a thread reading a MIDI keyboard can light and put out keys
 //! without waiting for the window; the falling notes (`falling.rs`) draw the keyboard with them
@@ -98,26 +98,12 @@ impl Default for Lights {
 }
 
 impl Lights {
-    #[cfg_attr(
-        not(test),
-        expect(
-            dead_code,
-            reason = "the keys the player strikes come with MIDI in (#14)"
-        )
-    )]
     pub fn press(&self, key: u8) {
         if let Some(light) = self.0.get(usize::from(key)) {
             light.store(true, Relaxed);
         }
     }
 
-    #[cfg_attr(
-        not(test),
-        expect(
-            dead_code,
-            reason = "the keys the player strikes come with MIDI in (#14)"
-        )
-    )]
     pub fn release(&self, key: u8) {
         if let Some(light) = self.0.get(usize::from(key)) {
             light.store(false, Relaxed);

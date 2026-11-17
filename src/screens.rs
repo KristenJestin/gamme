@@ -3,14 +3,17 @@
 //! the way back of either (or Escape) comes home, whose list is read again (the piece played is
 //! now first).
 //!
-//! The toasts are the window's: one stack above whichever screen shows.
+//! The toasts are the window's: one stack above whichever screen shows; MIDI in (`midi_in.rs`)
+//! too, which listens to the keyboards for as long as the window is open, whichever screen shows.
 
 use std::sync::Arc;
 
 use gpui_design_system::ToastStack;
 use gpui_kit::*;
 
+use crate::config;
 use crate::home::{self, Home};
+use crate::midi_in::MidiIn;
 use crate::midi_out::{Alsa, Ports};
 use crate::play_screen::{self, Opening, PlayScreen};
 use crate::settings::{self, SettingsPage};
@@ -32,6 +35,8 @@ pub struct Screens {
     screen: Screen,
     /// The machine's MIDI ports, one client for the screens that list or use them.
     ports: Arc<dyn Ports>,
+    /// The player's keyboards, to the play screen; the settings page chooses which.
+    midi_in: MidiIn,
     toasts: Entity<ToastStack>,
     _open: Subscription,
     _open_settings: Subscription,
@@ -53,10 +58,14 @@ impl Screens {
             cx.subscribe_in(&home, window, |this, _, home::OpenSettings, window, cx| {
                 this.settings(window, cx)
             });
+        let ports: Arc<dyn Ports> = Arc::new(Alsa::default());
+        // The settings are a file read: on MIDI in's own thread.
+        let midi_in = MidiIn::start(ports.clone(), || config::load().0.midi_in);
         let mut screens = Self {
             home,
             screen: Screen::Home,
-            ports: Arc::new(Alsa::default()),
+            ports,
+            midi_in,
             toasts,
             _open: open,
             _open_settings: open_settings,
@@ -68,8 +77,8 @@ impl Screens {
     }
 
     fn play(&mut self, opening: Opening, window: &mut Window, cx: &mut Context<Self>) {
-        let ports = self.ports.clone();
-        let screen = cx.new(|cx| PlayScreen::new(opening, ports, window, cx));
+        let (ports, midi_in) = (self.ports.clone(), self.midi_in.clone());
+        let screen = cx.new(|cx| PlayScreen::new(opening, ports, &midi_in, window, cx));
         let back = cx.subscribe(&screen, |this, _, play_screen::Back, cx| this.home(cx));
         self.screen = Screen::Play {
             screen,
@@ -79,8 +88,8 @@ impl Screens {
     }
 
     fn settings(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let ports = self.ports.clone();
-        let screen = cx.new(|cx| SettingsPage::new(ports, window, cx));
+        let (ports, midi_in) = (self.ports.clone(), self.midi_in.clone());
+        let screen = cx.new(|cx| SettingsPage::new(ports, midi_in, window, cx));
         let back = cx.subscribe(&screen, |this, _, settings::Back, cx| this.home(cx));
         self.screen = Screen::Settings {
             screen,

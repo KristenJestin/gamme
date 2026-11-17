@@ -145,7 +145,7 @@ fn sound_text(
             format!("The {output} could not be opened: {message}")
         }
         (Sound::Off, _, None) => format!(
-            "The built-in piano ({}) is downloaded the first time you play.",
+            "The built-in piano ({}) is downloaded the first time you play or strike a key.",
             font.name
         ),
         (Sound::Preparing, Stage::Downloading, None) => format!(

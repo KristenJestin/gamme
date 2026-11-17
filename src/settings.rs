@@ -18,6 +18,7 @@ use gpui_design_system::{
 use gpui_kit::*;
 
 use crate::config::{self, Settings};
+use crate::midi_in::MidiIn;
 use crate::midi_out::{self, PortInfo, Ports};
 use crate::{appearance, paths, soundfont};
 
@@ -72,6 +73,8 @@ pub struct Back;
 pub struct SettingsPage {
     focus: FocusHandle,
     ports: Arc<dyn Ports>,
+    /// Told at once of the input chosen.
+    midi_in: MidiIn,
     config: Option<PathBuf>,
     settings: Settings,
     /// Whether the kept settings were read: nothing is chosen before, or the defaults shown
@@ -89,7 +92,12 @@ pub struct SettingsPage {
 impl EventEmitter<Back> for SettingsPage {}
 
 impl SettingsPage {
-    pub fn new(ports: Arc<dyn Ports>, window: &mut Window, cx: &mut Context<Self>) -> Self {
+    pub fn new(
+        ports: Arc<dyn Ports>,
+        midi_in: MidiIn,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Self {
         // For Escape.
         let focus = cx.focus_handle();
         window.focus(&focus, cx);
@@ -97,6 +105,7 @@ impl SettingsPage {
         let mut page = Self {
             focus,
             ports,
+            midi_in,
             config,
             settings: Settings::default(),
             read: false,
@@ -192,6 +201,7 @@ impl SettingsPage {
 
     fn choose_input(&mut self, port: Option<String>, cx: &mut Context<Self>) {
         if self.read && self.settings.midi_in != port {
+            self.midi_in.choose(port.clone());
             self.settings.midi_in = port;
             self.keep(cx);
         }
