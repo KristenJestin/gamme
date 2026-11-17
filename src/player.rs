@@ -10,6 +10,9 @@
 //! An output that cannot be opened, or that is lost while the piece plays (a MIDI port unplugged),
 //! gives way to its [`Audio::fallback`] when it has one: the piece goes on from where it stood and
 //! [`Player::notice`] says what happened.
+//!
+//! The keys the player strikes (MIDI in) sound on the same output, through [`Player::keys`]:
+//! [`Player::warm`] opens it without playing, so that they sound before the piece does.
 
 use std::any::Any;
 use std::fs::File;
@@ -70,10 +73,18 @@ pub trait Audio: Send + Sync {
     fn fallback(&self) -> Option<Arc<dyn Audio>> {
         None
     }
+
+    /// A key the player strikes (`velocity` above 0) or lets go, on the input port `from` (its
+    /// id), sounded on the output open now; nothing when none is. Called on MIDI's threads.
+    fn live(&self, _key: u8, _velocity: u8, _from: &str) {}
 }
 
 /// The built-in piano: `rustysynth` on the default output.
-pub struct Builtin;
+#[derive(Default)]
+pub struct Builtin {
+    /// The player's keys, read by the output each one opens.
+    keys: piano::LiveKeys,
+}
 
 impl Audio for Builtin {
     fn open(
@@ -87,8 +98,23 @@ impl Audio for Builtin {
         let file = File::open(soundfont).map_err(|e| format!("cannot open the SoundFont: {e}"))?;
         let font = RustySoundFont::new(&mut BufReader::new(file))
             .map_err(|e| format!("cannot read the SoundFont: {e}"))?;
-        let output = piano::start(&Arc::new(font), timeline, clock, hands, lost)?;
+        let output = piano::start(&Arc::new(font), timeline, clock, hands, lost, &self.keys)?;
         Ok(Box::new(output))
+    }
+
+    fn live(&self, key: u8, velocity: u8, _from: &str) {
+        self.keys.push(key, velocity);
+    }
+}
+
+/// The keys the player strikes, to the player's output, whichever it is now (the one chosen or
+/// the built-in piano that took over). Cloned to MIDI in's threads.
+#[derive(Clone)]
+pub struct Keys(Arc<Shared>);
+
+impl Keys {
+    pub fn note(&self, key: u8, velocity: u8, from: &str) {
+        self.0.audio().live(key, velocity, from);
     }
 }
 
@@ -192,6 +218,22 @@ impl Player {
 
     pub fn font(&self) -> &Font {
         &self.font
+    }
+
+    /// Where the keys the player strikes go to be heard.
+    pub fn keys(&self) -> Keys {
+        Keys(self.shared.clone())
+    }
+
+    /// Makes the output ready without playing, if nothing was asked of it yet: the keys the
+    /// player strikes are heard before the piece plays.
+    pub fn warm(&self) {
+        let mut sound = self.shared.sound.lock().expect("the sound's lock");
+        if *sound == Sound::Off {
+            *sound = Sound::Preparing;
+            drop(sound);
+            self.prepare();
+        }
     }
 
     /// Whether the piece is playing, or will as soon as the piano is ready.
@@ -465,6 +507,8 @@ mod tests {
     struct Opened {
         paths: Mutex<Vec<PathBuf>>,
         lost: Mutex<Option<Arc<AtomicBool>>>,
+        /// The player's keys it was given.
+        keys: Mutex<Vec<(u8, u8)>>,
     }
 
     impl Opened {
@@ -472,6 +516,7 @@ mod tests {
             Arc::new(Self {
                 paths: Mutex::new(Vec::new()),
                 lost: Mutex::new(None),
+                keys: Mutex::new(Vec::new()),
             })
         }
     }
@@ -488,6 +533,10 @@ mod tests {
             self.paths.lock().unwrap().push(path.to_owned());
             *self.lost.lock().unwrap() = Some(lost.clone());
             Ok(Box::new(()))
+        }
+
+        fn live(&self, key: u8, velocity: u8, _: &str) {
+            self.keys.lock().unwrap().push((key, velocity));
         }
     }
 
@@ -686,6 +735,56 @@ mod tests {
     }
 
     #[test]
+    fn a_warm_player_opens_its_output_without_playing_and_once() {
+        let data = temp("player-warm");
+        let audio = Opened::new();
+        let mut player = Player::new(
+            timeline(),
+            data.clone(),
+            font(),
+            Arc::new(Serves(Arc::new(AtomicBool::new(true)))),
+            audio.clone(),
+        );
+        player.warm();
+        until("the piano", || player.sound() == Sound::Ready);
+        assert!(!player.clock.playing());
+        assert!(!player.wants_to_play());
+        // Warm again, or play: the output that is open stays.
+        player.warm();
+        player.play();
+        assert!(player.clock.playing());
+        assert_eq!(audio.paths.lock().unwrap().len(), 1);
+        let _ = std::fs::remove_dir_all(data);
+    }
+
+    #[test]
+    fn the_keys_struck_go_to_the_output_in_place_now() {
+        let data = temp("player-keys");
+        let piano = Opened::new();
+        let midi = Midi::new(piano.clone(), false);
+        let mut player = Player::new(
+            timeline(),
+            data.clone(),
+            font(),
+            Arc::new(Serves(Arc::new(AtomicBool::new(true)))),
+            midi.clone(),
+        );
+        let keys = player.keys();
+        player.play();
+        until("the output", || player.sound() == Sound::Ready);
+        keys.note(60, 90, "24:0");
+        assert_eq!(*midi.keys.lock().unwrap(), [(60, 90)]);
+        // The MIDI output is lost: the built-in piano that takes over gets them.
+        let (lost, _) = midi.opened.lock().unwrap().clone().unwrap();
+        lost.store(true, Relaxed);
+        until("the built-in piano", || player.sound() == Sound::Ready);
+        keys.note(60, 0, "24:0");
+        assert_eq!(*piano.keys.lock().unwrap(), [(60, 0)]);
+        assert_eq!(midi.keys.lock().unwrap().len(), 1);
+        let _ = std::fs::remove_dir_all(data);
+    }
+
+    #[test]
     fn seek_and_speed_reach_the_clock() {
         let mut player = Player::new(
             timeline(),
@@ -720,6 +819,7 @@ mod tests {
         /// Whether the port is not there.
         absent: bool,
         opened: Mutex<Option<(Arc<AtomicBool>, Arc<AtomicBool>)>>,
+        keys: Mutex<Vec<(u8, u8)>>,
     }
 
     impl Midi {
@@ -728,6 +828,7 @@ mod tests {
                 fallback,
                 absent,
                 opened: Mutex::new(None),
+                keys: Mutex::new(Vec::new()),
             })
         }
     }
@@ -760,6 +861,10 @@ mod tests {
 
         fn fallback(&self) -> Option<Arc<dyn Audio>> {
             Some(self.fallback.clone())
+        }
+
+        fn live(&self, key: u8, velocity: u8, _: &str) {
+            self.keys.lock().unwrap().push((key, velocity));
         }
     }
 

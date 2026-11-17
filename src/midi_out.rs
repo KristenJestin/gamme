@@ -20,8 +20,11 @@
 //! Each output has its own `lost` flag (`player.rs`), so that one that is closing cannot say the
 //! output that took its place is lost.
 //!
+//! The player's keys (MIDI in, `midi_in.rs`) go out through [`Audio::live`], except those of the
+//! very piano the piece goes to: it sounds its own keys already.
+//!
 //! The MIDI library (`midir`, on ALSA) is behind [`Ports`] and [`Wire`], so that the tests open
-//! no real port.
+//! no real port. [`Ports`] connects the input ports too, for MIDI in.
 
 use std::any::Any;
 use std::path::Path;
@@ -37,7 +40,7 @@ use crate::player::Audio;
 use crate::timeline::Timeline;
 
 /// The name Gamme gives its MIDI clients.
-const CLIENT: &str = "Gamme";
+pub const CLIENT: &str = "Gamme";
 /// The MIDI channel the piece is on (the first).
 const CHANNEL: u8 = 0;
 /// The renderer runs at this rate: one frame is one millisecond.
@@ -93,27 +96,67 @@ pub fn find<'a>(ports: &'a [PortInfo], saved: &str) -> Option<&'a PortInfo> {
         .or_else(|| ports.iter().find(|port| port.key() == saved))
 }
 
+/// The client of a port, from its id ("20:0"): the device it belongs to.
+fn client(id: &str) -> &str {
+    id.split_once(':').map_or(id, |(client, _)| client)
+}
+
 /// An open connection to a MIDI output.
 pub trait Wire: Send {
     fn send(&mut self, message: &[u8]) -> Result<(), String>;
 }
 
+/// What an input port sends, as it comes, on the MIDI library's own thread.
+pub type OnMessage = Box<dyn FnMut(&[u8]) + Send>;
+
 /// The MIDI ports of the machine.
 pub trait Ports: Send + Sync {
     fn outputs(&self) -> Vec<PortInfo>;
-    fn inputs(&self) -> Vec<PortInfo>;
+    /// The input ports; none when the system's MIDI cannot be asked: not knowing is never taken
+    /// for there being none.
+    fn input_list(&self) -> Option<Vec<PortInfo>>;
+    fn inputs(&self) -> Vec<PortInfo> {
+        self.input_list().unwrap_or_default()
+    }
     fn connect_output(&self, port: &PortInfo) -> Result<Box<dyn Wire>, String>;
+    /// Listens to an input port: `on_message` is given each message until the connection that
+    /// comes back is dropped, which waits for the library's thread to be done with it.
+    fn connect_input(
+        &self,
+        port: &PortInfo,
+        on_message: OnMessage,
+    ) -> Result<Box<dyn Send>, String>;
     /// Whether `port` is still listed; none when that cannot be told (the system's MIDI cannot be
     /// asked): not knowing is never taken for the port being gone.
     fn present(&self, port: &PortInfo) -> Option<bool>;
 }
 
 /// The real ports, through ALSA. Listing is done through one client of each kind, kept: opening
-/// one is a sequencer client other MIDI software sees come and go.
+/// one is a sequencer client other MIDI software sees come and go. A connection to an input
+/// takes a client of its own (`midir` wants it so), given back when it closes and kept for the
+/// next one.
 #[derive(Default)]
 pub struct Alsa {
     output: Mutex<Option<midir::MidiOutput>>,
     input: Mutex<Option<midir::MidiInput>>,
+    spare_inputs: Arc<Mutex<Vec<midir::MidiInput>>>,
+}
+
+/// A connection to an input port; dropped, it gives its client back.
+struct AlsaInput {
+    connection: Option<midir::MidiInputConnection<()>>,
+    spare: Arc<Mutex<Vec<midir::MidiInput>>>,
+}
+
+impl Drop for AlsaInput {
+    fn drop(&mut self) {
+        if let Some(connection) = self.connection.take() {
+            let (client, ()) = connection.close();
+            if let Ok(mut spare) = self.spare.lock() {
+                spare.push(client);
+            }
+        }
+    }
 }
 
 impl Alsa {
@@ -146,26 +189,71 @@ impl Ports for Alsa {
         self.on_output(output_ports).unwrap_or_default()
     }
 
-    fn inputs(&self) -> Vec<PortInfo> {
-        let Ok(mut client) = self.input.lock() else {
-            return Vec::new();
-        };
+    fn input_list(&self) -> Option<Vec<PortInfo>> {
+        let mut client = self.input.lock().ok()?;
         if client.is_none() {
             *client = midir::MidiInput::new(CLIENT).ok();
         }
-        let Some(client) = client.as_ref() else {
-            return Vec::new();
-        };
-        client
-            .ports()
-            .iter()
-            .filter_map(|port| {
-                Some(PortInfo {
-                    id: port.id(),
-                    name: client.port_name(port).ok()?,
+        let client = client.as_ref()?;
+        Some(
+            client
+                .ports()
+                .iter()
+                .filter_map(|port| {
+                    Some(PortInfo {
+                        id: port.id(),
+                        name: client.port_name(port).ok()?,
+                    })
                 })
-            })
-            .collect()
+                .collect(),
+        )
+    }
+
+    fn connect_input(
+        &self,
+        port: &PortInfo,
+        mut on_message: OnMessage,
+    ) -> Result<Box<dyn Send>, String> {
+        let spare = self
+            .spare_inputs
+            .lock()
+            .ok()
+            .and_then(|mut spare| spare.pop());
+        let mut input = match spare {
+            Some(input) => input,
+            None => {
+                midir::MidiInput::new(CLIENT).map_err(|e| format!("cannot start MIDI in: {e}"))?
+            }
+        };
+        // Only what a key does: no clock, no active sensing, no SysEx to wake for.
+        input.ignore(midir::Ignore::All);
+        let Some(found) = input.find_port_by_id(&port.id) else {
+            if let Ok(mut spare) = self.spare_inputs.lock() {
+                spare.push(input);
+            }
+            return Err(format!(
+                "the MIDI input “{}” is not there any more",
+                port.name
+            ));
+        };
+        match input.connect(
+            &found,
+            "Gamme in",
+            move |_, message, _| on_message(message),
+            (),
+        ) {
+            Ok(connection) => Ok(Box::new(AlsaInput {
+                connection: Some(connection),
+                spare: self.spare_inputs.clone(),
+            })),
+            Err(error) => {
+                let why = format!("cannot connect to “{}”: {error}", port.name);
+                if let Ok(mut spare) = self.spare_inputs.lock() {
+                    spare.push(error.into_inner());
+                }
+                Err(why)
+            }
+        }
     }
 
     fn present(&self, port: &PortInfo) -> Option<bool> {
@@ -196,6 +284,8 @@ impl Wire for midir::MidiOutputConnection {
 struct Link {
     state: Mutex<State>,
     lost: Arc<AtomicBool>,
+    /// The device the port belongs to (`client`).
+    device: String,
 }
 
 struct State {
@@ -208,7 +298,7 @@ struct State {
 }
 
 impl Link {
-    fn new(wire: Box<dyn Wire>, lost: Arc<AtomicBool>) -> Self {
+    fn new(wire: Box<dyn Wire>, lost: Arc<AtomicBool>, port: &PortInfo) -> Self {
         Self {
             state: Mutex::new(State {
                 wire,
@@ -217,6 +307,7 @@ impl Link {
                 closed: false,
             }),
             lost,
+            device: client(&port.id).to_owned(),
         }
     }
 
@@ -338,20 +429,17 @@ impl Live {
         self.0.lock().expect("the live keys' lock").clone()
     }
 
-    #[cfg_attr(
-        not(test),
-        expect(dead_code, reason = "MIDI in (#14) sends the player's keys through it")
-    )]
+    /// Whether the input port `from` is a port of the device the output is open on.
+    fn same_device(&self, from: &str) -> bool {
+        self.link().is_some_and(|link| link.device == client(from))
+    }
+
     pub fn note_on(&self, key: u8, velocity: u8) {
         if let Some(link) = self.link() {
             link.live_on(key, velocity);
         }
     }
 
-    #[cfg_attr(
-        not(test),
-        expect(dead_code, reason = "MIDI in (#14) sends the player's keys through it")
-    )]
     pub fn note_off(&self, key: u8) {
         if let Some(link) = self.link() {
             link.live_off(key);
@@ -496,10 +584,8 @@ impl MidiOut {
         }
     }
 
-    #[cfg_attr(
-        not(test),
-        expect(dead_code, reason = "MIDI in (#14) sends the player's keys through it")
-    )]
+    /// What `Audio::live` sends through, for the tests to hold apart from the output.
+    #[cfg(test)]
     pub fn live(&self) -> Live {
         self.live.clone()
     }
@@ -519,7 +605,7 @@ impl Audio for MidiOut {
             .ok_or_else(|| "it is not connected".to_owned())?
             .clone();
         let wire = self.ports.connect_output(&port)?;
-        let link = Arc::new(Link::new(wire, lost.clone()));
+        let link = Arc::new(Link::new(wire, lost.clone(), &port));
         let renderer = Renderer::new(
             MidiSink(link.clone()),
             piano::events(timeline),
@@ -568,6 +654,19 @@ impl Audio for MidiOut {
     fn fallback(&self) -> Option<Arc<dyn Audio>> {
         Some(self.fallback.clone())
     }
+
+    fn live(&self, key: u8, velocity: u8, from: &str) {
+        // A digital piano that is both the keyboard and the output sounds its keys itself: sent
+        // back, each would sound twice.
+        if self.live.same_device(from) {
+            return;
+        }
+        if velocity > 0 {
+            self.live.note_on(key, velocity);
+        } else {
+            self.live.note_off(key);
+        }
+    }
 }
 
 /// Ports that are not real, for the tests of this module and of the ones that use it.
@@ -575,10 +674,32 @@ impl Audio for MidiOut {
 pub mod testing {
     use super::*;
 
+    /// An input connected to, as `connect_input` left it.
+    struct Listening {
+        port: PortInfo,
+        on_message: OnMessage,
+        /// Cleared when the connection is dropped.
+        open: Arc<AtomicBool>,
+    }
+
+    /// What `connect_input` hands back: dropped, the input is not listened to any more.
+    struct FakeConnection(Arc<AtomicBool>);
+
+    impl Drop for FakeConnection {
+        fn drop(&mut self) {
+            self.0.store(false, Relaxed);
+        }
+    }
+
     /// A machine with these ports (names as ALSA says them), whose wires record what is sent.
+    /// Its inputs are numbered from 40 ("40:0"), its outputs from 20.
     pub struct FakePorts {
         outputs: Mutex<Vec<String>>,
-        inputs: Vec<String>,
+        inputs: Mutex<Vec<PortInfo>>,
+        listening: Mutex<Vec<Listening>>,
+        input_connections: Mutex<u32>,
+        /// Whether connecting to an input fails.
+        refuse_inputs: AtomicBool,
         sent: Arc<Mutex<Vec<Vec<u8>>>>,
         /// Whether the wires refuse what they are sent, as a port that went does.
         broken: Arc<AtomicBool>,
@@ -589,9 +710,20 @@ pub mod testing {
 
     impl FakePorts {
         pub fn new(outputs: &[&str], inputs: &[&str]) -> Self {
+            let inputs = inputs
+                .iter()
+                .enumerate()
+                .map(|(at, name)| PortInfo {
+                    id: format!("{}:0", 40 + at),
+                    name: (*name).to_owned(),
+                })
+                .collect();
             Self {
                 outputs: Mutex::new(outputs.iter().map(|name| (*name).to_owned()).collect()),
-                inputs: inputs.iter().map(|name| (*name).to_owned()).collect(),
+                inputs: Mutex::new(inputs),
+                listening: Mutex::new(Vec::new()),
+                input_connections: Mutex::new(0),
+                refuse_inputs: AtomicBool::new(false),
                 sent: Arc::default(),
                 broken: Arc::default(),
                 connections: Mutex::new(0),
@@ -599,9 +731,56 @@ pub mod testing {
             }
         }
 
-        /// The list of ports cannot be read from now on.
+        /// The list of ports cannot be read from now on, or again.
         pub fn cannot_look(&self) {
             self.unknown.store(true, Relaxed);
+        }
+
+        pub fn can_look(&self) {
+            self.unknown.store(false, Relaxed);
+        }
+
+        /// An input port appears, with this id ("client:port").
+        pub fn plug_input(&self, name: &str, id: &str) {
+            self.inputs.lock().unwrap().push(PortInfo {
+                id: id.to_owned(),
+                name: name.to_owned(),
+            });
+        }
+
+        /// The input port named so is unplugged: not listed any more, and silent.
+        pub fn unplug_input(&self, name: &str) {
+            self.inputs.lock().unwrap().retain(|port| port.name != name);
+        }
+
+        /// Connecting to an input fails from now on, or works again.
+        pub fn refuse_inputs(&self, refuse: bool) {
+            self.refuse_inputs.store(refuse, Relaxed);
+        }
+
+        pub fn input_connections(&self) -> u32 {
+            *self.input_connections.lock().unwrap()
+        }
+
+        /// The names of the inputs listened to now.
+        pub fn listened(&self) -> Vec<String> {
+            let mut listening = self.listening.lock().unwrap();
+            listening.retain(|input| input.open.load(Relaxed));
+            listening
+                .iter()
+                .map(|input| input.port.name.clone())
+                .collect()
+        }
+
+        /// The input port named so sends `message`, if it is listened to; whether it was.
+        pub fn send_from(&self, name: &str, message: &[u8]) -> bool {
+            let mut listening = self.listening.lock().unwrap();
+            listening.retain(|input| input.open.load(Relaxed));
+            let Some(input) = listening.iter_mut().find(|input| input.port.name == name) else {
+                return false;
+            };
+            (input.on_message)(message);
+            true
         }
 
         /// What was sent to the wires so far.
@@ -655,8 +834,29 @@ pub mod testing {
             infos(&self.outputs.lock().unwrap())
         }
 
-        fn inputs(&self) -> Vec<PortInfo> {
-            infos(&self.inputs)
+        fn input_list(&self) -> Option<Vec<PortInfo>> {
+            if self.unknown.load(Relaxed) {
+                return None;
+            }
+            Some(self.inputs.lock().unwrap().clone())
+        }
+
+        fn connect_input(
+            &self,
+            port: &PortInfo,
+            on_message: OnMessage,
+        ) -> Result<Box<dyn Send>, String> {
+            *self.input_connections.lock().unwrap() += 1;
+            if self.refuse_inputs.load(Relaxed) {
+                return Err(format!("cannot connect to “{}”", port.name));
+            }
+            let open = Arc::new(AtomicBool::new(true));
+            self.listening.lock().unwrap().push(Listening {
+                port: port.clone(),
+                on_message,
+                open: open.clone(),
+            });
+            Ok(Box::new(FakeConnection(open)))
         }
 
         fn present(&self, port: &PortInfo) -> Option<bool> {
@@ -727,7 +927,11 @@ mod tests {
     }
 
     fn open_with(ports: Arc<FakePorts>, saved: &str, hands: Hands) -> Result<Opened, String> {
-        let midi = MidiOut::new(ports.clone(), saved.to_owned(), Arc::new(Builtin));
+        let midi = MidiOut::new(
+            ports.clone(),
+            saved.to_owned(),
+            Arc::new(Builtin::default()),
+        );
         let timeline = timeline();
         let clock = Clock::new(timeline.duration_ms());
         let lost = Arc::new(AtomicBool::new(false));
@@ -891,7 +1095,7 @@ mod tests {
         let midi = MidiOut::new(
             ports.clone(),
             "Digital Piano MIDI 1".into(),
-            Arc::new(Builtin),
+            Arc::new(Builtin::default()),
         );
         let clock = Clock::new(timeline.duration_ms());
         let lost = Arc::new(AtomicBool::new(false));
@@ -964,6 +1168,21 @@ mod tests {
     }
 
     #[test]
+    fn the_players_keys_go_out_but_not_back_to_the_piano_they_come_from() {
+        let opened = opened();
+        // A keyboard of its own (client 40): the piano answers it.
+        Audio::live(&opened.midi, 72, 100, "40:0");
+        Audio::live(&opened.midi, 72, 0, "40:0");
+        assert_eq!(opened.count(NOTE_ON, 72), 1);
+        assert_eq!(opened.count(NOTE_OFF, 72), 1);
+        // The piano's own keys (its input is client 20 too, as the output): it sounds them.
+        Audio::live(&opened.midi, 74, 100, "20:1");
+        Audio::live(&opened.midi, 74, 0, "20:1");
+        assert_eq!(opened.count(NOTE_ON, 74), 0);
+        assert_eq!(opened.count(NOTE_OFF, 74), 0);
+    }
+
+    #[test]
     fn a_live_key_that_comes_late_after_the_close_sounds_nowhere() {
         let opened = opened();
         let live = opened.midi.live();
@@ -1010,7 +1229,11 @@ mod tests {
             .unwrap();
         assert_eq!(error, "it is not connected");
         assert_eq!(ports.connections(), 0);
-        let midi = MidiOut::new(ports, "Digital Piano MIDI 1".into(), Arc::new(Builtin));
+        let midi = MidiOut::new(
+            ports,
+            "Digital Piano MIDI 1".into(),
+            Arc::new(Builtin::default()),
+        );
         assert!(midi.fallback().is_some());
         assert!(!midi.needs_soundfont());
         assert_eq!(midi.label().unwrap(), "MIDI output “Digital Piano MIDI 1”");

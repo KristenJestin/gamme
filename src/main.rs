@@ -8,6 +8,7 @@ mod home;
 mod icons;
 mod keyboard;
 mod library;
+mod midi_in;
 mod midi_out;
 mod paths;
 mod piano;

@@ -8,9 +8,16 @@
 //!
 //! [`Renderer`] is the whole of the callback's logic, over a [`Sink`] instead of a synthesizer
 //! and a device, so that it is tested without either. [`start`] puts it on the output.
+//!
+//! The keys the player strikes on a MIDI keyboard (`midi_in.rs`) reach the callback through
+//! [`LiveKeys`], a ring of atomics made once: the callback plays them at the start of its next
+//! buffer, so the output is opened with a small one (`LIVE_FRAMES`). They are counted apart from
+//! the piece's: the piece ending a note, a pause or a seek do not cut a key the player holds, and
+//! the player letting a key go does not cut the piece's note on it.
 
-use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicU8, Ordering::Relaxed};
+use std::sync::atomic::Ordering::{Acquire, Release};
+use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU16, AtomicUsize, Ordering::Relaxed};
+use std::sync::{Arc, Mutex};
 
 use cpal::traits::{DeviceTrait as _, HostTrait as _, StreamTrait as _};
 use rustysynth::{SoundFont, Synthesizer, SynthesizerSettings};
@@ -22,6 +29,73 @@ use crate::timeline::{Hand, Timeline};
 const MAX_FRAMES: usize = 4096;
 /// The channel of a MIDI synthesizer the piano is on.
 const CHANNEL: i32 = 0;
+/// The buffer the output is asked for, in frames (5.3 ms at 48 kHz): a key struck sounds at the
+/// next buffer. Smaller would gain little and risk gaps on a busy machine; the device's own
+/// range has the last word.
+const LIVE_FRAMES: u32 = 256;
+/// How many keys struck and let go can wait for the callback: hundreds of buffers' worth.
+const LIVE_SLOTS: usize = 256;
+
+/// The keys the player strikes, on their way to the audio callback: a ring of atomics, written
+/// on MIDI's threads and read by the callback, which neither locks nor waits. Clones share it.
+#[derive(Clone)]
+pub struct LiveKeys(Arc<Ring>);
+
+struct Ring {
+    /// Each a key and its velocity (0: let go), `key << 8 | velocity`.
+    slots: [AtomicU16; LIVE_SLOTS],
+    /// How many were ever written, and read: a slot is free once read.
+    written: AtomicUsize,
+    read: AtomicUsize,
+    /// The writers take turns (several keyboards); the reader never takes it.
+    writing: Mutex<()>,
+}
+
+impl Default for LiveKeys {
+    fn default() -> Self {
+        Self(Arc::new(Ring {
+            slots: std::array::from_fn(|_| AtomicU16::new(0)),
+            written: AtomicUsize::new(0),
+            read: AtomicUsize::new(0),
+            writing: Mutex::new(()),
+        }))
+    }
+}
+
+impl LiveKeys {
+    /// A key struck (`velocity` above 0) or let go. Not for the audio callback. A ring that is
+    /// full (no output reads it) drops it: what is not heard now is not to be heard later.
+    pub fn push(&self, key: u8, velocity: u8) -> bool {
+        let ring = &*self.0;
+        let _turn = ring.writing.lock().expect("the live keys' lock");
+        let written = ring.written.load(Relaxed);
+        if written.wrapping_sub(ring.read.load(Acquire)) >= LIVE_SLOTS {
+            return false;
+        }
+        let packed = u16::from(key & 127) << 8 | u16::from(velocity & 127);
+        ring.slots[written % LIVE_SLOTS].store(packed, Relaxed);
+        ring.written.store(written.wrapping_add(1), Release);
+        true
+    }
+
+    /// The next key waiting, for the callback: no lock, no allocation.
+    fn pop(&self) -> Option<(u8, u8)> {
+        let ring = &*self.0;
+        let read = ring.read.load(Relaxed);
+        if read == ring.written.load(Acquire) {
+            return None;
+        }
+        let packed = ring.slots[read % LIVE_SLOTS].load(Relaxed);
+        ring.read.store(read.wrapping_add(1), Release);
+        Some(((packed >> 8) as u8, (packed & 0xFF) as u8))
+    }
+
+    /// Forgets what waits: struck before the output was there, it is not played late.
+    fn discard(&self) {
+        let ring = &*self.0;
+        ring.read.store(ring.written.load(Acquire), Release);
+    }
+}
 
 /// Which hands the computer plays: the other ones are the player's.
 #[derive(Clone)]
@@ -149,6 +223,9 @@ pub struct Renderer<S: Sink> {
     /// Which notes were struck by the computer and not ended yet: the end of one the computer
     /// did not strike (a hand that is the player's) is none of its business. Made here, once.
     struck: Vec<bool>,
+    /// The keys the player strikes, when this output sounds them, and the ones held now.
+    live: Option<LiveKeys>,
+    live_held: [bool; 128],
 }
 
 impl<S: Sink> Renderer<S> {
@@ -177,8 +254,37 @@ impl<S: Sink> Renderer<S> {
             carry: 0.,
             held: [0; 128],
             struck: vec![false; notes],
+            live: None,
+            live_held: [false; 128],
         }
         .following()
+    }
+
+    /// Sounds the keys the player strikes too, from now on.
+    pub fn with_live(mut self, live: LiveKeys) -> Self {
+        live.discard();
+        self.live = Some(live);
+        self
+    }
+
+    /// Plays the keys struck and let go since the last buffer, at its start.
+    fn play_live(&mut self) {
+        let Some(live) = &self.live else {
+            return;
+        };
+        while let Some((key, velocity)) = live.pop() {
+            let at = usize::from(key);
+            if velocity > 0 {
+                self.live_held[at] = true;
+                self.sink.note_on(key, velocity);
+            } else {
+                self.live_held[at] = false;
+                // The piece holds it too: its note ends with the piece's.
+                if self.held[at] == 0 {
+                    self.sink.note_off(key);
+                }
+            }
+        }
     }
 
     /// Puts `next` where the clock is.
@@ -188,10 +294,20 @@ impl<S: Sink> Renderer<S> {
         self
     }
 
+    /// Lets the piece's notes go, and none of the keys the player holds.
     fn release_all(&mut self) {
+        if self.live_held.contains(&true) {
+            for key in 0..128u8 {
+                let at = usize::from(key);
+                if self.held[at] > 0 && !self.live_held[at] {
+                    self.sink.note_off(key);
+                }
+            }
+        } else {
+            self.sink.release_all();
+        }
         self.held = [0; 128];
         self.struck.fill(false);
-        self.sink.release_all();
     }
 
     /// Fills `left` and `right` (the same length) with the next frames of sound.
@@ -199,6 +315,8 @@ impl<S: Sink> Renderer<S> {
         debug_assert_eq!(left.len(), right.len());
         // From the first buffer on, the clock is this output's: the wall clock stops moving it.
         self.clock.claim();
+        // Playing or not, the keys struck sound.
+        self.play_live();
         let snapshot = self.clock.snapshot();
         if snapshot.seeks != self.seeks {
             // The position jumped: what sounded belongs to the old one.
@@ -239,7 +357,8 @@ impl<S: Sink> Renderer<S> {
             if event.velocity == 0 {
                 if std::mem::take(struck) {
                     *held = held.saturating_sub(1);
-                    if *held == 0 {
+                    // A key the player holds is his to let go.
+                    if *held == 0 && !self.live_held[usize::from(event.key & 127)] {
                         self.sink.note_off(event.key);
                     }
                 }
@@ -265,14 +384,26 @@ pub struct Output {
     _stream: cpal::Stream,
 }
 
-/// Opens the default output and plays the piece on `font` as `clock` moves. Slow (it loads the
-/// synthesizer): not on the main thread.
+/// The buffer asked of a device: [`LIVE_FRAMES`] within what it takes, its own when it does not
+/// say.
+fn buffer_size(supported: &cpal::SupportedBufferSize) -> cpal::BufferSize {
+    match supported {
+        cpal::SupportedBufferSize::Range { min, max } if min <= max => {
+            cpal::BufferSize::Fixed(LIVE_FRAMES.clamp(*min, *max))
+        }
+        _ => cpal::BufferSize::Default,
+    }
+}
+
+/// Opens the default output and plays the piece on `font` as `clock` moves, and the keys the
+/// player strikes (`live`) as they come. Slow (it loads the synthesizer): not on the main thread.
 pub fn start(
     font: &Arc<SoundFont>,
     timeline: &Timeline,
     clock: &Clock,
     hands: &Hands,
     lost: &Arc<AtomicBool>,
+    live: &LiveKeys,
 ) -> Result<Output, String> {
     let device = cpal::default_host()
         .default_output_device()
@@ -282,33 +413,45 @@ pub fn start(
         .map_err(|e| format!("the audio output has no usable setup: {e}"))?;
     let sample_rate = supported.sample_rate();
     let channels = usize::from(supported.channels());
-    let config = cpal::StreamConfig {
-        channels: supported.channels(),
-        sample_rate,
-        // The device's own size: a small one is lower latency, but the clock and the cursor do
-        // not need it, and a size the device refuses is an error.
-        buffer_size: cpal::BufferSize::Default,
-    };
-    let synth = Synthesizer::new(font, &SynthesizerSettings::new(sample_rate as i32))
-        .map_err(|e| format!("cannot start the synthesizer: {e}"))?;
-    let renderer = Renderer::new(
-        synth,
-        events(timeline),
-        clock.clone(),
-        hands.clone(),
-        sample_rate,
-    );
-    let stream = match supported.sample_format() {
-        cpal::SampleFormat::F32 => build::<f32>(&device, config, channels, renderer, lost),
-        cpal::SampleFormat::I16 => build::<i16>(&device, config, channels, renderer, lost),
-        cpal::SampleFormat::U16 => build::<u16>(&device, config, channels, renderer, lost),
-        other => {
-            return Err(format!(
-                "the audio output's sample format ({other}) is not supported"
-            ));
-        }
+    let format = supported.sample_format();
+    if !matches!(
+        format,
+        cpal::SampleFormat::F32 | cpal::SampleFormat::I16 | cpal::SampleFormat::U16
+    ) {
+        return Err(format!(
+            "the audio output's sample format ({format}) is not supported"
+        ));
     }
-    .map_err(|e| format!("cannot open the audio output: {e}"))?;
+    let open = |buffer_size| -> Result<cpal::Stream, String> {
+        let config = cpal::StreamConfig {
+            channels: supported.channels(),
+            sample_rate,
+            buffer_size,
+        };
+        let synth = Synthesizer::new(font, &SynthesizerSettings::new(sample_rate as i32))
+            .map_err(|e| format!("cannot start the synthesizer: {e}"))?;
+        let renderer = Renderer::new(
+            synth,
+            events(timeline),
+            clock.clone(),
+            hands.clone(),
+            sample_rate,
+        )
+        .with_live(live.clone());
+        match format {
+            cpal::SampleFormat::I16 => build::<i16>(&device, config, channels, renderer, lost),
+            cpal::SampleFormat::U16 => build::<u16>(&device, config, channels, renderer, lost),
+            _ => build::<f32>(&device, config, channels, renderer, lost),
+        }
+        .map_err(|e| format!("cannot open the audio output: {e}"))
+    };
+    // A small buffer, for the keys struck to sound at once; the device's own if it refuses it.
+    let small = buffer_size(supported.buffer_size());
+    let stream = match open(small) {
+        Ok(stream) => stream,
+        Err(_) if small != cpal::BufferSize::Default => open(cpal::BufferSize::Default)?,
+        Err(error) => return Err(error),
+    };
     stream
         .play()
         .map_err(|e| format!("cannot start the audio output: {e}"))?;
@@ -623,6 +766,144 @@ mod tests {
         assert_eq!(
             renderer.sink.calls,
             [Call::On(62, 1000), Call::Off(62, 1100)]
+        );
+    }
+
+    fn live_rig(notes: Vec<Note>) -> (Renderer<Recorder>, Clock, LiveKeys) {
+        let (renderer, clock, _) = rig(notes);
+        let live = LiveKeys::default();
+        (renderer.with_live(live.clone()), clock, live)
+    }
+
+    #[test]
+    fn a_key_struck_sounds_at_the_next_buffer_with_no_piece_playing() {
+        let (mut renderer, clock, live) = live_rig(vec![]);
+        assert!(live.push(64, 100));
+        run(&mut renderer, 1, 100);
+        assert_eq!(renderer.sink.calls, [Call::On(64, 0)]);
+        live.push(64, 0);
+        run(&mut renderer, 1, 100);
+        assert_eq!(renderer.sink.calls[1..], [Call::Off(64, 100)]);
+        // The clock did not move: nothing plays the piece.
+        assert_eq!(clock.snapshot().position_us, 0);
+    }
+
+    #[test]
+    fn the_piece_ending_a_note_does_not_cut_the_key_the_player_holds() {
+        let (mut renderer, clock, live) = live_rig(vec![note(60, 0., 150., Hand::Right)]);
+        clock.play();
+        run(&mut renderer, 1, 100);
+        live.push(60, 90);
+        run(&mut renderer, 1, 100);
+        // The piece's note ends at 150 ms: the player's key goes on.
+        assert_eq!(renderer.sink.calls, [Call::On(60, 0), Call::On(60, 100)]);
+        live.push(60, 0);
+        run(&mut renderer, 1, 100);
+        assert_eq!(renderer.sink.calls[2..], [Call::Off(60, 200)]);
+    }
+
+    #[test]
+    fn the_player_letting_a_key_go_does_not_cut_the_pieces_note_on_it() {
+        let (mut renderer, clock, live) = live_rig(vec![note(60, 0., 250., Hand::Right)]);
+        clock.play();
+        run(&mut renderer, 1, 100);
+        live.push(60, 90);
+        live.push(60, 0);
+        run(&mut renderer, 1, 100);
+        assert_eq!(renderer.sink.calls, [Call::On(60, 0), Call::On(60, 100)]);
+        // The piece's own end cuts it.
+        run(&mut renderer, 1, 100);
+        assert_eq!(renderer.sink.calls[2..], [Call::Off(60, 250)]);
+    }
+
+    #[test]
+    fn a_pause_or_a_seek_lets_the_piece_go_and_not_the_keys_held() {
+        let (mut renderer, clock, live) = live_rig(vec![
+            note(60, 0., 900., Hand::Right),
+            note(64, 0., 900., Hand::Right),
+        ]);
+        clock.play();
+        live.push(72, 90);
+        live.push(64, 90);
+        run(&mut renderer, 1, 100);
+        clock.pause();
+        run(&mut renderer, 1, 100);
+        // Only the piece's 60: 64 is held by the player too, 72 is his alone.
+        let after: Vec<_> = renderer.sink.calls.iter().skip(4).collect();
+        assert_eq!(after, [&Call::Off(60, 100)]);
+        clock.play();
+        clock.seek_ms(500.);
+        run(&mut renderer, 1, 100);
+        assert!(
+            !renderer
+                .sink
+                .calls
+                .iter()
+                .any(|call| matches!(call, Call::Off(72 | 64, _) | Call::Release(_))),
+            "{:?}",
+            renderer.sink.calls
+        );
+        // Once the player lets go of everything, a pause releases all again.
+        live.push(72, 0);
+        live.push(64, 0);
+        run(&mut renderer, 1, 100);
+        clock.pause();
+        run(&mut renderer, 1, 100);
+        assert_eq!(renderer.sink.calls.last(), Some(&Call::Release(400)));
+    }
+
+    #[test]
+    fn keys_struck_before_the_output_was_there_are_not_played_late() {
+        let live = LiveKeys::default();
+        live.push(60, 90);
+        let (renderer, _, _) = rig(vec![]);
+        let mut renderer = renderer.with_live(live.clone());
+        run(&mut renderer, 1, 100);
+        assert_eq!(renderer.sink.calls, []);
+        live.push(62, 90);
+        run(&mut renderer, 1, 100);
+        assert_eq!(renderer.sink.calls, [Call::On(62, 100)]);
+    }
+
+    #[test]
+    fn the_ring_drops_what_no_one_reads_and_goes_round() {
+        let live = LiveKeys::default();
+        for _ in 0..LIVE_SLOTS {
+            assert!(live.push(60, 90));
+        }
+        assert!(!live.push(61, 90), "full");
+        live.discard();
+        assert_eq!(live.pop(), None);
+        // Many times round, from other threads, nothing lost or changed.
+        let writer = live.clone();
+        let thread = std::thread::spawn(move || {
+            for n in 0..10_000u32 {
+                while !writer.push((n % 128) as u8, (n % 127 + 1) as u8) {
+                    std::thread::yield_now();
+                }
+            }
+        });
+        let mut n = 0u32;
+        while n < 10_000 {
+            if let Some(got) = live.pop() {
+                assert_eq!(got, ((n % 128) as u8, (n % 127 + 1) as u8));
+                n += 1;
+            }
+        }
+        thread.join().unwrap();
+        assert_eq!(live.pop(), None);
+    }
+
+    #[test]
+    fn the_buffer_asked_for_is_small_within_what_the_device_takes() {
+        use cpal::{BufferSize, SupportedBufferSize};
+        let range = |min, max| buffer_size(&SupportedBufferSize::Range { min, max });
+        assert_eq!(range(64, 8192), BufferSize::Fixed(LIVE_FRAMES));
+        assert_eq!(range(512, 8192), BufferSize::Fixed(512));
+        assert_eq!(range(16, 128), BufferSize::Fixed(128));
+        assert_eq!(
+            buffer_size(&SupportedBufferSize::Unknown),
+            BufferSize::Default
         );
     }
 

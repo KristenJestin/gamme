@@ -11,6 +11,8 @@ readme = "README.md"
 publish = false
 
 [dependencies]
+# The keys struck on a MIDI keyboard, from MIDI's threads to the window's; already built for GPUI.
+async-channel = "2.5.0"
 # Verovio gives its MIDI output in base64; already built for `verovio`.
 base64 = "0.22.1"
 # The built-in piano: a SoundFont synthesizer (`rustysynth`) on the default output (`cpal`).

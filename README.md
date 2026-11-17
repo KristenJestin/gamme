@@ -8,9 +8,9 @@ piece, because apps that only show falling notes teach to follow, not to read.
 
 **Status: first notes.** What exists today is one window with the shared design system's look
 (it follows the Omarchy theme), a home screen that lists your pieces, a play screen that shows a
-piece engraved and falling over a keyboard and plays it with a built-in piano, and the machinery
-to publish, install and update the app. MIDI in, the game layer, the practice method and the
-fingering come next.
+piece engraved and falling over a keyboard and plays it with a built-in piano or a MIDI output,
+your MIDI keyboard lighting and sounding its keys, and the machinery to publish, install and update
+the app. The game layer, the practice method and the fingering come next.
 
 ## The library
 
@@ -85,6 +85,22 @@ and SHA-256 before anything is unpacked.
 
 `gamme play <piece> [--piano small|grand]` opens a piece with the piano of your choice.
 
+## Your MIDI keyboard
+
+Gamme listens to every MIDI input port as it appears, a keyboard plugged in while the window is
+open included, and again after it was unplugged and plugged back; or only to the port chosen in the
+settings. On the play screen the keys you strike light up on the keyboard (in the hit colour) and
+sound on the piece's output, whether the piece plays or not: the built-in piano, at the shortest
+buffer the audio device takes (256 frames, about 5 ms, when it can), or the MIDI output. A key you
+hold is not cut by the piece ending its own note on that key, by a pause or by a seek; a key you
+let go does not cut the piece's note on it. The keys held on a keyboard that is unplugged are let
+go. Each key is stamped with the instant it arrived, for the game to come.
+
+The built-in piano is opened with the piece when its SoundFont is there already; otherwise the
+first key you strike (or **Play**) downloads it. A digital piano that is both your keyboard and the
+MIDI output sounds its own keys: they are not sent back to it. Gamme's own ports are never
+listened to, and ALSA's **Midi Through** only when it is the port chosen.
+
 ## MIDI out and the settings
 
 The piece can sound on a **MIDI output** (a piano with its own speakers) instead of the built-in
@@ -96,9 +112,9 @@ key, then All Notes Off). If the port is not there when the piece starts, or goe
 The **settings page** (the Settings button of the home screen) chooses:
 
 - **MIDI**: the output the piece sounds on (the built-in piano until a port is chosen) and the
-  input the keys are read from (every port, or one), as ALSA lists them, with **Look again** for a
-  piano plugged in meanwhile. A port is kept by its name, not by the numbers ALSA changes at each
-  start;
+  input the keys are read from (every port, or one; the change applies at once), as ALSA lists
+  them, with **Look again** to list a piano plugged in meanwhile. A port is kept by its name, not
+  by the numbers ALSA changes at each start;
 - **Sound**: which piano the built-in one plays (the table above);
 - **Colours**: Gamme's Nocturne or Omarchy's theme (see Brand).
 
