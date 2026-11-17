@@ -187,13 +187,6 @@ impl Timeline {
     }
 
     /// The id of the engraved note `note` is, for an engraved piece.
-    #[cfg_attr(
-        not(test),
-        expect(
-            dead_code,
-            reason = "the judgement on the engraved note comes with #17"
-        )
-    )]
     pub fn element(&self, note: &Note) -> Option<&str> {
         self.elements
             .get(note.element? as usize)

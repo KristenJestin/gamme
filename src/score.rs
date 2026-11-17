@@ -107,6 +107,8 @@ struct Mark {
 
 pub struct Score {
     pages: Vec<usvg::Tree>,
+    /// Each note the timemap plays, by its engraved id: its head.
+    heads: HashMap<String, Placed>,
     measures: Vec<Measure>,
     steps: Vec<Step>,
     marks: Vec<Mark>,
@@ -156,10 +158,16 @@ impl Score {
         let mut steps = Vec::with_capacity(events.len());
         let mut marks: Vec<Mark> = Vec::new();
         let mut sounding: Vec<&String> = Vec::new();
+        let mut heads = HashMap::new();
         let mut current = None;
         for event in events {
             sounding.retain(|id| !event.off.contains(*id));
             sounding.extend(&event.on);
+            for id in &event.on {
+                if let Some(head) = note(id) {
+                    heads.insert(id.clone(), head);
+                }
+            }
             if let Some(id) = &event.measure_on {
                 let number = measures.len() + 1;
                 let name = engraved
@@ -204,6 +212,7 @@ impl Score {
         let duration = events.last().map_or(0., |event| event.tstamp);
         Self {
             pages: Vec::new(),
+            heads,
             measures,
             steps,
             marks,
@@ -219,6 +228,13 @@ impl Score {
     pub fn page_size(&self, page: usize) -> (f32, f32) {
         let size = self.pages[page].size();
         (size.width(), size.height())
+    }
+
+    /// Where the head of the engraved note `id` (a timeline's [`Timeline::element`]) is.
+    ///
+    /// [`Timeline::element`]: crate::timeline::Timeline::element
+    pub fn head(&self, id: &str) -> Option<Placed> {
+        self.heads.get(id).copied()
     }
 
     /// The length of the piece, in ms.
@@ -669,5 +685,13 @@ mod tests {
         assert!(close(head.left, 120.) && close(head.top, 25.), "{head:?}");
         assert!(score.at(3000.).sounding.is_empty());
         assert_eq!(score.duration(), 3000.);
+    }
+
+    #[test]
+    fn a_note_played_is_found_by_its_id_at_its_head() {
+        let score = score();
+        assert_eq!(score.head("n1"), Some(score.at(0.).sounding[0]));
+        assert_eq!(score.head("n2"), Some(score.at(1000.).sounding[0]));
+        assert_eq!(score.head("m1"), None, "a measure is no note");
     }
 }

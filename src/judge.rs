@@ -79,14 +79,6 @@ pub enum Grade {
 }
 
 impl Grade {
-    pub const ALL: [Grade; 5] = [
-        Grade::Perfect,
-        Grade::Good,
-        Grade::Late,
-        Grade::Missed,
-        Grade::Wrong,
-    ];
-
     fn index(self) -> usize {
         match self {
             Grade::Perfect => 0,
@@ -222,21 +214,25 @@ pub struct Run {
 }
 
 impl Run {
-    #[cfg_attr(
-        not(test),
-        expect(
-            dead_code,
-            reason = "the live judgements (#18) and the end of a run (#19) read them"
-        )
-    )]
     pub fn judgements(&self) -> &[Judgement] {
         &self.judgements
     }
 
+    #[cfg_attr(
+        not(test),
+        expect(dead_code, reason = "the end of a run (#19) counts each grade")
+    )]
     pub fn count(&self, grade: Grade) -> usize {
         self.counts[grade.index()]
     }
 
+    #[cfg_attr(
+        not(test),
+        expect(
+            dead_code,
+            reason = "the end of a run (#19) says when nothing was judged"
+        )
+    )]
     pub fn is_empty(&self) -> bool {
         self.judgements.is_empty()
     }
@@ -349,6 +345,11 @@ impl Judge {
     /// The run being played.
     pub fn run(&self) -> &Run {
         &self.run
+    }
+
+    /// How many runs ended before it: one more, and [`Judge::run`] is another run.
+    pub fn runs(&self) -> u64 {
+        self.runs
     }
 
     /// The run played before this one, to its end.
@@ -701,6 +702,11 @@ impl Live {
 
     pub fn run(&self) -> &Run {
         self.judge.run()
+    }
+
+    /// How many runs ended before the one being played.
+    pub fn runs(&self) -> u64 {
+        self.judge.runs()
     }
 
     fn moment(clock: &Clock, at: Instant) -> Moment {

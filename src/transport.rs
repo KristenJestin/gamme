@@ -10,21 +10,26 @@
 //!
 //! It holds the judge of the run too (`judge.rs`): each key from MIDI in goes to it with the
 //! instant it arrived, and each tick tells it time moved on. Hands changed, the run starts again.
-//! Its tally is a line of the practice row until the live judgements come (#18).
+//! What the judge says is counted (`tally.rs`: score, combo, accuracy, said in the practice row)
+//! and flashed (`flash.rs`: drawn by the play screen on the notes and the keys).
 
-use std::time::Duration;
+use std::cell::RefCell;
+use std::rc::Rc;
+use std::time::{Duration, Instant};
 
 use gpui_design_system::{
     Button, Icon, Segmented, Select, SelectOption, Switch, Type as _, palette, space,
 };
 use gpui_kit::*;
 
+use crate::flash::{self, Flashes};
 use crate::icons;
-use crate::judge::{Grade, Live};
+use crate::judge::Live;
 use crate::midi_in::{MidiIn, Played};
 use crate::player::{Player, Sound};
 use crate::practice::{self, Choice, Playing, Practice};
 use crate::soundfont::Stage;
+use crate::tally::{self, Tally};
 use crate::wall_clock::WallClock;
 
 /// How often the view looks at the clock while something moves.
@@ -49,6 +54,10 @@ pub struct Transport {
     notice: Option<String>,
     /// The judge of the run; none while the player listens.
     judge: Option<Live>,
+    /// What the judge said, counted.
+    tally: Tally,
+    /// What the judge said, shown.
+    flashes: flash::Shared,
     /// What the settings measured, taken away from each key.
     latency_ms: f64,
     _refresh: Task<()>,
@@ -80,9 +89,10 @@ impl Transport {
                             cx.notify();
                         }
                         this.wall.tick(&this.player.clock);
-                        if let Some(judge) = &mut this.judge
-                            && !judge.tick(&this.player.clock).is_empty()
-                        {
+                        if let Some(judge) = &mut this.judge {
+                            judge.tick(&this.player.clock);
+                        }
+                        if this.catch_up() {
                             cx.notify();
                         }
                         // A keyboard plugged in or out: the wait can be had, or not.
@@ -123,9 +133,30 @@ impl Transport {
             wall: WallClock::default(),
             notice: None,
             judge,
+            tally: Tally::default(),
+            flashes: Rc::new(RefCell::new(Flashes::default())),
             latency_ms,
             _refresh: refresh,
         }
+    }
+
+    /// The judgements, as the views draw them.
+    pub fn flashes(&self) -> &flash::Shared {
+        &self.flashes
+    }
+
+    /// Counts and flashes what the judge said since the last time; whether it said anything.
+    fn catch_up(&mut self) -> bool {
+        let Some(judge) = &self.judge else {
+            return false;
+        };
+        let new = self.tally.follow(judge.runs(), judge.run().judgements());
+        let now = Instant::now();
+        let mut flashes = self.flashes.borrow_mut();
+        for judgement in new {
+            flashes.add(judgement, now);
+        }
+        !new.is_empty()
     }
 
     pub fn player(&self) -> &Player {
@@ -139,14 +170,14 @@ impl Transport {
     /// A key from MIDI in, for the judge and the wait. The judge reads the clock first: the
     /// wait's release moves it on.
     pub fn key(&mut self, played: Played, cx: &mut Context<Self>) {
-        let judged = self
-            .judge
-            .as_mut()
-            .and_then(|judge| judge.key(played, &self.player.clock));
+        if let Some(judge) = &mut self.judge {
+            judge.key(played, &self.player.clock);
+        }
+        let judged = self.catch_up();
         let released =
             self.practice
                 .key(played.key, played.velocity, played.at, &self.player.clock);
-        if judged.is_some() || released {
+        if judged || released {
             cx.notify();
         }
     }
@@ -160,6 +191,7 @@ impl Transport {
             self.latency_ms,
             &self.player.clock,
         );
+        self.tally = Tally::default();
         cx.emit(self.practice.choice());
         cx.notify();
     }
@@ -284,24 +316,28 @@ impl Transport {
         };
         let (looped, half) = (self.practice.looped(), self.practice.half_loop());
         let label = practice::loop_text(looped, half, names);
-        // Until the live judgements (#18): how many of each, once there is one.
-        let tally = self
+        // The run as it stands: score, combo, accuracy, once something was judged.
+        let said = self
             .judge
             .as_ref()
-            .map(Live::run)
-            .filter(|run| !run.is_empty())
-            .map(|run| {
-                let words: Vec<String> = Grade::ALL
-                    .iter()
-                    .map(|&grade| format!("{} {}", run.count(grade), grade.word()))
-                    .collect();
-                div()
-                    .id("transport-judged")
-                    .ui_text()
-                    .text_color(p.mute)
-                    .whitespace_nowrap()
-                    .child(words.join(" · "))
-            });
+            .map(|_| tally::readout(&self.tally.standing()))
+            .unwrap_or_default();
+        let tally = (!said.is_empty()).then(|| {
+            div()
+                .id("transport-judged")
+                .flex()
+                .items_center()
+                .gap(space::MD)
+                .children(said.into_iter().map(|(what, value)| {
+                    div()
+                        .flex()
+                        .gap(space::XS)
+                        .ui_text()
+                        .whitespace_nowrap()
+                        .child(div().text_color(p.mute).child(what))
+                        .child(div().text_color(p.text).semibold().child(value))
+                }))
+        });
         let set_a = {
             let this = this.clone();
             Button::secondary("transport-loop-a", "A")

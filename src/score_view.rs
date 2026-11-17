@@ -1,5 +1,6 @@
 //! The score on screen, as the play screen holds it: its pages as images, and over them, drawn
-//! every frame, the measure being played, the cursor and the notes that sound.
+//! every frame, the measure being played, the cursor, the notes that sound, and the judgements
+//! on the notes they judged (`flash.rs`), fading.
 //!
 //! The pages are rasterized off the main thread, again when the window's width, the zoom or the
 //! theme's ink changes; meanwhile the images already there are drawn at the new size, so a
@@ -10,11 +11,12 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use gpui_design_system::theme::{radius, target_palette};
-use gpui_design_system::{Skeleton, awaiting, palette, space};
+use gpui_design_system::{Skeleton, Type as _, awaiting, palette, space};
 use gpui_kit::*;
 
+use crate::flash::{self, Flash, Inks};
 use crate::raster;
-use crate::score::{Cursor, Score};
+use crate::score::{Cursor, Placed, Score};
 
 /// Around the pages and between them.
 const PAGE_GAP: Pixels = space::XL;
@@ -32,6 +34,13 @@ pub trait Playhead: 'static {
     /// Whether it moves: the score is drawn every frame, the view following the cursor, while
     /// it does.
     fn moving(&self) -> bool;
+}
+
+/// The judgements shown on the notes: the flashes, and the head of each note of the timeline
+/// (by its place there) on the pages.
+struct Judged {
+    flashes: flash::Shared,
+    heads: Vec<Option<Placed>>,
 }
 
 /// What the pages are rasterized for: their width in device pixels and their ink.
@@ -58,6 +67,7 @@ pub struct ScoreView {
     /// moves to another one (a seek) is brought into view.
     followed: Option<usize>,
     scroll: ScrollHandle,
+    judged: Option<Judged>,
 }
 
 impl ScoreView {
@@ -65,6 +75,7 @@ impl ScoreView {
         Self {
             score,
             playhead,
+            judged: None,
             zoom: 1.,
             images: Vec::new(),
             drawn: None,
@@ -74,6 +85,26 @@ impl ScoreView {
             followed: None,
             scroll: ScrollHandle::new(),
         }
+    }
+
+    /// Shows the judgements of `flashes` on the notes judged, `heads` the head of each note of
+    /// the timeline, by its place there.
+    pub fn judged(mut self, flashes: flash::Shared, heads: Vec<Option<Placed>>) -> Self {
+        self.judged = Some(Judged { flashes, heads });
+        self
+    }
+
+    /// The judgements showing at `now`, each with the head of its note.
+    fn marks(&self, now: Instant) -> Vec<(Flash, Placed)> {
+        let Some(judged) = &self.judged else {
+            return Vec::new();
+        };
+        judged
+            .flashes
+            .borrow()
+            .live(now)
+            .filter_map(|flash| Some((*flash, (*judged.heads.get(flash.note?)?)?)))
+            .collect()
     }
 
     /// Brings the cursor into view at the next frame, as when the score is first shown: the
@@ -164,6 +195,9 @@ impl ScoreView {
 
     fn pages(&mut self, page_width: f32, window: &Window, cx: &App) -> Vec<AnyElement> {
         let p = palette(cx);
+        let inks = Inks::of(&p);
+        let now = Instant::now();
+        let marks = self.marks(now);
         let score = self.score.clone();
         let position = self.playhead.position();
         let moment = score.at(position);
@@ -218,6 +252,53 @@ impl ScoreView {
                             .rounded(px(3.))
                             .bg(p.run.opacity(0.45))
                     });
+                // A halo around each note judged, and its word over it, rising; the newest
+                // word by its note, an older one in its way lifted over it.
+                let mut judged = Vec::new();
+                let mut said: Vec<flash::Place> = Vec::new();
+                for &(flash, head) in marks.iter().rev().filter(|(_, head)| head.page == page) {
+                    let (ink, strength) = (inks.get(flash.grade), flash.strength(now));
+                    let rise = flash.rise(now);
+                    let halo = flash::HALO * (0.5 + 0.5 * rise);
+                    let a = head.area;
+                    judged.push(
+                        div()
+                            .absolute()
+                            .left(px(a.left * k - halo))
+                            .top(px(a.top * k - halo))
+                            .w(px(a.width() * k + 2. * halo))
+                            .h(px(a.height() * k + 2. * halo))
+                            .rounded(px(halo + 2.))
+                            .border_2()
+                            .border_color(ink.opacity(strength))
+                            .bg(ink.opacity(0.25 * strength)),
+                    );
+                    let size = flash::SCORE_WORD_SIZE;
+                    let text = flash.grade.word();
+                    let tall = (size * 1.4).round();
+                    // Wide enough for the word in the kit's face, as it is not measured here.
+                    let wide = text.len() as f32 * size * 0.62 + 2. * flash::WORD_PAD;
+                    let left = (a.left + a.right) / 2. * k - wide / 2.;
+                    let top = a.top * k - halo - tall - flash::RISE / 2. * rise;
+                    let place = flash::lift(&said, left, wide, top, tall);
+                    said.push(place);
+                    judged.push(
+                        div()
+                            .absolute()
+                            .left(px(place.left))
+                            .top(px(place.top))
+                            .w(px(place.wide))
+                            .rounded(px(2.))
+                            .bg(p.card.opacity(flash::WORD_GROUND * strength))
+                            .text_center()
+                            .ui_text()
+                            .text_size(px(size))
+                            .line_height(px(tall))
+                            .semibold()
+                            .text_color(ink.opacity(strength))
+                            .child(text),
+                    );
+                }
                 let line = moment.cursor.filter(|c| c.page == page).map(|c| {
                     div()
                         .absolute()
@@ -240,6 +321,7 @@ impl ScoreView {
                     .child(img(image.clone()).size_full())
                     .children(band)
                     .children(heads)
+                    .children(judged)
                     .children(line)
                     .into_any_element()
             })
@@ -260,7 +342,11 @@ impl Render for ScoreView {
         };
         self.redraw(look, cx);
         let pages = self.pages(page_width, window, cx);
-        if self.playhead.moving() && self.playhead.position() <= self.score.duration() {
+        let fading = self
+            .judged
+            .as_ref()
+            .is_some_and(|judged| judged.flashes.borrow().any(Instant::now()));
+        if fading || (self.playhead.moving() && self.playhead.position() <= self.score.duration()) {
             window.request_animation_frame();
         }
         let pending = pages.is_empty();

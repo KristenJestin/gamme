@@ -545,13 +545,30 @@ impl PlayScreen {
         let latency_ms = self.settings.latency_ms;
         let transport =
             cx.new(|cx| Transport::new(player, names, practice, midi_in, latency_ms, cx));
-        let observe = cx.observe(&transport, |_, _, cx| cx.notify());
+        // The score is drawn again with the screen: a view is drawn only when told to, and it
+        // asks for its own frames only once it sees the clock move or a judgement fade.
+        let observe = cx.observe(&transport, |this, _, cx| {
+            if let State::Ready(Ready {
+                score: Some(score), ..
+            }) = &this.state
+            {
+                score.update(cx, |_, cx| cx.notify());
+            }
+            cx.notify();
+        });
         let keep = cx.subscribe(&transport, |this, _, choice: &Choice, cx| {
             this.keep_practice(*choice, cx);
         });
+        let flashes = transport.read(cx).flashes().clone();
         let score = loaded.score.map(|score| {
             let head = Box::new(ClockHead(clock.clone()));
-            cx.new(|_| ScoreView::new(score, head))
+            // Each note's engraved head, for its judgement.
+            let heads = timeline
+                .notes()
+                .iter()
+                .map(|note| timeline.element(note).and_then(|id| score.head(id)))
+                .collect();
+            cx.new(|_| ScoreView::new(score, head).judged(flashes, heads))
         });
         if play {
             transport.update(cx, |transport, cx| transport.toggle(cx));
@@ -841,13 +858,16 @@ impl PlayScreen {
 impl Render for PlayScreen {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let p = palette(cx);
+        let now = Instant::now();
         if let State::Ready(ready) = &self.state {
             let playing = ready.clock.playing();
-            if playing {
+            // The judgements fade out on a piece paused too.
+            let fading = ready.transport.read(cx).flashes().borrow().any(now);
+            if playing || fading {
                 window.request_animation_frame();
-                if !self.marked {
-                    self.mark_played(cx);
-                }
+            }
+            if playing && !self.marked {
+                self.mark_played(cx);
             }
         }
         let header = self.header(cx);
@@ -867,12 +887,15 @@ impl Render for PlayScreen {
                 if self.hands_open && ready.score.is_none() {
                     hands = Some(self.hands(ready, cx));
                 }
+                let flashes = ready.transport.read(cx).flashes().borrow().clone();
                 let notes = || {
                     falling(
                         ready.timeline.clone(),
                         ready.keyboard,
                         ready.clock.position_ms(),
                         self.lights.clone(),
+                        flashes.clone(),
+                        now,
                         &p,
                     )
                 };
