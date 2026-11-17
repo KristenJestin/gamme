@@ -58,7 +58,7 @@ The last three are CI's `verify` job (`.github/workflows/ci.yml`), on Rust 1.95,
 | `home.rs` | The home screen: the library's pieces, import (picker, drop), removal, and opening one |
 | `library.rs` | The library in `$XDG_DATA_HOME/gamme/library`: import, list, remove, mark played, the hands and the practice kept per piece |
 | `piece_file.rs` | What an imported file is: MusicXML, MEI or MIDI, its title and composer, why it is refused |
-| `icons.rs` | The icons Gamme adds to the kit's (Lucide) |
+| `icons.rs` | The pixel icons (`tools/icons.py`): Gamme's own, and the kit's its screens show under their Lucide names, served before the kit's |
 | `update.rs` | `gamme update`: the channel's latest build, its sum checked, the binary replaced |
 | `desktop.rs` | The launcher entry and the icon, written by `update` as `install.sh` writes them |
 | `paths.rs` | `$XDG_STATE_HOME/gamme`, `$XDG_CONFIG_HOME/gamme`, `$XDG_CACHE_HOME/gamme`, `$XDG_DATA_HOME`, `$XDG_DATA_HOME/gamme` and the library's folder |
@@ -66,7 +66,8 @@ The last three are CI's `verify` job (`.github/workflows/ci.yml`), on Rust 1.95,
 | `settings.rs` | The settings page, from the kit's components; the latency's calibration, played along with clicks |
 | `touch.rs` | The touch of the player's keys on the built-in piano: the pure velocity curve (light, normal, heavy, fixed), applied before the keys enter `piano.rs`'s ring |
 | `theme.rs` | Gamme's palette, "Nocturne", light and dark, on the kit's tokens |
-| `fonts.rs` | The bundled pixel fonts (Jersey 10 for titles and buttons, Gamme Dot for text), registered at start-up, and the whole multiples of their grids they are set at |
+| `fonts.rs` | The bundled pixel fonts (Jersey 10 for titles and controls, Gamme Dot for text), registered through the kit at start-up, and `Pixel`: Gamme's own texts at whole multiples of their face's grid |
+| `look.rs` | Gamme's pixel look on the kit (`init_with`): the faces, corners notched by a cell, lines and a hard shadow a cell wide, every size on the grid of 4-pixel `CELL`s |
 | `appearance.rs` | Omarchy's colours or Gamme's: the choice, kept in the state folder, and its control |
 | `engraver.rs` | The one Verovio toolkit of the process, on its own thread; its resources unpacked once into the cache; a piece's pages, timemap, MIDI and written notes |
 | `score.rs` | A piece engraved: its pages, where its measures and notes sit, the cursor at each moment |
@@ -109,6 +110,8 @@ Besides `src/`:
     keys and clicks into its display;
   - `brand.py`: writes the mark's SVGs and the icon's SVG and PNGs from one pixel grid; edit the
     grid there and run `python3 tools/brand.py`, never a generated file;
+  - `icons.py`: writes the pixel icons (`assets/icons/`, 7 x 7 cells) from their grids; edit a
+    grid there, never a generated file;
   - `fonts.py`: writes the bundled pixel fonts (`assets/fonts/`: Jersey 10, and Gamme Dot, a
     changed DotGothic16) from their pinned upstream files; needs fontTools, never a generated
     file edited by hand;

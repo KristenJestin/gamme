@@ -278,8 +278,12 @@ dark until chosen) or Omarchy (the desktop's theme, followed as it changes). Off
 window shows Nocturne whatever is chosen, and the control says why Omarchy is not available. The
 choice applies at once and is kept in `$XDG_STATE_HOME/gamme/appearance.json`.
 
-The style is pixel art everywhere except the score, which stays engraved. The falling notes and
-the keys are drawn on a grid of 4-pixel cells: a note is outlined in a darker shade of its colour,
+The style is pixel art everywhere except the score, which stays engraved. The design system draws
+every component in Gamme's pixel look (`src/look.rs`): corners cut by a cell, lines a cell wide, a
+hard shadow under the controls that a pressed button moves onto, every size on a grid of 4-pixel
+cells, and pixel icons (`python3 tools/icons.py` writes them). The kit sets its own texts at its
+own sizes, which are not yet whole multiples of the pixel fonts' grids: those texts are a little
+soft until the kit can snap them. The falling notes and the keys are drawn on the same grid: a note is outlined in a darker shade of its colour,
 lit along its left edge and frayed at its top, and a key that sounds sinks into its front edge.
 
 The type is two pixel fonts, bundled: **Jersey 10** (Sarah Cadigan-Fried) for the titles and the
