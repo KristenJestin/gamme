@@ -5,13 +5,19 @@
 //! The right hand is the accent, the left the second colour; a note on a black key is darker.
 //! A key sounds in its hand's colour while the piece plays it, and in the hit colour while it is
 //! lit from outside ([`Lights`]: the keys the player strikes).
+//!
+//! A judgement (`flash.rs`) flashes in its grade's colour on the note it judged, while that note
+//! is near the keys, and on its key, and its word rises over the key and fades: one word for the
+//! notes of a chord judged alike.
 
 use std::sync::Arc;
+use std::time::Instant;
 
-use gpui_design_system::Palette;
 use gpui_design_system::color::{hex, mix};
+use gpui_design_system::{Palette, Type as _};
 use gpui_kit::*;
 
+use crate::flash::{self, Flashes, Inks};
 use crate::keyboard::{Keyboard, Lights, is_black};
 use crate::theme;
 use crate::timeline::{Hand, Timeline};
@@ -28,6 +34,7 @@ struct Look {
     white: Hsla,
     black: Hsla,
     gap: Hsla,
+    inks: Inks,
 }
 
 impl Look {
@@ -40,6 +47,7 @@ impl Look {
             white: paper,
             black: night,
             gap: mix(night, paper, 0.35),
+            inks: Inks::of(p),
         }
     }
 
@@ -125,33 +133,58 @@ impl Layout {
     }
 }
 
-/// The falling notes of `timeline` at `position`, over its keyboard, filling their parent.
+/// The falling notes of `timeline` at `position`, over its keyboard, filling their parent, with
+/// the judgements of `flashes` as they stand at `now`; their words in the kit's face.
 pub fn falling(
     timeline: Arc<Timeline>,
     keyboard: Keyboard,
     position: f64,
     lights: Lights,
+    flashes: Flashes,
+    now: Instant,
     p: &Palette,
 ) -> impl IntoElement {
     let look = Look::of(p);
-    canvas(
+    let notes = canvas(
         |_, _, _| {},
-        move |bounds, (), window, _| {
-            paint(&timeline, keyboard, position, &lights, look, bounds, window);
+        move |bounds, (), window, cx| {
+            let shown = Shown {
+                lights: &lights,
+                flashes: &flashes,
+                now,
+            };
+            paint(
+                &timeline, keyboard, position, &shown, look, bounds, window, cx,
+            );
         },
     )
-    .size_full()
+    .size_full();
+    // The canvas paints its words in the text style around it.
+    div().size_full().ui_text().semibold().child(notes)
 }
 
+/// What is lit and judged from outside the piece, at the frame's moment.
+struct Shown<'a> {
+    lights: &'a Lights,
+    flashes: &'a Flashes,
+    now: Instant,
+}
+
+#[expect(
+    clippy::too_many_arguments,
+    reason = "one canvas's paint: what it draws, and where"
+)]
 fn paint(
     timeline: &Timeline,
     keyboard: Keyboard,
     position: f64,
-    lights: &Lights,
+    shown: &Shown,
     look: Look,
     bounds: Bounds<Pixels>,
     window: &mut Window,
+    cx: &mut App,
 ) {
+    let now = shown.now;
     let width = f32::from(bounds.size.width);
     let height = f32::from(bounds.size.height);
     let layout = Layout::new(keyboard, width, height);
@@ -209,12 +242,23 @@ fn paint(
         .partition_point(|note| note.on_ms <= position + LOOKAHEAD_MS)];
     let mut sounding: [Option<Hand>; 128] = [None; 128];
     for black in [false, true] {
-        for note in coming.iter().filter(|note| is_black(note.key) == black) {
+        for (index, note) in coming
+            .iter()
+            .enumerate()
+            .filter(|(_, note)| is_black(note.key) == black)
+        {
             if note.on_ms <= position && note.off_ms > position {
                 sounding[usize::from(note.key)] = Some(note.hand);
             }
             if let Some(rect) = layout.note(note.key, note.on_ms, note.off_ms, position) {
-                quad(rect, Look::hand(note.hand, black));
+                let color = Look::hand(note.hand, black);
+                let color = match shown.flashes.on_note(index, now) {
+                    Some(f) if (note.on_ms - position).abs() <= flash::NEAR_MS => {
+                        mix(color, look.inks.get(f.grade), flash::TINT * f.strength(now))
+                    }
+                    _ => color,
+                };
+                quad(rect, color);
             }
         }
     }
@@ -228,11 +272,18 @@ fn paint(
         look.now,
     );
 
-    // The keys: a key struck by the player is the hit colour, one the piece plays its hand's.
-    let color = |key: u8, idle: Hsla| match (lights.lit(key), sounding[usize::from(key)]) {
-        (true, _) => hex(theme::HIT),
-        (false, Some(hand)) => Look::hand(hand, is_black(key)),
-        (false, None) => idle,
+    // The keys: a key struck by the player is the hit colour, one the piece plays its hand's;
+    // a key judged takes its grade's colour, fading.
+    let color = |key: u8, idle: Hsla| {
+        let color = match (shown.lights.lit(key), sounding[usize::from(key)]) {
+            (true, _) => hex(theme::HIT),
+            (false, Some(hand)) => Look::hand(hand, is_black(key)),
+            (false, None) => idle,
+        };
+        match shown.flashes.on_key(key, now) {
+            Some(f) => mix(color, look.inks.get(f.grade), flash::TINT * f.strength(now)),
+            None => color,
+        }
     };
     let top = layout.area;
     for key in keyboard.keys().filter(|&key| !is_black(key)) {
@@ -277,6 +328,50 @@ fn paint(
             },
             color(key, look.black),
         );
+    }
+
+    // The words, over the keys they say, rising as they fade; the newest nearest the keys, an
+    // older one in its way lifted over it.
+    let style = window.text_style();
+    let font_size = px(flash::WORD_SIZE);
+    let tall = (flash::WORD_SIZE * 1.4).round();
+    let mut said: Vec<flash::Place> = Vec::new();
+    for word in shown.flashes.words(now).iter().rev() {
+        if !keyboard.shows(word.low) || !keyboard.shows(word.high) {
+            continue;
+        }
+        let (low, _) = layout.key(word.low);
+        let (high, high_width) = layout.key(word.high);
+        let middle = (low + high + high_width) / 2.;
+        let text = SharedString::from(word.grade.word());
+        let run = TextRun {
+            color: look.inks.get(word.grade).opacity(word.flash.strength(now)),
+            ..style.to_run(text.len())
+        };
+        let line = window
+            .text_system()
+            .shape_line(text, font_size, &[run], None);
+        let wide = f32::from(line.width());
+        let left = (middle - wide / 2.).clamp(0., (width - wide).max(0.));
+        let top = layout.area - 4. - tall - flash::RISE * word.flash.rise(now);
+        let pad = flash::WORD_PAD;
+        let place = flash::lift(&said, left - pad, wide + 2. * pad, top, tall);
+        said.push(place);
+        let at = point(
+            origin.x + px(place.left.round()),
+            origin.y + px(place.top.round().max(0.)),
+        );
+        // On the ground's colour: a word over the note it judged, tinted alike, still reads.
+        let ground = look
+            .ground
+            .opacity(flash::WORD_GROUND * word.flash.strength(now));
+        window.paint_quad(fill(
+            Bounds::new(at, size(px(place.wide.round()), px(tall))),
+            ground,
+        ));
+        // A word that cannot be shaped is not said; the flash on the key still shows.
+        let text_at = point(at.x + px(pad), at.y);
+        let _ = line.paint(text_at, px(tall), TextAlign::Left, None, window, cx);
     }
 }
 

@@ -10,9 +10,9 @@ piece, because apps that only show falling notes teach to follow, not to read.
 (it follows the Omarchy theme), a home screen that lists your pieces, a play screen that shows a
 piece engraved and falling over a keyboard and plays it with a built-in piano or a MIDI output,
 your MIDI keyboard lighting and sounding its keys, practice with one hand or both (the piece
-waiting for you, or looping over a few measures), every note you play judged, and the machinery to
-publish, install and update the app. The rest of the game layer, the practice method and the
-fingering come next.
+waiting for you, or looping over a few measures), every note you play judged as you play it, with a
+combo and a score, and the machinery to publish, install and update the app. The rest of the game
+layer, the practice method and the fingering come next.
 
 ## The library
 
@@ -90,9 +90,27 @@ own; a key repeated fast goes to each of its notes in turn. With **Wait for me**
 timing: a note is perfect when you strike it, a wrong key is wrong. Each time the loop comes round,
 or after a seek, the notes are owed again and judged afresh; changing the hands you play, or
 playing again after the end, starts the count again. Under the wait, a key you strike again
-because your chord was not all down at once is not counted against you. The latency measured in the settings is taken away from each key. For now the
-row under the transport counts them; the judgements on the notes themselves, the combo and the
-score come next.
+because your chord was not all down at once is not counted against you. The latency measured in
+the settings is taken away from each key.
+
+Each judgement shows as it is made, for a moment, in its colour: on the falling note and on its
+key (perfect pink, good green, late amber, missed grey), with its word rising over the key, and
+around the note on the score. A wrong key flashes red on the key. A miss is said once the note's
+time is past, so it shows a little after the note has gone by.
+
+The row under the transport keeps the run's account:
+
+- **Score**: a note is worth 100 when perfect, 70 when good, 30 when late, nothing when missed,
+  times the combo, up to ×10.
+- **Combo**: the notes struck in a row, back to 0 at a note missed or a wrong key; a late note
+  keeps it going.
+- **Accuracy**: the share of the notes judged that were perfect or good. A wrong key is no note:
+  it breaks the combo but leaves the accuracy.
+- **Wrong**: the wrong keys.
+
+Under **Wait for me** there is no timing, so the notes you play there build the combo but earn no
+points and stay out of the accuracy: the row says how many were played with the wait, not
+scored.
 
 ## Install
 
