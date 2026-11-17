@@ -52,14 +52,16 @@ The last three are CI's `verify` job (`.github/workflows/ci.yml`), on Rust 1.95,
 | File | What it is |
 |---|---|
 | `main.rs` | The entry: arguments (`--help`, `--version`, `update`, `play`, a piece), the window and its theme |
-| `screens.rs` | The window's screens and the way between them: home, and a piece played |
+| `screens.rs` | The window's screens and the way between them: home, a piece played and the settings; the window's toasts |
 | `home.rs` | The home screen: the library's pieces, import (picker, drop), removal, and opening one |
 | `library.rs` | The library in `$XDG_DATA_HOME/gamme/library`: import, list, remove, mark played, the hands kept per piece |
 | `piece_file.rs` | What an imported file is: MusicXML, MEI or MIDI, its title and composer, why it is refused |
 | `icons.rs` | The icons Gamme adds to the kit's (Lucide) |
 | `update.rs` | `gamme update`: the channel's latest build, its sum checked, the binary replaced |
 | `desktop.rs` | The launcher entry and the icon, written by `update` as `install.sh` writes them |
-| `paths.rs` | `$XDG_STATE_HOME/gamme`, `$XDG_CACHE_HOME/gamme`, `$XDG_DATA_HOME`, `$XDG_DATA_HOME/gamme` and the library's folder |
+| `paths.rs` | `$XDG_STATE_HOME/gamme`, `$XDG_CONFIG_HOME/gamme`, `$XDG_CACHE_HOME/gamme`, `$XDG_DATA_HOME`, `$XDG_DATA_HOME/gamme` and the library's folder |
+| `config.rs` | The settings in `$XDG_CONFIG_HOME/gamme/settings.json` (piano, MIDI out and in), written atomically, and the output they choose (`Settings::audio`) |
+| `settings.rs` | The settings page, from the kit's components |
 | `theme.rs` | Gamme's palette, "Nocturne", light and dark, on the kit's tokens |
 | `appearance.rs` | Omarchy's colours or Gamme's: the choice, kept in the state folder, and its control |
 | `engraver.rs` | The one Verovio toolkit of the process, on its own thread; its resources unpacked once into the cache; a piece's pages, timemap, MIDI and written notes |
@@ -74,7 +76,8 @@ The last three are CI's `verify` job (`.github/workflows/ci.yml`), on Rust 1.95,
 | `clock.rs` | The play position shared with the audio thread (atomics): play, pause, seek, speed |
 | `soundfont.rs` | The SoundFonts of the built-in piano and their resumable, checked download |
 | `piano.rs` | The built-in piano: the audio callback's logic (`Renderer`) and the `cpal` output |
-| `player.rs` | A piece being played: timeline, clock, and the piano made ready on its own thread |
+| `player.rs` | A piece being played: timeline, clock, and its output (an `Audio`: the built-in piano or MIDI out) made ready on its own thread; the fallback to the built-in piano |
+| `midi_out.rs` | MIDI out as an `Audio`: a thread paces the clock by the wall clock and sends the notes; `midir` is behind `Ports` and `Wire` so no test opens a port |
 | `transport.rs` | The transport bar (play, seek by measure, speed, SoundFont progress); it holds the player |
 
 Besides `src/`:

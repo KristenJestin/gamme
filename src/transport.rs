@@ -19,6 +19,9 @@ use crate::wall_clock::WallClock;
 /// How often the view looks at the clock while something moves.
 const REFRESH: Duration = Duration::from_millis(33);
 
+/// How long the app waits for the output to close when it quits.
+const QUIT_WAIT: Duration = Duration::from_millis(500);
+
 /// The speeds offered, in percent: the clock takes any from 25 to 100.
 const SPEEDS: [u32; 3] = [25, 50, 100];
 
@@ -28,6 +31,8 @@ pub struct Transport {
     /// no score, whose measures are counted.
     names: Vec<SharedString>,
     wall: WallClock,
+    /// What the player said last about its output (it was replaced), kept on screen.
+    notice: Option<String>,
     _refresh: Task<()>,
 }
 
@@ -39,6 +44,11 @@ impl Transport {
                 let alive = this
                     .update(cx, |this, cx| {
                         let sound = this.player.sound();
+                        // Said once by the player (the output was replaced), kept on screen.
+                        if let Some(notice) = this.player.notice() {
+                            this.notice = Some(notice);
+                            cx.notify();
+                        }
                         this.wall.tick(&this.player.clock);
                         // Idle, nothing changes: no frame to draw.
                         if this.player.wants_to_play() || sound == Sound::Preparing {
@@ -51,10 +61,18 @@ impl Transport {
                 }
             }
         });
+        // The app quitting does not drop the entities: a MIDI output is closed here, its keys
+        // let go, or a note would go on sounding on the piano after the window is gone.
+        cx.on_app_quit(|this, _| {
+            this.player.shutdown(QUIT_WAIT);
+            async {}
+        })
+        .detach();
         Self {
             player,
             names,
             wall: WallClock::default(),
+            notice: None,
             _refresh: refresh,
         }
     }
@@ -109,34 +127,44 @@ fn time_text(ms: f64) -> String {
     format!("{}:{:02}", seconds / 60, seconds % 60)
 }
 
-/// What the piano says of itself, from the state of its preparation.
+/// What the sound says of itself, from the state of its preparation. `output` is the MIDI
+/// output the piece goes to, when it is not the built-in piano.
 fn sound_text(
     sound: &Sound,
     stage: Stage,
     (done, total): (u64, u64),
     font: &crate::soundfont::Font,
+    output: Option<&str>,
 ) -> String {
     let megabytes = |bytes: u64| format!("{:.1}", bytes as f64 / (1 << 20) as f64);
-    match (sound, stage) {
-        (Sound::Off, _) => format!(
+    match (sound, stage, output) {
+        (Sound::Off, _, Some(output)) => format!("The piece plays on the {output}."),
+        (Sound::Preparing, _, Some(output)) => format!("Opening the {output}…"),
+        (Sound::Ready, _, Some(output)) => format!("Playing on the {output}."),
+        (Sound::Failed(message), _, Some(output)) => {
+            format!("The {output} could not be opened: {message}")
+        }
+        (Sound::Off, _, None) => format!(
             "The built-in piano ({}) is downloaded the first time you play.",
             font.name
         ),
-        (Sound::Preparing, Stage::Downloading) => format!(
+        (Sound::Preparing, Stage::Downloading, None) => format!(
             "Downloading the piano ({}): {} % ({} of {} MiB)",
             font.name,
             (done * 100).checked_div(total).unwrap_or(0),
             megabytes(done),
             megabytes(total),
         ),
-        (Sound::Preparing, Stage::Verifying) => "Checking the download…".to_owned(),
-        (Sound::Preparing, Stage::Unpacking) => "Unpacking the piano…".to_owned(),
-        (Sound::Preparing, _) => "Opening the sound…".to_owned(),
-        (Sound::Ready, _) => format!(
+        (Sound::Preparing, Stage::Verifying, None) => "Checking the download…".to_owned(),
+        (Sound::Preparing, Stage::Unpacking, None) => "Unpacking the piano…".to_owned(),
+        (Sound::Preparing, _, None) => "Opening the sound…".to_owned(),
+        (Sound::Ready, _, None) => format!(
             "Built-in piano: {}, by {} ({})",
             font.name, font.author, font.licence
         ),
-        (Sound::Failed(message), _) => format!("The piano could not be made ready: {message}"),
+        (Sound::Failed(message), _, None) => {
+            format!("The piano could not be made ready: {message}")
+        }
     }
 }
 
@@ -207,14 +235,16 @@ impl Render for Transport {
         };
 
         let progress = player.progress();
+        let state = player.sound();
+        let output = player.output_label();
         let sound = sound_text(
-            &player.sound(),
+            &state,
             progress.stage(),
             progress.bytes(),
             player.font(),
+            output.as_deref(),
         );
-        let downloading =
-            progress.stage() == Stage::Downloading && player.sound() == Sound::Preparing;
+        let downloading = progress.stage() == Stage::Downloading && state == Sound::Preparing;
         let cancel = downloading.then(|| {
             let this = this.clone();
             Button::quiet("transport-cancel-download", "Cancel").on_click(move |_, _, cx| {
@@ -276,6 +306,11 @@ impl Render for Transport {
                     )
                     .children(cancel),
             )
+            .children(
+                self.notice
+                    .clone()
+                    .map(|notice| div().id("transport-notice").ui_text().child(notice)),
+            )
     }
 }
 
@@ -299,21 +334,35 @@ mod tests {
             Stage::Downloading,
             (3 << 20, 6 << 20),
             &SMALL_PIANO,
+            None,
         );
         assert_eq!(
             text,
             "Downloading the piano (Upright piano (small)): 50 % (3.0 of 6.0 MiB)"
         );
-        let first = sound_text(&Sound::Off, Stage::Idle, (0, 0), &SMALL_PIANO);
+        let first = sound_text(&Sound::Off, Stage::Idle, (0, 0), &SMALL_PIANO, None);
         assert!(first.contains("first time you play"));
         assert!(
             sound_text(
                 &Sound::Failed("no audio output".into()),
                 Stage::Idle,
                 (0, 0),
-                &SMALL_PIANO
+                &SMALL_PIANO,
+                None
             )
             .ends_with("no audio output")
         );
+    }
+
+    #[test]
+    fn a_midi_output_is_named_and_has_no_download() {
+        let output = Some("MIDI output “Digital Piano”");
+        let said = |sound: Sound, stage| sound_text(&sound, stage, (0, 0), &SMALL_PIANO, output);
+        assert_eq!(
+            said(Sound::Ready, Stage::Idle),
+            "Playing on the MIDI output “Digital Piano”."
+        );
+        assert!(!said(Sound::Off, Stage::Idle).contains("downloaded"));
+        assert!(said(Sound::Preparing, Stage::Idle).starts_with("Opening the MIDI output"));
     }
 }

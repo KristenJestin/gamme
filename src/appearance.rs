@@ -3,10 +3,10 @@
 //! are the desktop's Omarchy theme, or Gamme's own, Nocturne, light or dark. Gamme keeps the choice
 //! in its state folder, and uses it again at the next start.
 //!
-//! The settings page (a later issue) takes the control over from the home screen.
+//! The control is on the settings page (`settings.rs`). The choice stays here, in the state
+//! folder, not with the settings in the config folder: it is the kit's appearance state, kept
+//! where the other applications on the kit keep theirs.
 
-use std::io::Write as _;
-use std::os::unix::fs::{DirBuilderExt as _, OpenOptionsExt as _};
 use std::path::{Path, PathBuf};
 
 use gpui_design_system::appearance::{self, Appearance, Source};
@@ -16,7 +16,7 @@ use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::{App, IntoElement, ParentElement, Styled, div, px};
 use serde::{Deserialize, Serialize};
 
-use crate::{paths, theme};
+use crate::{config, paths, theme};
 
 /// The id of the kit's Omarchy desktop source.
 const OMARCHY: &str = "omarchy";
@@ -99,21 +99,7 @@ pub fn read(state: &Path) -> Result<Kept, String> {
 /// Keeps `kept`: the folder `0700`, the file `0600`, written beside and renamed over the old one,
 /// so that it is the old choice or the new one, never half of one.
 pub fn save(state: &Path, kept: Kept) -> std::io::Result<()> {
-    std::fs::DirBuilder::new()
-        .recursive(true)
-        .mode(0o700)
-        .create(state)?;
-    let path = file(state);
-    let temp = path.with_extension(format!("json.{}.tmp", std::process::id()));
-    let mut out = std::fs::OpenOptions::new()
-        .write(true)
-        .create(true)
-        .truncate(true)
-        .mode(0o600)
-        .open(&temp)?;
-    out.write_all(&serde_json::to_vec(&kept)?)?;
-    out.sync_all()?;
-    std::fs::rename(&temp, &path)
+    config::write_private(state, "appearance.json", &serde_json::to_vec(&kept)?)
 }
 
 /// Uses the choice kept, once the kit is started. A file that cannot be read is said, and the

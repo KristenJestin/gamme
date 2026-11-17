@@ -15,6 +15,11 @@ pub fn state() -> Option<PathBuf> {
     Some(folder("XDG_STATE_HOME", ".local/state")?.join("gamme"))
 }
 
+/// `$XDG_CONFIG_HOME/gamme`: what the player chose in the settings.
+pub fn config() -> Option<PathBuf> {
+    Some(folder("XDG_CONFIG_HOME", ".config")?.join("gamme"))
+}
+
 /// `$XDG_DATA_HOME/gamme/library`: the pieces the player imported, each in a folder of its own.
 pub fn library() -> Option<PathBuf> {
     Some(data_home()?.join("gamme").join("library"))

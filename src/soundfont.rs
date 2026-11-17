@@ -76,10 +76,6 @@ pub const CONCERT_GRAND: Font = Font {
     bytes: 1_266_462_334,
 };
 
-#[cfg_attr(
-    not(test),
-    expect(dead_code, reason = "Settings lists the pianos (#16)")
-)]
 pub const FONTS: [Font; 2] = [SMALL_PIANO, CONCERT_GRAND];
 
 impl Font {

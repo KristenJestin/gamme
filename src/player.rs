@@ -1,10 +1,15 @@
-//! A piece being played: its timeline, its clock, and the built-in piano that sounds it.
+//! A piece being played: its timeline, its clock, and the output that sounds it: the built-in
+//! piano, or a MIDI output (`midi_out.rs`), both an [`Audio`].
 //!
 //! The window holds a [`Player`] and calls it: `play`, `pause`, `seek_measure`, `set_speed`. The
-//! first `play` has the piano made ready on a thread of its own (the SoundFont fetched if it is
-//! not there yet, loaded, the audio output opened) and the clock starts when it is; what the
-//! window shows meanwhile is [`Player::sound`] and [`Player::progress`]. The thread keeps the
-//! output (a `cpal` stream is not `Send`) until the player goes.
+//! first `play` has the output made ready on a thread of its own (for the built-in piano, the
+//! SoundFont fetched if it is not there yet, loaded, the audio output opened) and the clock starts
+//! when it is; what the window shows meanwhile is [`Player::sound`] and [`Player::progress`]. The
+//! thread keeps the output (a `cpal` stream is not `Send`) until the player goes.
+//!
+//! An output that cannot be opened, or that is lost while the piece plays (a MIDI port unplugged),
+//! gives way to its [`Audio::fallback`] when it has one: the piece goes on from where it stood and
+//! [`Player::notice`] says what happened.
 
 use std::any::Any;
 use std::fs::File;
@@ -13,6 +18,8 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering::Relaxed};
 use std::sync::mpsc::{self, Sender};
 use std::sync::{Arc, Mutex};
+use std::thread::JoinHandle;
+use std::time::Duration;
 
 use rustysynth::SoundFont as RustySoundFont;
 
@@ -20,6 +27,10 @@ use crate::clock::{Clock, Speed};
 use crate::piano::{self, Hands};
 use crate::soundfont::{self, Fetcher, Font, Progress};
 use crate::timeline::Timeline;
+
+/// How long a player that goes waits for its output to be closed: a port that does not answer
+/// must not hold the window.
+const CLOSE_WAIT: Duration = Duration::from_millis(500);
 
 /// Where the sound of the piece stands.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -44,6 +55,21 @@ pub trait Audio: Send + Sync {
         hands: &Hands,
         lost: &Arc<AtomicBool>,
     ) -> Result<Box<dyn Any>, String>;
+
+    /// Whether `open` is given a SoundFont to play: the built-in piano's, not a MIDI output's.
+    fn needs_soundfont(&self) -> bool {
+        true
+    }
+
+    /// What the output is called, when it is not the built-in piano ("MIDI output “Piano”").
+    fn label(&self) -> Option<String> {
+        None
+    }
+
+    /// What plays instead when this output cannot be opened or is lost.
+    fn fallback(&self) -> Option<Arc<dyn Audio>> {
+        None
+    }
 }
 
 /// The built-in piano: `rustysynth` on the default output.
@@ -67,11 +93,20 @@ impl Audio for Builtin {
 }
 
 struct Shared {
+    /// What sounds the piece: the one the player was given, then its fallback if it gave way.
+    audio: Mutex<Arc<dyn Audio>>,
+    /// What the window is to say once: the output was replaced, and why.
+    notice: Mutex<Option<String>>,
+    /// An output gave way and its fallback is not open yet: what is to be said of it, which is
+    /// not said before the fallback plays (it may fail to open too).
+    pending: Mutex<Option<String>>,
     sound: Mutex<Sound>,
     /// The player pressed play and the clock has not started yet.
     play_when_ready: AtomicBool,
-    /// Set by the output's error callback (an atomic: nothing else is allowed there).
-    device_lost: Arc<AtomicBool>,
+    /// The flag of the output opened last, set by its error callback (an atomic: nothing else is
+    /// allowed there). Each output has its own: one that is closing, and says it is lost on its
+    /// way out, must not condemn the output that took its place.
+    device_lost: Mutex<Arc<AtomicBool>>,
     progress: Progress,
 }
 
@@ -82,10 +117,11 @@ pub struct Player {
     data: PathBuf,
     font: Font,
     fetcher: Arc<dyn Fetcher>,
-    audio: Arc<dyn Audio>,
     shared: Arc<Shared>,
     /// Dropping it ends the thread that holds the output.
-    stop: Option<Sender<()>>,
+    stop: Mutex<Option<Sender<()>>>,
+    /// That thread, so that the next one waits for the output to be closed before it opens its own.
+    thread: Mutex<Option<JoinHandle<()>>>,
 }
 
 impl Player {
@@ -104,26 +140,50 @@ impl Player {
             data,
             font,
             fetcher,
-            audio,
             shared: Arc::new(Shared {
+                audio: Mutex::new(audio),
+                notice: Mutex::new(None),
+                pending: Mutex::new(None),
                 sound: Mutex::new(Sound::Off),
                 play_when_ready: AtomicBool::new(false),
-                device_lost: Arc::new(AtomicBool::new(false)),
+                device_lost: Mutex::new(Arc::new(AtomicBool::new(false))),
                 progress: Progress::default(),
             }),
-            stop: None,
+            stop: Mutex::new(None),
+            thread: Mutex::new(None),
         }
     }
 
     pub fn sound(&self) -> Sound {
         let mut sound = self.shared.sound.lock().expect("the sound's lock");
-        if *sound == Sound::Ready && self.shared.device_lost.load(Relaxed) {
+        if *sound == Sound::Ready && self.shared.lost() {
+            if self.shared.fall_back("was lost") {
+                // The piece goes on from where it stood, on what takes over.
+                let was_playing = self.clock.playing() || self.shared.play_when_ready.load(Relaxed);
+                self.clock.pause();
+                self.shared.play_when_ready.store(was_playing, Relaxed);
+                *sound = Sound::Preparing;
+                drop(sound);
+                self.prepare();
+                return Sound::Preparing;
+            }
             // The piece would run on in silence: stop it and say why.
             *sound = Sound::Failed("the audio output was lost".into());
             self.shared.play_when_ready.store(false, Relaxed);
             self.clock.pause();
         }
         sound.clone()
+    }
+
+    /// What the window is to tell the player, once: the output was replaced by the built-in
+    /// piano, and why.
+    pub fn notice(&self) -> Option<String> {
+        self.shared.notice.lock().expect("the notice's lock").take()
+    }
+
+    /// What the piece sounds on, when it is not the built-in piano ("MIDI output “Piano”").
+    pub fn output_label(&self) -> Option<String> {
+        self.shared.audio().label()
     }
 
     pub fn progress(&self) -> &Progress {
@@ -184,22 +244,41 @@ impl Player {
         self.shared.progress.cancel();
     }
 
-    /// Starts the thread that makes the piano ready; the state is `Preparing` already.
-    fn prepare(&mut self) {
+    /// Lets the output go and waits for it to be closed (its keys let go), for `wait` at most:
+    /// what the window does when it quits, since a thread that is detached is not waited for.
+    pub fn shutdown(&self, wait: Duration) {
+        self.shared.progress.cancel();
+        // The thread ends with its sender, and drops the output.
+        self.stop.lock().expect("the stop's lock").take();
+        let Some(thread) = self.thread.lock().expect("the thread's lock").take() else {
+            return;
+        };
+        let (done, finished) = mpsc::channel::<()>();
+        let waiter = std::thread::Builder::new()
+            .name("gamme-audio-wait".into())
+            .spawn(move || {
+                let _ = thread.join();
+                let _ = done.send(());
+            });
+        if waiter.is_ok() {
+            let _ = finished.recv_timeout(wait);
+        }
+    }
+
+    /// Starts the thread that makes the output ready; the state is `Preparing` already.
+    fn prepare(&self) {
         // A new job: what the last one met does not apply to it.
         self.shared.progress.reset();
-        self.shared.device_lost.store(false, Relaxed);
-        // An output lost or never made drives the clock no more: the wall clock does until the
-        // new one renders.
-        self.clock.release();
+        self.shared.fresh_lost();
+        let previous = self.thread.lock().expect("the thread's lock").take();
         let (stop, stopped) = mpsc::channel::<()>();
-        self.stop = Some(stop);
+        // The last output's thread ends with its sender, and lets its keys go.
+        *self.stop.lock().expect("the stop's lock") = Some(stop);
         let job = Job {
             shared: self.shared.clone(),
             data: self.data.clone(),
             font: self.font,
             fetcher: self.fetcher.clone(),
-            audio: self.audio.clone(),
             timeline: self.timeline.clone(),
             clock: self.clock.clone(),
             hands: self.hands.clone(),
@@ -207,14 +286,25 @@ impl Player {
         let spawned = std::thread::Builder::new()
             .name("gamme-audio".into())
             .spawn(move || {
+                // The last output is closed first: it renders no more, so it cannot take the
+                // clock again after it is released, and a MIDI port is let go of before the
+                // next one opens.
+                if let Some(previous) = previous {
+                    let _ = previous.join();
+                }
+                // An output lost or never made drives the clock no more: the wall clock does
+                // until the new one renders.
+                job.clock.release();
                 let output = job.run();
                 // The output lives until the player goes (the channel closes).
                 let _ = stopped.recv();
                 drop(output);
             });
-        if let Err(error) = spawned {
-            self.shared
-                .fail(format!("cannot start the audio thread: {error}"));
+        match spawned {
+            Ok(thread) => *self.thread.lock().expect("the thread's lock") = Some(thread),
+            Err(error) => self
+                .shared
+                .fail(format!("cannot start the audio thread: {error}")),
         }
     }
 }
@@ -222,7 +312,8 @@ impl Player {
 impl Drop for Player {
     fn drop(&mut self) {
         // A window closed during the download does not leave curl running; the part is kept.
-        self.shared.progress.cancel();
+        // The output is closed, and a MIDI one lets its keys go, before the player is gone.
+        self.shutdown(CLOSE_WAIT);
     }
 }
 
@@ -231,32 +322,50 @@ struct Job {
     data: PathBuf,
     font: Font,
     fetcher: Arc<dyn Fetcher>,
-    audio: Arc<dyn Audio>,
     timeline: Arc<Timeline>,
     clock: Clock,
     hands: Hands,
 }
 
 impl Job {
-    fn run(self) -> Option<Box<dyn Any>> {
-        let opened = soundfont::install(
-            &self.font,
-            &self.data,
-            &*self.fetcher,
-            &self.shared.progress,
-        )
-        .map_err(|e| e.to_string())
-        .and_then(|path| {
-            self.audio.open(
-                &path,
-                &self.timeline,
-                &self.clock,
-                &self.hands,
-                &self.shared.device_lost,
+    /// Opens `audio`: the SoundFont first when it plays one.
+    fn open(&self, audio: &dyn Audio) -> Result<Box<dyn Any>, String> {
+        // The output's own flag: a dead one's cannot say this one is lost.
+        let lost = self.shared.fresh_lost();
+        let soundfont = if audio.needs_soundfont() {
+            soundfont::install(
+                &self.font,
+                &self.data,
+                &*self.fetcher,
+                &self.shared.progress,
             )
-        });
+            .map_err(|e| e.to_string())?
+        } else {
+            PathBuf::new()
+        };
+        audio.open(&soundfont, &self.timeline, &self.clock, &self.hands, &lost)
+    }
+
+    fn run(self) -> Option<Box<dyn Any>> {
+        let mut opened = self.open(&*self.shared.audio());
+        if let Err(why) = &opened
+            && self.shared.fall_back(&format!("cannot be used ({why})"))
+        {
+            opened = self.open(&*self.shared.audio());
+        }
         match opened {
             Ok(output) => {
+                // An output gave way: it is said now that what takes over plays.
+                if let Some(said) = self
+                    .shared
+                    .pending
+                    .lock()
+                    .expect("the notice's lock")
+                    .take()
+                {
+                    *self.shared.notice.lock().expect("the notice's lock") =
+                        Some(format!("{said} The built-in piano plays instead."));
+                }
                 // Ready and the start of a piece asked for meanwhile, in one go.
                 let mut sound = self.shared.sound.lock().expect("the sound's lock");
                 *sound = Sound::Ready;
@@ -266,6 +375,16 @@ impl Job {
                 Some(output)
             }
             Err(message) => {
+                // What gave way is said alone: the failure of what took over is the state's.
+                if let Some(said) = self
+                    .shared
+                    .pending
+                    .lock()
+                    .expect("the notice's lock")
+                    .take()
+                {
+                    *self.shared.notice.lock().expect("the notice's lock") = Some(said);
+                }
                 self.shared.fail(message);
                 None
             }
@@ -274,6 +393,38 @@ impl Job {
 }
 
 impl Shared {
+    fn audio(&self) -> Arc<dyn Audio> {
+        self.audio.lock().expect("the audio's lock").clone()
+    }
+
+    /// The flag a new output is opened with, which is the one [`Shared::lost`] reads from now on.
+    fn fresh_lost(&self) -> Arc<AtomicBool> {
+        let fresh = Arc::new(AtomicBool::new(false));
+        *self.device_lost.lock().expect("the lost flag's lock") = fresh.clone();
+        fresh
+    }
+
+    /// Whether the output opened last says it is lost.
+    fn lost(&self) -> bool {
+        self.device_lost
+            .lock()
+            .expect("the lost flag's lock")
+            .load(Relaxed)
+    }
+
+    /// Puts the output's fallback in its place, if it has one. What is to be told of it (`why`
+    /// follows the output's name) waits for the fallback to open.
+    fn fall_back(&self, why: &str) -> bool {
+        let mut audio = self.audio.lock().expect("the audio's lock");
+        let Some(next) = audio.fallback() else {
+            return false;
+        };
+        let name = audio.label().unwrap_or_else(|| "The sound output".into());
+        *self.pending.lock().expect("the notice's lock") = Some(format!("{name} {why}."));
+        *audio = next;
+        true
+    }
+
     fn fail(&self, message: String) {
         self.play_when_ready.store(false, Relaxed);
         *self.sound.lock().expect("the sound's lock") = Sound::Failed(message);
@@ -551,5 +702,218 @@ mod tests {
         player.set_speed(50);
         assert_eq!(player.clock.speed().factor(), 0.5);
         player.pause();
+    }
+
+    /// Says it is closed when the player lets go of it.
+    struct Closes(Arc<AtomicBool>);
+
+    impl Drop for Closes {
+        fn drop(&mut self) {
+            self.0.store(true, Relaxed);
+        }
+    }
+
+    /// A MIDI output as the player sees it: it plays no SoundFont, and the built-in piano (here
+    /// `Opened`) stands by.
+    struct Midi {
+        fallback: Arc<dyn Audio>,
+        /// Whether the port is not there.
+        absent: bool,
+        opened: Mutex<Option<(Arc<AtomicBool>, Arc<AtomicBool>)>>,
+    }
+
+    impl Midi {
+        fn new(fallback: Arc<dyn Audio>, absent: bool) -> Arc<Self> {
+            Arc::new(Self {
+                fallback,
+                absent,
+                opened: Mutex::new(None),
+            })
+        }
+    }
+
+    impl Audio for Midi {
+        fn open(
+            &self,
+            path: &Path,
+            _: &Timeline,
+            _: &Clock,
+            _: &Hands,
+            lost: &Arc<AtomicBool>,
+        ) -> Result<Box<dyn Any>, String> {
+            assert_eq!(path, Path::new(""), "no SoundFont for a MIDI output");
+            if self.absent {
+                return Err("it is not connected".into());
+            }
+            let closed = Arc::new(AtomicBool::new(false));
+            *self.opened.lock().unwrap() = Some((lost.clone(), closed.clone()));
+            Ok(Box::new(Closes(closed)))
+        }
+
+        fn needs_soundfont(&self) -> bool {
+            false
+        }
+
+        fn label(&self) -> Option<String> {
+            Some("MIDI output “Test piano”".into())
+        }
+
+        fn fallback(&self) -> Option<Arc<dyn Audio>> {
+            Some(self.fallback.clone())
+        }
+    }
+
+    #[test]
+    fn a_midi_output_plays_without_a_soundfont() {
+        let data = temp("player-midi");
+        // The fetcher would have been asked for the SoundFont, and it waits to be let go.
+        let gate = Arc::new(Gate {
+            released: Arc::new(AtomicBool::new(false)),
+            calls: Mutex::new(0),
+        });
+        let midi = Midi::new(Opened::new(), false);
+        let mut player = Player::new(timeline(), data.clone(), font(), gate.clone(), midi.clone());
+        assert_eq!(player.output_label().unwrap(), "MIDI output “Test piano”");
+        player.play();
+        until("the output", || player.sound() == Sound::Ready);
+        assert!(player.clock.playing());
+        assert_eq!(*gate.calls.lock().unwrap(), 0);
+        assert_eq!(player.notice(), None);
+
+        // The player going closes the output: its keys are let go (see `midi_out`).
+        let (_, closed) = midi.opened.lock().unwrap().clone().unwrap();
+        assert!(!closed.load(Relaxed));
+        drop(player);
+        until("the output to close", || closed.load(Relaxed));
+        let _ = std::fs::remove_dir_all(data);
+    }
+
+    #[test]
+    fn a_midi_output_that_is_not_there_gives_way_to_the_built_in_piano_and_says_so() {
+        let data = temp("player-midi-absent");
+        let piano = Opened::new();
+        let mut player = Player::new(
+            timeline(),
+            data.clone(),
+            font(),
+            Arc::new(Serves(Arc::new(AtomicBool::new(true)))),
+            Midi::new(piano.clone(), true),
+        );
+        player.play();
+        until("the built-in piano", || player.sound() == Sound::Ready);
+        assert!(
+            player.clock.playing(),
+            "the piece plays, on the other output"
+        );
+        assert_eq!(piano.paths.lock().unwrap().len(), 1);
+        assert_eq!(player.output_label(), None);
+        let notice = player.notice().unwrap();
+        assert!(
+            notice.starts_with("MIDI output “Test piano” cannot be used (it is not connected)")
+        );
+        assert!(
+            notice.ends_with("The built-in piano plays instead."),
+            "{notice}"
+        );
+        assert_eq!(player.notice(), None, "said once");
+        let _ = std::fs::remove_dir_all(data);
+    }
+
+    #[test]
+    fn a_player_that_shuts_down_has_closed_its_output_when_it_returns() {
+        let data = temp("player-shutdown");
+        let midi = Midi::new(Opened::new(), false);
+        let mut player = Player::new(
+            timeline(),
+            data.clone(),
+            font(),
+            Arc::new(Serves(Arc::new(AtomicBool::new(true)))),
+            midi.clone(),
+        );
+        player.play();
+        until("the output", || player.sound() == Sound::Ready);
+        let (_, closed) = midi.opened.lock().unwrap().clone().unwrap();
+        player.shutdown(Duration::from_secs(5));
+        assert!(closed.load(Relaxed), "closed, not closing");
+        // Going on after it is not a second close.
+        drop(player);
+        let _ = std::fs::remove_dir_all(data);
+    }
+
+    #[test]
+    fn a_fallback_that_cannot_open_is_not_said_to_play() {
+        let data = temp("player-fallback-fails");
+        // The built-in piano is asked for its SoundFont, and the fetcher is not there.
+        let released = Arc::new(AtomicBool::new(true));
+        let gate = Arc::new(Gate {
+            released,
+            calls: Mutex::new(0),
+        });
+        let mut player = Player::new(
+            timeline(),
+            data.clone(),
+            font(),
+            gate,
+            Midi::new(Opened::new(), true),
+        );
+        player.play();
+        until("the failure", || matches!(player.sound(), Sound::Failed(_)));
+        let notice = player.notice().unwrap();
+        assert!(notice.starts_with("MIDI output “Test piano” cannot be used"));
+        assert!(!notice.contains("plays instead"), "{notice}");
+        let _ = std::fs::remove_dir_all(data);
+    }
+
+    #[test]
+    fn a_lost_midi_output_gives_way_to_the_built_in_piano_where_the_piece_stood() {
+        let data = temp("player-midi-lost");
+        let piano = Opened::new();
+        let midi = Midi::new(piano.clone(), false);
+        let mut player = Player::new(
+            timeline(),
+            data.clone(),
+            font(),
+            Arc::new(Serves(Arc::new(AtomicBool::new(true)))),
+            midi.clone(),
+        );
+        player.play();
+        until("the output", || player.sound() == Sound::Ready);
+        player.clock.seek_ms(1_500.);
+        let (lost, closed) = midi.opened.lock().unwrap().clone().unwrap();
+        assert!(piano.paths.lock().unwrap().is_empty());
+
+        // What the MIDI thread does when the port is gone.
+        lost.store(true, Relaxed);
+        assert_eq!(player.sound(), Sound::Preparing);
+        until("the built-in piano", || player.sound() == Sound::Ready);
+        assert!(player.clock.playing(), "it goes on");
+        assert_eq!(player.clock.snapshot().position_us, 1_500_000);
+        assert_eq!(piano.paths.lock().unwrap().len(), 1);
+        until("the lost output to close", || closed.load(Relaxed));
+        assert_eq!(player.output_label(), None);
+        let notice = player.notice().unwrap();
+        assert!(
+            notice.starts_with("MIDI output “Test piano” was lost."),
+            "{notice}"
+        );
+        assert_eq!(player.notice(), None);
+
+        // The lost output goes on failing as it closes (its thread still looks at its port):
+        // that is its own flag, and says nothing of the piano that took over.
+        lost.store(true, Relaxed);
+        assert_eq!(player.sound(), Sound::Ready);
+        assert!(player.clock.playing());
+        assert_eq!(player.notice(), None);
+
+        // The built-in piano is not replaced by anything: its loss is a failure, as before.
+        piano
+            .lost
+            .lock()
+            .unwrap()
+            .as_ref()
+            .unwrap()
+            .store(true, Relaxed);
+        assert!(matches!(player.sound(), Sound::Failed(_)));
+        let _ = std::fs::remove_dir_all(data);
     }
 }
