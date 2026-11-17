@@ -16,6 +16,7 @@ use gpui_design_system::{
 use gpui_kit::*;
 
 use crate::icons;
+use crate::midi_in::MidiIn;
 use crate::player::{Player, Sound};
 use crate::practice::{self, Choice, Playing, Practice};
 use crate::soundfont::Stage;
@@ -36,6 +37,8 @@ pub struct Transport {
     /// no score, whose measures are counted.
     names: Vec<SharedString>,
     practice: Practice,
+    /// Whether a keyboard is listened to is looked at here, for the wait.
+    midi_in: MidiIn,
     wall: WallClock,
     /// What the player said last about its output (it was replaced), kept on screen.
     notice: Option<String>,
@@ -49,9 +52,11 @@ impl Transport {
     pub fn new(
         player: Player,
         names: Vec<SharedString>,
-        practice: Practice,
+        mut practice: Practice,
+        midi_in: MidiIn,
         cx: &mut Context<Self>,
     ) -> Self {
+        practice.set_keyboard(midi_in.listening_to_any(), &player);
         practice.apply(&player);
         let refresh = cx.spawn(async move |this, cx| {
             loop {
@@ -65,6 +70,11 @@ impl Transport {
                             cx.notify();
                         }
                         this.wall.tick(&this.player.clock);
+                        // A keyboard plugged in or out: the wait can be had, or not.
+                        let keyboard = this.midi_in.listening_to_any();
+                        if this.practice.set_keyboard(keyboard, &this.player) {
+                            cx.notify();
+                        }
                         // Idle, nothing changes: no frame to draw.
                         if this.player.wants_to_play() || sound == Sound::Preparing {
                             cx.notify();
@@ -87,6 +97,7 @@ impl Transport {
             player,
             names,
             practice,
+            midi_in,
             wall: WallClock::default(),
             notice: None,
             _refresh: refresh,
@@ -114,10 +125,12 @@ impl Transport {
         cx.notify();
     }
 
+    /// A wait that cannot be had (listening, no keyboard) is not turned on.
     pub fn set_wait(&mut self, wait: bool, cx: &mut Context<Self>) {
-        self.practice.set_wait(wait, &self.player);
-        cx.emit(self.practice.choice());
-        cx.notify();
+        if self.practice.set_wait(wait, &self.player) {
+            cx.emit(self.practice.choice());
+            cx.notify();
+        }
     }
 
     /// `a` and `b`: the loop starts, or ends, with the measure the piece is in.
@@ -202,14 +215,19 @@ impl Transport {
         };
         let wait = {
             let this = this.clone();
-            Switch::new("transport-wait", choice.wait, "Wait for me (w)")
-                .disabled(choice.playing == Playing::Listen)
-                .on_click(move |_, _, cx| {
-                    this.update(cx, |t, cx| {
-                        let wait = !t.practice.choice().wait;
-                        t.set_wait(wait, cx);
-                    })
+            let switch = Switch::new("transport-wait", choice.wait, "Wait for me (w)")
+                .disabled(!self.practice.can_wait());
+            let switch = if self.practice.keyboard() {
+                switch
+            } else {
+                switch.hint("Plug in a MIDI keyboard: the wait listens to it")
+            };
+            switch.on_click(move |_, _, cx| {
+                this.update(cx, |t, cx| {
+                    let wait = !t.practice.choice().wait;
+                    t.set_wait(wait, cx);
                 })
+            })
         };
         let waiting = self.player.clock.held().then(|| {
             div()

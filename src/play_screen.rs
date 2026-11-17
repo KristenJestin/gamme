@@ -323,6 +323,8 @@ pub struct PlayScreen {
     hands_open: bool,
     /// The practice on its way to the library.
     kept: Arc<Kept>,
+    /// Whether a keyboard is listened to, for the wait.
+    midi_in: MidiIn,
     focus: FocusHandle,
 }
 
@@ -444,6 +446,7 @@ impl PlayScreen {
             marked: false,
             hands_open: false,
             kept: Arc::default(),
+            midi_in: midi_in.clone(),
             focus,
         }
     }
@@ -538,7 +541,8 @@ impl PlayScreen {
                 player.chords.clone(),
             ),
         };
-        let transport = cx.new(|cx| Transport::new(player, names, practice, cx));
+        let midi_in = self.midi_in.clone();
+        let transport = cx.new(|cx| Transport::new(player, names, practice, midi_in, cx));
         let observe = cx.observe(&transport, |_, _, cx| cx.notify());
         let keep = cx.subscribe(&transport, |this, _, choice: &Choice, cx| {
             this.keep_practice(*choice, cx);

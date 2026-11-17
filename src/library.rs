@@ -220,7 +220,9 @@ impl Library {
                 format!("{id:?} is not a piece's id"),
             ));
         }
-        let _turn = CHANGES.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        let _turn = CHANGES
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         let folder = self.root.join(id);
         let mut piece = read_piece(&folder)
             .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "no such piece"))?;

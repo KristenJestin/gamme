@@ -235,31 +235,66 @@ pub struct Practice {
     /// The loop's ends as chosen, measures in the order of play; it plays once both are.
     a: Option<usize>,
     b: Option<usize>,
+    /// Whether a MIDI keyboard is listened to: with none, nothing would ever release a wait, and
+    /// the clock does not wait, whatever is chosen.
+    keyboard: bool,
     waiter: Waiter,
 }
 
 impl Practice {
+    /// With no keyboard known yet ([`Practice::set_keyboard`]).
     pub fn new(choice: Choice, chords: Arc<Chords>) -> Self {
         Self {
             choice,
             a: None,
             b: None,
+            keyboard: false,
             waiter: Waiter::new(chords),
         }
     }
 
-    /// The same choice and loop, for the player that takes `player`'s place (the hands of a
-    /// MIDI file's parts changed).
+    /// The same choice, loop and keyboard, for the player that takes `player`'s place (the hands
+    /// of a MIDI file's parts changed).
     pub fn carried(&self, chords: Arc<Chords>) -> Self {
         Self {
             a: self.a,
             b: self.b,
+            keyboard: self.keyboard,
             ..Self::new(self.choice, chords)
         }
     }
 
     pub fn choice(&self) -> Choice {
         self.choice
+    }
+
+    /// Whether the wait can be had: the player plays a hand, on a keyboard listened to.
+    pub fn can_wait(&self) -> bool {
+        self.keyboard && self.choice.playing != Playing::Listen
+    }
+
+    /// Whether a keyboard is listened to.
+    pub fn keyboard(&self) -> bool {
+        self.keyboard
+    }
+
+    /// What the clock waits for: the choice, while there is a keyboard to release it.
+    fn wait_now(&self) -> Wait {
+        if self.keyboard {
+            self.choice.wait_for()
+        } else {
+            Wait::Off
+        }
+    }
+
+    /// A keyboard is listened to, or none any more; true when that changed.
+    pub fn set_keyboard(&mut self, keyboard: bool, player: &Player) -> bool {
+        let changed = self.keyboard != keyboard;
+        if changed {
+            self.keyboard = keyboard;
+            self.apply(player);
+        }
+        changed
     }
 
     /// The loop's first and last measures, once both are chosen.
@@ -280,7 +315,7 @@ impl Practice {
     pub fn apply(&self, player: &Player) {
         let (right, left) = self.choice.playing.computer();
         player.hands.set(right, left);
-        player.clock.set_wait(self.choice.wait_for());
+        player.clock.set_wait(self.wait_now());
         player.clock.set_loop(self.looped());
     }
 
@@ -289,9 +324,15 @@ impl Practice {
         self.apply(player);
     }
 
-    pub fn set_wait(&mut self, wait: bool, player: &Player) {
+    /// False, and nothing done, for a wait that cannot be had ([`Practice::can_wait`]); it can
+    /// always be ended.
+    pub fn set_wait(&mut self, wait: bool, player: &Player) -> bool {
+        if wait && !self.can_wait() {
+            return false;
+        }
         self.choice.wait = wait;
         self.apply(player);
+        true
     }
 
     /// The loop starts at the measure the piece stands in.
@@ -784,6 +825,27 @@ mod tests {
         };
         assert_eq!(listening.wait_for(), Wait::Off);
         assert_eq!(Playing::Both.next(), Playing::Listen);
+    }
+
+    #[test]
+    fn the_wait_needs_a_hand_played_and_a_keyboard() {
+        let choice = Choice {
+            playing: Playing::Right,
+            wait: true,
+        };
+        let mut practice = Practice::new(choice, Arc::default());
+        // No keyboard listened to: nothing would release it, the clock does not wait.
+        assert!(!practice.can_wait());
+        assert_eq!(practice.wait_now(), Wait::Off);
+        practice.keyboard = true;
+        assert!(practice.can_wait());
+        assert_eq!(practice.wait_now(), Wait::Right);
+        practice.choice.playing = Playing::Listen;
+        assert!(!practice.can_wait());
+        assert_eq!(practice.wait_now(), Wait::Off);
+        // Carried to the next player, the keyboard is still known.
+        practice.choice.playing = Playing::Left;
+        assert_eq!(practice.carried(Arc::default()).wait_now(), Wait::Left);
     }
 
     #[test]

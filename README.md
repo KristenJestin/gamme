@@ -67,7 +67,8 @@ What you play and the wait are kept with the piece; the loop is not.
 
 Known limits:
 
-- the wait listens to a MIDI keyboard only: the keys on the screen cannot be clicked;
+- the wait listens to a MIDI keyboard only (the keys on the screen cannot be clicked): with none
+  plugged in, or while you listen, it cannot be turned on and the piece does not wait;
 - a chord is the notes of your hands that start within 30 ms of each other: a rolled chord written
   as separate notes is waited for note by note.
 
