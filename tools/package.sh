@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # The archive of a build (docs/releases.md): `gamme-<version>-x86_64-linux.tar.gz`, holding the
-# binary, Gamme's licence, the fonts' licence and the launcher's files (`share/`: the desktop
+# binary, Gamme's licence, the fonts' licences and the launcher's files (`share/`: the desktop
 # entry and the icons, from packaging/linux) in one folder, and its SHA-256 sum beside it, as
 # `sha256sum --check` reads it. Linux x86_64 only.
 #   tools/package.sh <version> <binary> <out folder>
@@ -18,7 +18,11 @@ trap 'rm -rf "$work"' EXIT
 mkdir "$work/$name"
 install -m 0755 "$binary" "$work/$name/gamme"
 install -m 0644 "$root/LICENSE" "$work/$name/LICENSE"
-install -m 0644 "$root/assets/fonts/OFL.txt" "$work/$name/LICENSE-fonts.txt"
+# The fonts' licences in one file: the design system's Geist, then Gamme's own pixel fonts.
+cat "$root/assets/fonts/OFL.txt" \
+  <(printf '\n\n') "$root/assets/fonts/Jersey10-OFL.txt" \
+  <(printf '\n\n') "$root/assets/fonts/GammeDot-OFL.txt" >"$work/$name/LICENSE-fonts.txt"
+chmod 0644 "$work/$name/LICENSE-fonts.txt"
 (cd "$root/packaging/linux" && find gamme.desktop icons -type f | sort) | while read -r file; do
   case "$file" in
     gamme.desktop) target="share/applications/$file" ;;

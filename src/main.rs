@@ -5,6 +5,7 @@ mod desktop;
 mod engraver;
 mod falling;
 mod flash;
+mod fonts;
 mod home;
 mod icons;
 mod judge;
@@ -153,6 +154,7 @@ fn window(opening: Option<play_screen::Opening>) {
                 )])
                 .desktop(desktop);
             gpui_design_system::init(identity, cx);
+            fonts::register(cx);
             appearance::restore(cx);
             let bounds = Bounds::centered(None, size(px(1100.), px(760.)), cx);
             let options = WindowOptions {
