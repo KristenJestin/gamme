@@ -321,7 +321,33 @@ pub struct PlayScreen {
     marked: bool,
     /// Whether the hands of the parts are shown, to be changed.
     hands_open: bool,
+    /// The practice on its way to the library.
+    kept: Arc<Kept>,
     focus: FocusHandle,
+}
+
+/// A choice on its way to the library: the latest one only, written one at a time and in the
+/// order chosen, so that an earlier one never lands after a later one.
+#[derive(Default)]
+struct Kept {
+    latest: Mutex<Option<Choice>>,
+    writing: Mutex<()>,
+}
+
+impl Kept {
+    /// `choice` is the one to write from now on.
+    fn wants(&self, choice: Choice) {
+        *self.latest.lock().expect("the practice's lock") = Some(choice);
+    }
+
+    /// Writes the latest choice with `write`, unless a write before took it already. Blocking.
+    fn write(&self, write: impl FnOnce(Choice)) {
+        let _turn = self.writing.lock().expect("the practice's lock");
+        let latest = self.latest.lock().expect("the practice's lock").take();
+        if let Some(choice) = latest {
+            write(choice);
+        }
+    }
 }
 
 impl EventEmitter<Back> for PlayScreen {}
@@ -417,6 +443,7 @@ impl PlayScreen {
             sound_wanted: false,
             marked: false,
             hands_open: false,
+            kept: Arc::default(),
             focus,
         }
     }
@@ -534,7 +561,8 @@ impl PlayScreen {
         });
     }
 
-    /// The hands played and the wait, kept with the piece, off the main thread.
+    /// The hands played and the wait, kept with the piece, off the main thread: only the latest
+    /// choice, whatever came between.
     fn keep_practice(&mut self, choice: Choice, cx: &mut Context<Self>) {
         let Some((library, piece)) = &mut self.opening.library else {
             return;
@@ -542,11 +570,15 @@ impl PlayScreen {
         // What opens it again on this screen (its hands changed) starts with it too.
         piece.practice = Some(choice);
         let (library, id) = (library.clone(), piece.id.clone());
+        self.kept.wants(choice);
+        let kept = self.kept.clone();
         cx.background_executor()
             .spawn(async move {
-                if let Err(error) = library.set_practice(&id, choice) {
-                    eprintln!("gamme: the practice was not kept: {error}");
-                }
+                kept.write(|choice| {
+                    if let Err(error) = library.set_practice(&id, choice) {
+                        eprintln!("gamme: the practice was not kept: {error}");
+                    }
+                });
             })
             .detach();
     }
@@ -883,7 +915,8 @@ impl Render for PlayScreen {
 #[cfg(test)]
 mod tests {
     // Not `super::*`: gpui_kit's own `test` attribute would come with it.
-    use super::{Opening, View};
+    use super::{Kept, Opening, View};
+    use crate::practice::{Choice, Playing};
 
     fn parse(line: &str) -> Result<Opening, String> {
         let mut words = line.split_whitespace().map(str::to_owned);
@@ -920,5 +953,26 @@ mod tests {
         assert_eq!(View::Falling.next(), View::Score);
         assert_eq!(View::Score.next(), View::Both);
         assert_eq!(View::parse("score"), Some(View::Score));
+    }
+
+    #[test]
+    fn only_the_latest_practice_chosen_is_written() {
+        let kept = Kept::default();
+        let choice = |playing| Choice {
+            playing,
+            wait: false,
+        };
+        // Three choices before the first write runs: one write, of the last.
+        kept.wants(choice(Playing::Right));
+        kept.wants(choice(Playing::Left));
+        kept.wants(choice(Playing::Both));
+        let mut written = Vec::new();
+        for _ in 0..3 {
+            kept.write(|choice| written.push(choice.playing));
+        }
+        assert_eq!(written, [Playing::Both]);
+        kept.wants(choice(Playing::Listen));
+        kept.write(|choice| written.push(choice.playing));
+        assert_eq!(written, [Playing::Both, Playing::Listen]);
     }
 }

@@ -10,6 +10,8 @@ use std::fmt;
 use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
+use std::sync::Mutex;
+use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
@@ -208,7 +210,9 @@ impl Library {
         self.root.join(&piece.id).join(&piece.file)
     }
 
-    /// Reads a piece's metadata, changes it and writes it again.
+    /// Reads a piece's metadata, changes it and writes it again. One change at a time in the
+    /// process: two at once (the hands and the practice kept off the main thread, a piece marked
+    /// played) would each write what it read, and the one written last lose the other's.
     fn change(&self, id: &str, change: impl FnOnce(&mut Piece)) -> io::Result<()> {
         if !is_id(id) {
             return Err(io::Error::new(
@@ -216,6 +220,7 @@ impl Library {
                 format!("{id:?} is not a piece's id"),
             ));
         }
+        let _turn = CHANGES.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
         let folder = self.root.join(id);
         let mut piece = read_piece(&folder)
             .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "no such piece"))?;
@@ -244,12 +249,24 @@ fn read_piece(folder: &Path) -> Option<Piece> {
     }
 }
 
-/// Written aside and renamed, so that a metadata file is never half there.
+/// The changes of pieces' metadata take turns ([`Library::change`]).
+static CHANGES: Mutex<()> = Mutex::new(());
+
+/// Written aside and renamed, so that a metadata file is never half there. The file aside is
+/// this write's own: another write, of another process even, never renames it half written.
 fn write_metadata(folder: &Path, piece: &Piece) -> io::Result<()> {
+    static WRITES: AtomicU64 = AtomicU64::new(0);
     let json = serde_json::to_vec_pretty(piece).map_err(io::Error::other)?;
-    let aside = folder.join(format!("{METADATA}.new"));
-    fs::write(&aside, json)?;
-    fs::rename(aside, folder.join(METADATA))
+    let aside = folder.join(format!(
+        ".{METADATA}.{}.{}.new",
+        std::process::id(),
+        WRITES.fetch_add(1, Relaxed)
+    ));
+    let written = fs::write(&aside, json).and_then(|()| fs::rename(&aside, folder.join(METADATA)));
+    if written.is_err() {
+        fs::remove_file(&aside).ok();
+    }
+    written
 }
 
 /// The file's name without its extension: the title of a score that names none.
@@ -455,6 +472,42 @@ mod tests {
         assert_eq!(again[0].practice, Some(choice));
         assert_eq!(again[0].title, dance.title, "the rest stays");
         assert!(library.set_practice("../keep", choice).is_err());
+    }
+
+    #[test]
+    fn changes_made_at_once_from_several_threads_lose_nothing() {
+        use crate::practice::Playing;
+        let (_home, library) = library();
+        let tune = library.import(&fixture("a-tune.mid")).unwrap();
+        let choice = Choice {
+            playing: Playing::Left,
+            wait: true,
+        };
+        let hands = [PartHand::Left];
+        std::thread::scope(|scope| {
+            for thread in 0..3 {
+                let (library, id) = (&library, &tune.id);
+                scope.spawn(move || {
+                    for n in 0..30 {
+                        match thread {
+                            0 => library.set_hands(id, &hands).unwrap(),
+                            1 => library.set_practice(id, choice).unwrap(),
+                            _ => library.mark_played(id, n + 1).unwrap(),
+                        }
+                    }
+                });
+            }
+        });
+        let again = library.list();
+        assert_eq!(again.len(), 1, "the piece is still there");
+        assert_eq!(again[0].hands.as_deref(), Some(&hands[..]));
+        assert_eq!(again[0].practice, Some(choice));
+        assert_eq!(again[0].last_played, Some(30));
+        let left: Vec<_> = fs::read_dir(library.root.join(&tune.id))
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name())
+            .collect();
+        assert_eq!(left.len(), 2, "the score and its metadata only: {left:?}");
     }
 
     #[test]
