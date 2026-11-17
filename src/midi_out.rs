@@ -353,6 +353,12 @@ impl Link {
         }
     }
 
+    /// The player's sustain pedal; the close lets it up.
+    fn live_pedal(&self, value: u8) {
+        let mut state = self.state.lock().expect("the MIDI port's lock");
+        self.send(&mut state, &[0xB0 | CHANNEL, 64, value & 127]);
+    }
+
     fn send(&self, state: &mut State, message: &[u8]) {
         if state.closed || self.is_lost() {
             return;
@@ -411,6 +417,11 @@ impl Sink for MidiSink {
         self.0.release_piece();
     }
 
+    // The player's keys go out through `Live`, at once, not at the pace of this thread.
+    fn live_on(&mut self, _: u8, _: u8) {}
+    fn live_off(&mut self, _: u8) {}
+    fn live_pedal(&mut self, _: u8) {}
+
     fn render(&mut self, _: &mut [f32], _: &mut [f32]) {}
 }
 
@@ -443,6 +454,12 @@ impl Live {
     pub fn note_off(&self, key: u8) {
         if let Some(link) = self.link() {
             link.live_off(key);
+        }
+    }
+
+    pub fn pedal(&self, value: u8) {
+        if let Some(link) = self.link() {
+            link.live_pedal(value);
         }
     }
 }
@@ -665,6 +682,13 @@ impl Audio for MidiOut {
             self.live.note_on(key, velocity);
         } else {
             self.live.note_off(key);
+        }
+    }
+
+    fn live_pedal(&self, value: u8, from: &str) {
+        // Its own pedal too.
+        if !self.live.same_device(from) {
+            self.live.pedal(value);
         }
     }
 }
@@ -1180,6 +1204,29 @@ mod tests {
         Audio::live(&opened.midi, 74, 0, "20:1");
         assert_eq!(opened.count(NOTE_ON, 74), 0);
         assert_eq!(opened.count(NOTE_OFF, 74), 0);
+        // The pedal likewise: its own is not sent back, another keyboard's is.
+        opened.midi.live_pedal(127, "20:1");
+        assert_eq!(opened.count(0xB0, 64), 0);
+        opened.midi.live_pedal(127, "40:0");
+        opened.midi.live_pedal(0, "40:0");
+        let pedal: Vec<_> = opened
+            .sent()
+            .into_iter()
+            .filter(|m| m[..2] == [0xB0, 64])
+            .collect();
+        assert_eq!(pedal, [vec![0xB0, 64, 127], vec![0xB0, 64, 0]]);
+    }
+
+    #[test]
+    fn closing_the_output_lets_the_players_pedal_up() {
+        let opened = opened();
+        opened.midi.live_pedal(127, "40:0");
+        let Opened { ports, output, .. } = opened;
+        drop(output);
+        let sent = ports.sent();
+        let down = sent.iter().position(|m| m == &[0xB0, 64, 127]).unwrap();
+        let up = sent.iter().rposition(|m| m == &[0xB0, 64, 0]).unwrap();
+        assert!(down < up, "{sent:?}");
     }
 
     #[test]

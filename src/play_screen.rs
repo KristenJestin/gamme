@@ -10,9 +10,9 @@
 //!   in the library (`library.rs`), and the piece is made again with it, at the same place.
 //! - The first play marks the piece played, so that the home screen lists it first.
 //! - The keys the player strikes on a MIDI keyboard (`midi_in.rs`) light on the keyboard and sound
-//!   on the piece's output, playing or not: the output is opened with the piece when its piano is
-//!   downloaded already, else at the first key struck (or play). They are kept, with the instant
-//!   each arrived, for the game.
+//!   on the piece's output, playing or not, his sustain pedal too: the output is opened with the
+//!   piece when its piano is downloaded already, else at the first key struck (or play). Keys and
+//!   pedal are kept apart, with the instant each arrived, for the game.
 //!
 //! Keys: Space plays and pauses, `v` changes the view, Left and Right move by measure, `+`, `-`
 //! and `0` zoom the score, Escape goes back.
@@ -35,7 +35,7 @@ use crate::falling::falling;
 use crate::icons;
 use crate::keyboard::{Keyboard, Lights};
 use crate::library::{Library, Piece};
-use crate::midi_in::{self, Attached, MidiIn, Played};
+use crate::midi_in::{self, Attached, MidiIn, Pedal, Played};
 use crate::midi_out::{PortInfo, Ports};
 use crate::paths;
 use crate::player::{self, Player};
@@ -167,16 +167,23 @@ impl Opening {
 /// The play screen asks to go back to the pieces.
 pub struct Back;
 
-/// How many keys played are kept, the last ones.
+/// How many keys played, and pedal moves, are kept: the last ones.
 const PLAYED_KEPT: usize = 512;
 
-/// The keys the player strikes, as MIDI in hands them over, on its threads: lit and sounded
-/// there, and sent on to the window.
+/// What came from MIDI in, to the window.
+#[derive(Clone, Copy)]
+enum Arrival {
+    Key(Played),
+    Pedal(Pedal),
+}
+
+/// The keys the player strikes and his pedal, as MIDI in hands them over, on its threads: lit and
+/// sounded there, and sent on to the window.
 struct Struck {
     lights: Lights,
     /// The player's output, once there is a player.
     sound: Mutex<Option<player::Keys>>,
-    arrived: async_channel::Sender<Played>,
+    arrived: async_channel::Sender<Arrival>,
 }
 
 impl midi_in::Keys for Struck {
@@ -190,7 +197,14 @@ impl midi_in::Keys for Struck {
             sound.note(played.key, played.velocity, &from.id);
         }
         // Unbounded: never full, and it goes with the screen.
-        let _ = self.arrived.try_send(played);
+        let _ = self.arrived.try_send(Arrival::Key(played));
+    }
+
+    fn pedal(&self, pedal: Pedal, from: &PortInfo) {
+        if let Some(sound) = self.sound.lock().expect("the keys' lock").as_ref() {
+            sound.pedal(pedal.value, &from.id);
+        }
+        let _ = self.arrived.try_send(Arrival::Pedal(pedal));
     }
 }
 
@@ -267,8 +281,9 @@ pub struct PlayScreen {
     /// The keys go to `struck` while it is there.
     _attached: Attached,
     _arrivals: Task<()>,
-    /// The keys played last, oldest first.
+    /// The keys played last, and the pedal's last moves, oldest first.
     played: VecDeque<Played>,
+    pedal: VecDeque<Pedal>,
     /// Whether the output is opened without a play: its piano is there, or a key was struck.
     sound_wanted: bool,
     /// Whether the piece was marked played in the library.
@@ -341,11 +356,12 @@ impl PlayScreen {
         });
         let attached = midi_in.attach(struck.clone());
         let arrivals = cx.spawn(async move |this, cx| {
-            while let Ok(played) = arrivals.recv().await {
-                if this
-                    .update(cx, |this, cx| this.on_played(played, cx))
-                    .is_err()
-                {
+            while let Ok(arrival) = arrivals.recv().await {
+                let shown = this.update(cx, |this, cx| match arrival {
+                    Arrival::Key(played) => this.on_played(played, cx),
+                    Arrival::Pedal(pedal) => this.on_pedal(pedal),
+                });
+                if shown.is_err() {
                     break;
                 }
             }
@@ -366,6 +382,7 @@ impl PlayScreen {
             _attached: attached,
             _arrivals: arrivals,
             played: VecDeque::new(),
+            pedal: VecDeque::new(),
             sound_wanted: false,
             marked: false,
             hands_open: false,
@@ -377,6 +394,20 @@ impl PlayScreen {
     #[expect(dead_code, reason = "wait mode (#15) reads the keys played")]
     pub fn played(&self) -> &VecDeque<Played> {
         &self.played
+    }
+
+    /// The pedal's last moves, oldest first, apart from the keys.
+    #[expect(dead_code, reason = "wait mode (#15) reads the pedal")]
+    pub fn pedal(&self) -> &VecDeque<Pedal> {
+        &self.pedal
+    }
+
+    /// The pedal moved (sounded already): kept. Nothing on screen shows it.
+    fn on_pedal(&mut self, pedal: Pedal) {
+        if self.pedal.len() == PLAYED_KEPT {
+            self.pedal.pop_front();
+        }
+        self.pedal.push_back(pedal);
     }
 
     /// A key came from MIDI in (lit and sounded already): kept, and shown.

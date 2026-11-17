@@ -77,6 +77,9 @@ pub trait Audio: Send + Sync {
     /// A key the player strikes (`velocity` above 0) or lets go, on the input port `from` (its
     /// id), sounded on the output open now; nothing when none is. Called on MIDI's threads.
     fn live(&self, _key: u8, _velocity: u8, _from: &str) {}
+
+    /// The player's sustain pedal (its value, 64 and above down), as [`Audio::live`].
+    fn live_pedal(&self, _value: u8, _from: &str) {}
 }
 
 /// The built-in piano: `rustysynth` on the default output.
@@ -105,6 +108,10 @@ impl Audio for Builtin {
     fn live(&self, key: u8, velocity: u8, _from: &str) {
         self.keys.push(key, velocity);
     }
+
+    fn live_pedal(&self, value: u8, _from: &str) {
+        self.keys.push_pedal(value);
+    }
 }
 
 /// The keys the player strikes, to the player's output, whichever it is now (the one chosen or
@@ -115,6 +122,10 @@ pub struct Keys(Arc<Shared>);
 impl Keys {
     pub fn note(&self, key: u8, velocity: u8, from: &str) {
         self.0.audio().live(key, velocity, from);
+    }
+
+    pub fn pedal(&self, value: u8, from: &str) {
+        self.0.audio().live_pedal(value, from);
     }
 }
 
@@ -538,6 +549,11 @@ mod tests {
         fn live(&self, key: u8, velocity: u8, _: &str) {
             self.keys.lock().unwrap().push((key, velocity));
         }
+
+        /// The pedal, as a key 128 can never be.
+        fn live_pedal(&self, value: u8, _: &str) {
+            self.keys.lock().unwrap().push((128, value));
+        }
     }
 
     /// A font whose archive is the 7z fixture of `soundfont.rs`' tests, so that a real install
@@ -779,7 +795,8 @@ mod tests {
         lost.store(true, Relaxed);
         until("the built-in piano", || player.sound() == Sound::Ready);
         keys.note(60, 0, "24:0");
-        assert_eq!(*piano.keys.lock().unwrap(), [(60, 0)]);
+        keys.pedal(127, "24:0");
+        assert_eq!(*piano.keys.lock().unwrap(), [(60, 0), (128, 127)]);
         assert_eq!(midi.keys.lock().unwrap().len(), 1);
         let _ = std::fs::remove_dir_all(data);
     }
@@ -921,6 +938,31 @@ mod tests {
             "{notice}"
         );
         assert_eq!(player.notice(), None, "said once");
+        let _ = std::fs::remove_dir_all(data);
+    }
+
+    #[test]
+    fn a_warm_player_whose_midi_output_is_not_there_says_so_and_the_piano_answers() {
+        let data = temp("player-warm-midi-absent");
+        let piano = Opened::new();
+        let player = Player::new(
+            timeline(),
+            data.clone(),
+            font(),
+            Arc::new(Serves(Arc::new(AtomicBool::new(true)))),
+            Midi::new(piano.clone(), true),
+        );
+        // What the first key struck does.
+        player.warm();
+        until("the built-in piano", || player.sound() == Sound::Ready);
+        assert!(!player.clock.playing());
+        let notice = player.notice().unwrap();
+        assert!(
+            notice.starts_with("MIDI output “Test piano” cannot be used (it is not connected)"),
+            "{notice}"
+        );
+        player.keys().note(60, 90, "40:0");
+        assert_eq!(*piano.keys.lock().unwrap(), [(60, 90)]);
         let _ = std::fs::remove_dir_all(data);
     }
 

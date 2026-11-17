@@ -90,11 +90,13 @@ and SHA-256 before anything is unpacked.
 Gamme listens to every MIDI input port as it appears, a keyboard plugged in while the window is
 open included, and again after it was unplugged and plugged back; or only to the port chosen in the
 settings. On the play screen the keys you strike light up on the keyboard (in the hit colour) and
-sound on the piece's output, whether the piece plays or not: the built-in piano, at the shortest
-buffer the audio device takes (256 frames, about 5 ms, when it can), or the MIDI output. A key you
-hold is not cut by the piece ending its own note on that key, by a pause or by a seek; a key you
-let go does not cut the piece's note on it. The keys held on a keyboard that is unplugged are let
-go. Each key is stamped with the instant it arrived, for the game to come.
+sound on the piece's output, whether the piece plays or not, with your sustain pedal: the built-in
+piano, at the shortest buffer the audio device takes (256 frames, about 5 ms, when it can), or the
+MIDI output. On the built-in piano your keys and pedal are apart from the piece's notes: a key you
+hold is not cut by the piece ending its own note on that key, by a pause or by a seek, a key you
+let go does not cut the piece's note on it, and your pedal holds your notes only. The keys held
+and the pedal down on a keyboard that is unplugged are let go, within a second. Each key and each
+move of the pedal is stamped with the instant it arrived, for the game to come.
 
 The built-in piano is opened with the piece when its SoundFont is there already; otherwise the
 first key you strike (or **Play**) downloads it. A digital piano that is both your keyboard and the

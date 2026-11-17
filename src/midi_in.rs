@@ -12,9 +12,16 @@
 //! connected to is not tried again until it is unplugged or the choice changes: trying each
 //! second would make a client each second.
 //!
+//! The sustain pedal (controller 64) is handed on too, as a [`Pedal`] of its own: down while it
+//! is down on any keyboard.
+//!
 //! The messages come on the MIDI library's threads, one per port, never the window's: nothing
 //! there calls GPUI. A key held on two keyboards is let go when the last one lets go of it, and
-//! the keys held on a port that goes are let go then.
+//! the keys held on a port that goes, and its pedal, are let go then.
+//!
+//! A known limit: a port unplugged is seen at the next look, so its keys and its pedal are let go
+//! up to a second late. ALSA announces a port that goes (its System Announce port); listening to
+//! it would let go at once, but `midir` does not expose it.
 //!
 //! Gamme's own ports (its MIDI out) are never listened to, and "Midi Through" only when it is
 //! chosen: it echoes what other software sends it, and the piece itself when it is the output.
@@ -40,18 +47,40 @@ pub struct Played {
     pub at: Instant,
 }
 
+/// The sustain pedal moved to `value` (64 and above: down), and the instant it arrived.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Pedal {
+    pub value: u8,
+    pub at: Instant,
+}
+
 /// Where the keys go: what shows the keyboard.
 pub trait Keys: Send + Sync {
     /// A key played on the input port `from`. Called on MIDI's threads, never the window's, one
     /// at a time: it must not wait for the window.
     fn played(&self, played: Played, from: &PortInfo);
+    /// The pedal moved, on `from`; as [`Keys::played`].
+    fn pedal(&self, pedal: Pedal, from: &PortInfo);
 }
 
-/// The key of a message, and its velocity (0: let go); none for what is not a key.
-fn note(message: &[u8]) -> Option<(u8, u8)> {
+/// What a message says, of what Gamme listens to.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Message {
+    /// A key and its velocity (0: let go).
+    Key(u8, u8),
+    Pedal(u8),
+}
+
+/// The sustain pedal's controller.
+const PEDAL: u8 = 64;
+
+fn read(message: &[u8]) -> Option<Message> {
     match *message {
-        [status, key, velocity, ..] if status & 0xF0 == 0x90 => Some((key & 127, velocity & 127)),
-        [status, key, _, ..] if status & 0xF0 == 0x80 => Some((key & 127, 0)),
+        [status, key, velocity, ..] if status & 0xF0 == 0x90 => {
+            Some(Message::Key(key & 127, velocity & 127))
+        }
+        [status, key, _, ..] if status & 0xF0 == 0x80 => Some(Message::Key(key & 127, 0)),
+        [status, PEDAL, value, ..] if status & 0xF0 == 0xB0 => Some(Message::Pedal(value & 127)),
         _ => None,
     }
 }
@@ -77,13 +106,23 @@ fn wanted<'a>(list: &'a [PortInfo], choice: Option<&str>) -> Vec<&'a PortInfo> {
     }
 }
 
+/// An open connection, as the hub knows it.
+struct Listened {
+    serial: u64,
+    port: PortInfo,
+    /// The keys held on it, and its pedal.
+    held: [bool; 128],
+    pedal: u8,
+}
+
 /// The keys held on each connection, and where they go.
 struct Hub {
     keys: Option<(u64, Arc<dyn Keys>)>,
-    /// Each open connection: its number, its port, the keys held on it.
-    connections: Vec<(u64, PortInfo, [bool; 128])>,
+    connections: Vec<Listened>,
     /// On how many connections each key is held.
     count: [u8; 128],
+    /// The pedal as it was handed on last: the most down of the connections'.
+    pedal: u8,
 }
 
 impl Default for Hub {
@@ -92,19 +131,39 @@ impl Default for Hub {
             keys: None,
             connections: Vec::new(),
             count: [0; 128],
+            pedal: 0,
         }
     }
 }
 
 impl Hub {
+    fn opened(&mut self, serial: u64, port: PortInfo) {
+        self.connections.push(Listened {
+            serial,
+            port,
+            held: [false; 128],
+            pedal: 0,
+        });
+    }
+
     fn message(&mut self, serial: u64, message: &[u8], at: Instant) {
-        let Some((key, velocity)) = note(message) else {
+        let Some(message) = read(message) else {
             return;
         };
         // A message that comes as its connection closes.
-        let Some((_, from, held)) = self.connections.iter_mut().find(|c| c.0 == serial) else {
+        let Some(index) = self.connections.iter().position(|c| c.serial == serial) else {
             return;
         };
+        let (key, velocity) = match message {
+            Message::Key(key, velocity) => (key, velocity),
+            Message::Pedal(value) => {
+                self.connections[index].pedal = value;
+                let from = self.connections[index].port.clone();
+                self.pedal_moved(&from, at);
+                return;
+            }
+        };
+        let Listened { port, held, .. } = &mut self.connections[index];
         let at_key = usize::from(key);
         let count = &mut self.count[at_key];
         if velocity > 0 {
@@ -123,16 +182,28 @@ impl Hub {
             }
         }
         if let Some((_, keys)) = &self.keys {
-            keys.played(Played { key, velocity, at }, from);
+            keys.played(Played { key, velocity, at }, port);
         }
     }
 
-    /// The connection `serial` is closed: the keys held on it are let go.
+    /// A connection's pedal moved, or it went: the pedal is handed on if that changes it.
+    fn pedal_moved(&mut self, from: &PortInfo, at: Instant) {
+        let value = self.connections.iter().map(|c| c.pedal).max().unwrap_or(0);
+        if value == self.pedal {
+            return;
+        }
+        self.pedal = value;
+        if let Some((_, keys)) = &self.keys {
+            keys.pedal(Pedal { value, at }, from);
+        }
+    }
+
+    /// The connection `serial` is closed: the keys held on it, and its pedal, are let go.
     fn close(&mut self, serial: u64, at: Instant) {
-        let Some(index) = self.connections.iter().position(|c| c.0 == serial) else {
+        let Some(index) = self.connections.iter().position(|c| c.serial == serial) else {
             return;
         };
-        let (_, from, held) = self.connections.remove(index);
+        let Listened { port, held, .. } = self.connections.remove(index);
         for key in 0..128u8 {
             let at_key = usize::from(key);
             if !held[at_key] {
@@ -148,10 +219,11 @@ impl Hub {
                         velocity: 0,
                         at,
                     },
-                    &from,
+                    &port,
                 );
             }
         }
+        self.pedal_moved(&port, at);
     }
 }
 
@@ -359,9 +431,7 @@ impl Watcher {
         self.serials += 1;
         let serial = self.serials;
         // Known before the first message can come.
-        lock(&self.hub)
-            .connections
-            .push((serial, port.clone(), [false; 128]));
+        lock(&self.hub).opened(serial, port.clone());
         let hub = self.hub.clone();
         let on_message: OnMessage = Box::new(move |message| {
             // On arrival, before anything waits.
@@ -410,17 +480,27 @@ mod tests {
         }
     }
 
-    /// What the keys were, from where.
+    /// What the keys were, from where, and the pedal apart.
     #[derive(Default)]
-    struct Recorder(Mutex<Vec<(Played, String)>>);
+    struct Recorder(Mutex<Vec<(Played, String)>>, Mutex<Vec<(Pedal, String)>>);
 
     impl Keys for Recorder {
         fn played(&self, played: Played, from: &PortInfo) {
             self.0.lock().unwrap().push((played, from.name.clone()));
         }
+
+        fn pedal(&self, pedal: Pedal, from: &PortInfo) {
+            self.1.lock().unwrap().push((pedal, from.name.clone()));
+        }
     }
 
     impl Recorder {
+        /// Each value of the pedal, in order.
+        fn pedals(&self) -> Vec<u8> {
+            let pedal = self.1.lock().unwrap();
+            pedal.iter().map(|(p, _)| p.value).collect()
+        }
+
         /// Each key and velocity, in order.
         fn keys(&self) -> Vec<(u8, u8)> {
             let played = self.0.lock().unwrap();
@@ -444,14 +524,50 @@ mod tests {
     }
 
     #[test]
-    fn a_message_is_a_key_struck_or_let_go_or_nothing() {
-        assert_eq!(note(&[0x90, 60, 100]), Some((60, 100)));
+    fn a_message_is_a_key_struck_or_let_go_the_pedal_or_nothing() {
+        assert_eq!(read(&[0x90, 60, 100]), Some(Message::Key(60, 100)));
         // Any channel, and a note on at velocity 0 is a release.
-        assert_eq!(note(&[0x93, 61, 0]), Some((61, 0)));
-        assert_eq!(note(&[0x85, 62, 64]), Some((62, 0)));
-        assert_eq!(note(&[0xB0, 64, 127]), None);
-        assert_eq!(note(&[0xFE]), None);
-        assert_eq!(note(&[0x90, 60]), None);
+        assert_eq!(read(&[0x93, 61, 0]), Some(Message::Key(61, 0)));
+        assert_eq!(read(&[0x85, 62, 64]), Some(Message::Key(62, 0)));
+        assert_eq!(read(&[0xB0, 64, 127]), Some(Message::Pedal(127)));
+        assert_eq!(read(&[0xB2, 64, 30]), Some(Message::Pedal(30)));
+        // Another controller (modulation), active sensing, a cut message: nothing.
+        assert_eq!(read(&[0xB0, 1, 127]), None);
+        assert_eq!(read(&[0xFE]), None);
+        assert_eq!(read(&[0x90, 60]), None);
+    }
+
+    #[test]
+    fn the_pedal_is_its_own_event_down_while_any_keyboard_holds_it() {
+        let ports = Arc::new(FakePorts::new(&[], &[KEYSTATION, VMPK]));
+        let midi = start(&ports, None);
+        let keys = Arc::new(Recorder::default());
+        let _attached = midi.attach(keys.clone());
+        listening(&midi, &[KEYSTATION, VMPK]);
+        let before = Instant::now();
+        ports.send_from(KEYSTATION, &[0xB0, 64, 127]);
+        ports.send_from(VMPK, &[0xB0, 64, 127]);
+        // The other keyboard holds it still.
+        ports.send_from(KEYSTATION, &[0xB0, 64, 0]);
+        ports.send_from(VMPK, &[0xB0, 64, 0]);
+        assert_eq!(keys.pedals(), [127, 0]);
+        assert!(keys.1.lock().unwrap()[0].0.at >= before);
+        // Not among the keys.
+        assert!(keys.keys().is_empty());
+    }
+
+    #[test]
+    fn the_pedal_of_a_port_that_goes_is_let_up() {
+        let ports = Arc::new(FakePorts::new(&[], &[KEYSTATION]));
+        let midi = start(&ports, None);
+        let keys = Arc::new(Recorder::default());
+        let _attached = midi.attach(keys.clone());
+        listening(&midi, &[KEYSTATION]);
+        ports.send_from(KEYSTATION, &[0xB0, 64, 100]);
+        ports.unplug_input(KEYSTATION);
+        until("the pedal up", || keys.pedals() == [100, 0]);
+        let pedal = keys.1.lock().unwrap();
+        assert_eq!(pedal[1].1, KEYSTATION, "from the port that went");
     }
 
     #[test]
