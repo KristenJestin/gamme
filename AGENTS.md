@@ -18,7 +18,8 @@ for versions, CI, releases, install and update. This file is how to work.
 Today it is one window, the design system's identity and theme (Omarchy's, followed), the home
 screen and its library, the play screen (the score, the falling notes and the built-in piano), MIDI
 out and in, practice (hands, wait, A–B loop), the judge of every note with its latency calibration,
-its judgements shown live with a combo and a score, and the machinery above. The rest of the game layer, the method, the fingering and the pieces come
+its judgements shown live with a combo and a score, the end of a run (its stars, the measures most
+missed and Rework), and the machinery above. The rest of the game layer, the method, the fingering and the pieces come
 as issues of their own.
 
 ## Commands
@@ -72,21 +73,23 @@ The last three are CI's `verify` job (`.github/workflows/ci.yml`), on Rust 1.95,
 | `score_view.rs` | The score as the play screen holds it, the cursor, the sounding notes and the judgements on their notes drawn over it every frame; the `Playhead` the clock feeds |
 | `timeline.rs` | The notes of a piece in time, each with its hand, its measure and its engraved note (from Verovio's MIDI, or a MIDI file's tracks), and where its measures start |
 | `play_screen.rs` | The play screen: a piece opened, its three views (score and falling notes, falling notes, score), the hands of a MIDI piece's parts, the keys played (lit, sounded, kept, handed to the wait) |
-| `practice.rs` | Practice: the hands the player plays (the computer plays the others), the player's chords, the judge of the wait (`Waiter`), the A–B loop chosen |
+| `practice.rs` | Practice: the hands the player plays (the computer plays the others), the player's chords, the judge of the wait (`Waiter`), the A–B loop chosen, or Rework in its place |
 | `judge.rs` | The judge of every note (perfect, good, late, missed, wrong), pure, on the piece's time laid end to end across the loop's passes; `Live` feeds it from the clock, the run's judgements kept in order |
 | `latency.rs` | The latency calibration's clicks and its pure measure, the offset the judge takes away |
 | `tally.rs` | The run's score, combo and accuracy (design §5.2), pure, counted in the piece's order (a miss is said late); what the transport says of them |
+| `stars.rs` | The stars a run earns (design §5.3), pure, from its `Feat` (slowest speed, accuracy, wait, whole piece, aid): for the end of a run and the progress to come |
+| `run_end.rs` | The end of a run: the measures most missed and Rework's plan (pure), and the dialog that shows them with the stars |
 | `flash.rs` | The judgements on screen, fading (pure), and every colour and size they are drawn with, from the palette |
 | `falling.rs` | The falling notes over the keyboard, painted every frame in one canvas, the judgements flashing on the notes and keys, their words over them |
 | `keyboard.rs` | The on-screen keyboard's keys and places, and the keys lit from outside (MIDI in) |
 | `wall_clock.rs` | The clock moved by the wall clock while no sound moves it (the piano not ready, no output) |
-| `clock.rs` | The play position shared with the audio thread (atomics): play, pause, seek, speed; the chords it waits at and the loop it goes round, obeyed by whoever steps it (`step`, `commit`); where the piece stood at a key's instant (`position_at`) |
+| `clock.rs` | The play position shared with the audio thread (atomics): play, pause, seek, speed; the chords it waits at and the loop it goes round (spans of measures, apart or not), obeyed by whoever steps it (`step`, `commit`); where the piece stood at a key's instant (`position_at`) |
 | `soundfont.rs` | The SoundFonts of the built-in piano and their resumable, checked download |
 | `piano.rs` | The built-in piano: the audio callback's logic (`Renderer`), the player's keys on their lock-free way to it (`LiveKeys`), and the `cpal` output |
 | `player.rs` | A piece being played: timeline, clock, and its output (an `Audio`: the built-in piano or MIDI out) made ready on its own thread; the fallback to the built-in piano |
 | `midi_out.rs` | MIDI out as an `Audio`: a thread paces the clock by the wall clock and sends the notes; `midir` is behind `Ports` and `Wire` so no test opens a port (inputs included) |
 | `midi_in.rs` | MIDI in: one thread watches the input ports (every one, or the one chosen) and connects them as they appear; each key timestamped on arrival, counted per port, handed to the play screen's `Keys` |
-| `transport.rs` | The transport bar (play, seek by measure, speed, the hands played, the wait, the loop, the run's score, combo and accuracy, SoundFont progress); it holds the player, its practice and the judge of the run, its tally and its flashes |
+| `transport.rs` | The transport bar (play, seek by measure, speed, the hands played, the wait, the loop, the run's score, combo and accuracy, SoundFont progress); it holds the player, its practice and the judge of the run, its tally and its flashes, and makes the end of a run |
 
 Besides `src/`:
 

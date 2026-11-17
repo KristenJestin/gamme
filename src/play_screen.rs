@@ -16,6 +16,9 @@
 //! - Practice (`practice.rs`, its controls in the transport): the hands the player plays, the
 //!   wait (each key from MIDI in goes to it as it comes), the A–B loop. The hands and the wait
 //!   are kept with a piece of the library; all of it goes on when a MIDI file's parts change hands.
+//! - The end of a run (`run_end.rs`), made by the transport when the piece reaches its end, is
+//!   shown over the piece: its score, its stars, the measures most missed, and Rework. The
+//!   transport is told whether the falling notes are shown: the third star is earned without.
 //!
 //! Keys: Space plays and pauses, `v` changes the view, Left and Right move by measure, `+`, `-`
 //! and `0` zoom the score, `h` changes the hands played, `w` waits or not, `a` and `b` set the
@@ -44,6 +47,7 @@ use crate::midi_out::{PortInfo, Ports};
 use crate::paths;
 use crate::player::{self, Player};
 use crate::practice::{Choice, Practice};
+use crate::run_end;
 use crate::score::Score;
 use crate::score_view::{Playhead, ScoreView, timing};
 use crate::soundfont::{self, Font};
@@ -543,8 +547,14 @@ impl PlayScreen {
         };
         let midi_in = self.midi_in.clone();
         let latency_ms = self.settings.latency_ms;
-        let transport =
-            cx.new(|cx| Transport::new(player, names, practice, midi_in, latency_ms, cx));
+        let engraved = self.opening.engraved();
+        let aid = self.view != View::Score;
+        let transport = cx.new(|cx| {
+            let mut transport =
+                Transport::new(player, names, practice, midi_in, latency_ms, engraved, cx);
+            transport.set_aid(aid);
+            transport
+        });
         // The score is drawn again with the screen: a view is drawn only when told to, and it
         // asks for its own frames only once it sees the clock move or a judgement fade.
         let observe = cx.observe(&transport, |this, _, cx| {
@@ -617,6 +627,9 @@ impl PlayScreen {
         if let Some(score) = &ready.score {
             score.update(cx, |score, cx| score.reveal(cx));
         }
+        ready
+            .transport
+            .update(cx, |transport, _| transport.set_aid(view != View::Score));
         cx.notify();
     }
 
@@ -922,6 +935,21 @@ impl Render for PlayScreen {
             State::Ready(ready) => Some(ready.transport.clone()),
             _ => None,
         };
+        let end = transport.as_ref().and_then(|transport| {
+            let (summary, shown) = transport.read(cx).end()?;
+            let names = transport.read(cx).names();
+            let act = |what: fn(&mut Transport, &mut Context<Transport>)| {
+                let transport = transport.clone();
+                Box::new(move |_: &mut Window, cx: &mut App| transport.update(cx, what))
+                    as run_end::Action
+            };
+            let actions = run_end::Actions {
+                rework: act(Transport::rework),
+                again: act(Transport::play_again),
+                close: act(Transport::close_end),
+            };
+            Some(run_end::view(summary, names, shown, actions, cx))
+        });
         div()
             .id("play")
             .size_full()
@@ -943,6 +971,7 @@ impl Render for PlayScreen {
             .children(hands)
             .child(body)
             .children(transport)
+            .children(end)
     }
 }
 

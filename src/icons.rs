@@ -10,8 +10,28 @@ pub const MUSIC: Icon = Icon::Lucide("music");
 pub const PAUSE: Icon = Icon::Lucide("pause");
 pub const SKIP_BACK: Icon = Icon::Lucide("skip-back");
 pub const SKIP_FORWARD: Icon = Icon::Lucide("skip-forward");
+pub const STAR: Icon = Icon::Lucide("star");
+pub const STAR_FILL: Icon = Icon::Lucide("star-fill");
+pub const TROPHY: Icon = Icon::Lucide("trophy");
+pub const TARGET: Icon = Icon::Lucide("target");
+pub const FLAME: Icon = Icon::Lucide("flame");
+pub const REPEAT: Icon = Icon::Lucide("repeat");
 
-gpui_kit::assets::icon_assets!(Lucide, [Music, Pause, SkipBack, SkipForward]);
+gpui_kit::assets::icon_assets!(
+    Lucide,
+    [
+        Music,
+        Pause,
+        SkipBack,
+        SkipForward,
+        Star,
+        StarFill,
+        Trophy,
+        Target,
+        Flame,
+        Repeat
+    ]
+);
 
 /// Gamme's icons, then the kit's.
 pub struct Assets;

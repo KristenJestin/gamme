@@ -13,6 +13,9 @@
 //! - **Loop**: measures A to B, in the order of play (a repeat plays a measure twice: each time is
 //!   its own), chosen where the piece stands, again and again with no gap (`clock.rs` wraps the
 //!   position, `piano.rs` lets the piece's notes go at the seam).
+//! - **Rework** (`run_end.rs`): the end of a run loops its measures most missed, apart ones one
+//!   after the other (the clock's spans), slowed. It takes the A–B loop's place; setting A, B or
+//!   clearing the loop ends it.
 //!
 //! The choice of hands and the wait are kept with a piece of the library; the loop is not.
 
@@ -21,8 +24,9 @@ use std::time::Instant;
 
 use serde::{Deserialize, Serialize};
 
-use crate::clock::{Clock, Marks, Wait};
+use crate::clock::{Clock, Marks, Spans, Wait};
 use crate::player::Player;
+use crate::run_end::Plan;
 use crate::timeline::{Hand, Timeline};
 
 /// How early, in real time, a key struck before its chord still counts for it.
@@ -251,6 +255,8 @@ pub struct Practice {
     /// The loop's ends as chosen, measures in the order of play; it plays once both are.
     a: Option<usize>,
     b: Option<usize>,
+    /// Rework under way, in the A–B loop's place.
+    rework: Option<Plan>,
     /// Whether a MIDI keyboard is listened to: with none, nothing would ever release a wait, and
     /// the clock does not wait, whatever is chosen.
     keyboard: bool,
@@ -264,6 +270,7 @@ impl Practice {
             choice,
             a: None,
             b: None,
+            rework: None,
             keyboard: false,
             waiter: Waiter::new(chords),
         }
@@ -275,6 +282,7 @@ impl Practice {
         Self {
             a: self.a,
             b: self.b,
+            rework: self.rework.clone(),
             keyboard: self.keyboard,
             ..Self::new(self.choice, chords)
         }
@@ -319,6 +327,19 @@ impl Practice {
         Some((a.min(b), a.max(b)))
     }
 
+    /// Rework under way.
+    pub fn reworking(&self) -> Option<&Plan> {
+        self.rework.as_ref()
+    }
+
+    /// What the clock loops: Rework's spans, or the A–B loop.
+    pub fn spans(&self) -> Spans {
+        match &self.rework {
+            Some(plan) => plan.spans,
+            None => Spans::of(self.looped()),
+        }
+    }
+
     /// The loop's start, while its end is not chosen yet.
     pub fn half_loop(&self) -> Option<usize> {
         match (self.a, self.b) {
@@ -332,7 +353,7 @@ impl Practice {
         let (right, left) = self.choice.playing.computer();
         player.hands.set(right, left);
         player.clock.set_wait(self.wait_now());
-        player.clock.set_loop(self.looped());
+        player.clock.set_spans(self.spans());
     }
 
     pub fn set_playing(&mut self, playing: Playing, player: &Player) {
@@ -351,37 +372,55 @@ impl Practice {
         true
     }
 
-    /// The loop starts at the measure the piece stands in.
+    /// The loop starts at the measure the piece stands in; Rework ends.
     pub fn set_a(&mut self, player: &Player) {
         self.a = Some(player.clock.measure(&player.timeline));
+        self.rework = None;
         self.loop_changed(player);
     }
 
-    /// The loop ends with the measure the piece stands in.
+    /// The loop ends with the measure the piece stands in; Rework ends.
     pub fn set_b(&mut self, player: &Player) {
         self.b = Some(player.clock.measure(&player.timeline));
+        self.rework = None;
         self.loop_changed(player);
     }
 
     pub fn clear_loop(&mut self, player: &Player) {
         self.a = None;
         self.b = None;
+        self.rework = None;
         self.loop_changed(player);
     }
 
-    /// A loop made while the piece stands outside it starts at A.
+    /// Loops `plan`'s measures at its speed, from the first of them, in the A–B loop's place.
+    /// The speed stays when Rework ends (A, B, Clear, Play again): the player sets it back, as
+    /// any speed he chose.
+    pub fn rework(&mut self, plan: Plan, player: &Player) {
+        self.a = None;
+        self.b = None;
+        player.set_speed(plan.speed);
+        self.rework = Some(plan);
+        self.loop_changed(player);
+    }
+
+    /// A loop made while the piece stands outside it starts at its first span's start.
     fn loop_changed(&mut self, player: &Player) {
         self.apply(player);
-        let Some((first, last)) = self.looped() else {
+        let spans = self.spans();
+        let Some(&(first, _)) = spans.as_slice().first() else {
             return;
         };
         let timeline = &player.timeline;
-        let start = timeline.measure_start_ms(first).unwrap_or(0.);
-        let end = timeline
-            .measure_start_ms(last + 1)
-            .unwrap_or_else(|| timeline.duration_ms());
         let at = player.clock.position_ms();
-        if at < start || at >= end {
+        let inside = spans.as_slice().iter().any(|&(first, last)| {
+            let start = timeline.measure_start_ms(first).unwrap_or(0.);
+            let end = timeline
+                .measure_start_ms(last + 1)
+                .unwrap_or_else(|| timeline.duration_ms());
+            start <= at && at < end
+        });
+        if !inside {
             player.seek_measure(first);
         }
     }
@@ -755,6 +794,35 @@ mod tests {
             ]
         );
         assert_eq!(rig.position_ms(), 4400);
+        assert!(rig.clock.playing());
+    }
+
+    /// The issue's check, as the piano plays it: Rework of measures 3 and 7 plays 3, 7, 3, 7 with
+    /// no gap at either seam, nothing of what lies between heard, the notes of each let go at its
+    /// seam, nothing struck twice.
+    #[test]
+    fn rework_of_measures_3_and_7_plays_one_then_the_other_without_a_gap() {
+        let mut rig = ten_measures();
+        rig.clock.set_spans(Spans::of([(2, 2), (6, 6)]));
+        rig.clock.seek_ms(2000.);
+        rig.clock.play();
+        // 300 frames a buffer: the seams fall inside buffers, at frames 1000, 2000, 3000.
+        rig.run(12, 300);
+        assert_eq!(
+            rig.calls(),
+            [
+                Call::Release(0),
+                Call::On(62, 0),
+                Call::Release(1000),
+                Call::On(66, 1000),
+                Call::Release(2000),
+                Call::On(62, 2000),
+                Call::Release(3000),
+                Call::On(66, 3000),
+            ]
+        );
+        assert_eq!(rig.renderer.sink().frames, 3600, "every frame rendered");
+        assert_eq!(rig.position_ms(), 6600);
         assert!(rig.clock.playing());
     }
 

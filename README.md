@@ -11,8 +11,9 @@ piece, because apps that only show falling notes teach to follow, not to read.
 piece engraved and falling over a keyboard and plays it with a built-in piano or a MIDI output,
 your MIDI keyboard lighting and sounding its keys, practice with one hand or both (the piece
 waiting for you, or looping over a few measures), every note you play judged as you play it, with a
-combo and a score, and the machinery to publish, install and update the app. The rest of the game
-layer, the practice method and the fingering come next.
+combo and a score, the end of a run with its stars and the measures to rework, and the machinery to
+publish, install and update the app. Stars kept per piece, the practice method and the fingering
+come next.
 
 ## The library
 
@@ -111,6 +112,25 @@ The row under the transport keeps the run's account:
 Under **Wait for me** there is no timing, so the notes you play there build the combo but earn no
 points and stay out of the accuracy: the row says how many were played with the wait, not
 scored.
+
+## The end of a run
+
+When the piece reaches its end, a dialog sums the run up: its score, its accuracy, its best combo,
+the stars it earned, and the measures to rework.
+
+- **Stars**: one at 50 % speed, two at 75 %, three at 100 % with the falling notes not shown (the
+  **Score** view); each needs 90 % accuracy with **Wait for me** off, on the whole piece (every
+  note of your hands judged, struck or missed). A run counts at the slowest speed it was played
+  at. A MIDI piece has no score, so it stops at two. When no star came, the dialog says what they
+  ask. They are not kept yet.
+- **The measures to rework**: the three that weigh most, a note missed or a wrong key weighing
+  two and a late note one, every time through the loop counted. They are named as the score prints
+  them; a measure played again by a repeat says which time (“3 (2nd time)”).
+- **Rework** loops those measures, slowed one step (100 % to 50 %, 50 % to 25 %): measures 3 and 7
+  play 3, 7, 3, 7… with no gap between them, measures side by side as one. It takes the loop's
+  place; **A**, **B** or **Clear** end it. Its slower speed stays when it ends, and when you play
+  again: set the speed back yourself. Once the dialog is closed, **Rework** waits in the practice
+  row until you play again. **Play again** plays the piece from its start.
 
 ## Install
 

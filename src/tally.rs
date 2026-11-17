@@ -116,10 +116,6 @@ pub struct Tally {
 
 impl Tally {
     /// The tally of `judgements`, all of one run, in the order they were made.
-    #[cfg_attr(
-        not(test),
-        expect(dead_code, reason = "the end of a run (#19) counts the run that ended")
-    )]
     pub fn of(judgements: &[Judgement]) -> Self {
         let mut tally = Self::default();
         tally.follow(0, judgements);
