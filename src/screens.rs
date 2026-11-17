@@ -5,10 +5,13 @@
 //!
 //! The toasts are the window's: one stack above whichever screen shows.
 
+use std::sync::Arc;
+
 use gpui_design_system::ToastStack;
 use gpui_kit::*;
 
 use crate::home::{self, Home};
+use crate::midi_out::{Alsa, Ports};
 use crate::play_screen::{self, Opening, PlayScreen};
 use crate::settings::{self, SettingsPage};
 
@@ -27,6 +30,8 @@ enum Screen {
 pub struct Screens {
     home: Entity<Home>,
     screen: Screen,
+    /// The machine's MIDI ports, one client for the screens that list or use them.
+    ports: Arc<dyn Ports>,
     toasts: Entity<ToastStack>,
     _open: Subscription,
     _open_settings: Subscription,
@@ -51,6 +56,7 @@ impl Screens {
         let mut screens = Self {
             home,
             screen: Screen::Home,
+            ports: Arc::new(Alsa::default()),
             toasts,
             _open: open,
             _open_settings: open_settings,
@@ -62,7 +68,8 @@ impl Screens {
     }
 
     fn play(&mut self, opening: Opening, window: &mut Window, cx: &mut Context<Self>) {
-        let screen = cx.new(|cx| PlayScreen::new(opening, window, cx));
+        let ports = self.ports.clone();
+        let screen = cx.new(|cx| PlayScreen::new(opening, ports, window, cx));
         let back = cx.subscribe(&screen, |this, _, play_screen::Back, cx| this.home(cx));
         self.screen = Screen::Play {
             screen,
@@ -72,7 +79,8 @@ impl Screens {
     }
 
     fn settings(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let screen = cx.new(|cx| SettingsPage::new(window, cx));
+        let ports = self.ports.clone();
+        let screen = cx.new(|cx| SettingsPage::new(ports, window, cx));
         let back = cx.subscribe(&screen, |this, _, settings::Back, cx| this.home(cx));
         self.screen = Screen::Settings {
             screen,

@@ -19,6 +19,9 @@ use crate::wall_clock::WallClock;
 /// How often the view looks at the clock while something moves.
 const REFRESH: Duration = Duration::from_millis(33);
 
+/// How long the app waits for the output to close when it quits.
+const QUIT_WAIT: Duration = Duration::from_millis(500);
+
 /// The speeds offered, in percent: the clock takes any from 25 to 100.
 const SPEEDS: [u32; 3] = [25, 50, 100];
 
@@ -58,6 +61,13 @@ impl Transport {
                 }
             }
         });
+        // The app quitting does not drop the entities: a MIDI output is closed here, its keys
+        // let go, or a note would go on sounding on the piano after the window is gone.
+        cx.on_app_quit(|this, _| {
+            this.player.shutdown(QUIT_WAIT);
+            async {}
+        })
+        .detach();
         Self {
             player,
             names,

@@ -9,12 +9,16 @@
 //! the callback never calls MIDI, and this one may block on the port as it likes.
 //!
 //! What sounds is always let go of: on a pause, a seek or the end of the piece (the renderer
-//! releases every key), and when the output closes (a different port is chosen, the player goes):
-//! a note-off for each key that sounds, then All Notes Off.
+//! releases every key): a note-off for each key of the piece that sounds, then All Notes Off; and
+//! when the output closes (a different port is chosen, the player goes): every key, the sustain
+//! pedal, All Sound Off and All Notes Off. The player's own keys ([`Live`]) are kept apart from
+//! the piece's: a pause or a seek does not cut a key the player holds.
 //!
 //! A port that disappears is told by a failed send, or by the port missing from the list (an
-//! unplugged USB piano does not always fail a send): `lost` is set, and the player goes on with
-//! the built-in piano and says so.
+//! unplugged USB piano does not always fail a send), which a thread of its own looks at: `lost` is
+//! set, nothing is sent any more, and the player goes on with the built-in piano and says so.
+//! Each output has its own `lost` flag (`player.rs`), so that one that is closing cannot say the
+//! output that took its place is lost.
 //!
 //! The MIDI library (`midir`, on ALSA) is behind [`Ports`] and [`Wire`], so that the tests open
 //! no real port.
@@ -39,9 +43,10 @@ const CHANNEL: u8 = 0;
 /// The renderer runs at this rate: one frame is one millisecond.
 const FRAME_RATE: u32 = 1_000;
 const FRAME: Duration = Duration::from_millis(1);
-/// How often the thread looks at the clock while it plays, and while it does not.
+/// How often the thread looks at the clock while it plays, and while it does not (a pause is
+/// let go of, and a play heard, within this).
 const PLAYING_TICK: Duration = Duration::from_millis(1);
-const IDLE_TICK: Duration = Duration::from_millis(10);
+const IDLE_TICK: Duration = Duration::from_millis(50);
 /// The longest time the thread catches up on after a stall (a suspended laptop, a busy machine):
 /// what is past it is dropped, not played all at once.
 const MAX_CATCH_UP: usize = 50;
@@ -98,43 +103,73 @@ pub trait Ports: Send + Sync {
     fn outputs(&self) -> Vec<PortInfo>;
     fn inputs(&self) -> Vec<PortInfo>;
     fn connect_output(&self, port: &PortInfo) -> Result<Box<dyn Wire>, String>;
+    /// Whether `port` is still listed; none when that cannot be told (the system's MIDI cannot be
+    /// asked): not knowing is never taken for the port being gone.
+    fn present(&self, port: &PortInfo) -> Option<bool>;
 }
 
-/// The real ports, through ALSA.
-pub struct Alsa;
+/// The real ports, through ALSA. Listing is done through one client of each kind, kept: opening
+/// one is a sequencer client other MIDI software sees come and go.
+#[derive(Default)]
+pub struct Alsa {
+    output: Mutex<Option<midir::MidiOutput>>,
+    input: Mutex<Option<midir::MidiInput>>,
+}
+
+impl Alsa {
+    /// Runs `list` on the kept output client, made the first time; none when there is no
+    /// sequencer (a machine with no ALSA MIDI).
+    fn on_output<T>(&self, list: impl FnOnce(&midir::MidiOutput) -> T) -> Option<T> {
+        let mut client = self.output.lock().ok()?;
+        if client.is_none() {
+            *client = midir::MidiOutput::new(CLIENT).ok();
+        }
+        client.as_ref().map(list)
+    }
+}
+
+fn output_ports(client: &midir::MidiOutput) -> Vec<PortInfo> {
+    client
+        .ports()
+        .iter()
+        .filter_map(|port| {
+            Some(PortInfo {
+                id: port.id(),
+                name: client.port_name(port).ok()?,
+            })
+        })
+        .collect()
+}
 
 impl Ports for Alsa {
     fn outputs(&self) -> Vec<PortInfo> {
-        // No sequencer (a machine with no ALSA MIDI): no port.
-        let Ok(output) = midir::MidiOutput::new(CLIENT) else {
+        self.on_output(output_ports).unwrap_or_default()
+    }
+
+    fn inputs(&self) -> Vec<PortInfo> {
+        let Ok(mut client) = self.input.lock() else {
             return Vec::new();
         };
-        output
+        if client.is_none() {
+            *client = midir::MidiInput::new(CLIENT).ok();
+        }
+        let Some(client) = client.as_ref() else {
+            return Vec::new();
+        };
+        client
             .ports()
             .iter()
             .filter_map(|port| {
                 Some(PortInfo {
                     id: port.id(),
-                    name: output.port_name(port).ok()?,
+                    name: client.port_name(port).ok()?,
                 })
             })
             .collect()
     }
 
-    fn inputs(&self) -> Vec<PortInfo> {
-        let Ok(input) = midir::MidiInput::new(CLIENT) else {
-            return Vec::new();
-        };
-        input
-            .ports()
-            .iter()
-            .filter_map(|port| {
-                Some(PortInfo {
-                    id: port.id(),
-                    name: input.port_name(port).ok()?,
-                })
-            })
-            .collect()
+    fn present(&self, port: &PortInfo) -> Option<bool> {
+        self.on_output(|client| output_ports(client).contains(port))
     }
 
     fn connect_output(&self, port: &PortInfo) -> Result<Box<dyn Wire>, String> {
@@ -165,7 +200,11 @@ struct Link {
 
 struct State {
     wire: Box<dyn Wire>,
-    sounding: [bool; 128],
+    /// The keys the piece sounds, and the keys the player holds (see [`Live`]).
+    piece: [bool; 128],
+    live: [bool; 128],
+    /// Nothing is sent once the link is closed: a key that comes late stays silent.
+    closed: bool,
 }
 
 impl Link {
@@ -173,35 +212,59 @@ impl Link {
         Self {
             state: Mutex::new(State {
                 wire,
-                sounding: [false; 128],
+                piece: [false; 128],
+                live: [false; 128],
+                closed: false,
             }),
             lost,
         }
     }
 
+    /// A port that is gone is not written to again.
+    fn is_lost(&self) -> bool {
+        self.lost.load(Relaxed)
+    }
+
     fn note_on(&self, key: u8, velocity: u8) {
+        let mut state = self.state.lock().expect("the MIDI port's lock");
+        state.piece[usize::from(key & 127)] = true;
         self.send(
+            &mut state,
             &[0x90 | CHANNEL, key & 127, velocity.clamp(1, 127)],
-            Some((key, true)),
         );
     }
 
     fn note_off(&self, key: u8) {
-        self.send(&[0x80 | CHANNEL, key & 127, 0], Some((key, false)));
-    }
-
-    fn send(&self, message: &[u8], keys: Option<(u8, bool)>) {
         let mut state = self.state.lock().expect("the MIDI port's lock");
-        self.send_locked(&mut state, message, keys);
+        let at = usize::from(key & 127);
+        state.piece[at] = false;
+        // The player holds that key too: it is his to let go.
+        if !state.live[at] {
+            self.send(&mut state, &[0x80 | CHANNEL, key & 127, 0]);
+        }
     }
 
-    fn send_locked(&self, state: &mut State, message: &[u8], keys: Option<(u8, bool)>) {
-        // A port that is gone is not written to again.
-        if self.lost.load(Relaxed) {
-            return;
+    fn live_on(&self, key: u8, velocity: u8) {
+        let mut state = self.state.lock().expect("the MIDI port's lock");
+        state.live[usize::from(key & 127)] = true;
+        self.send(
+            &mut state,
+            &[0x90 | CHANNEL, key & 127, velocity.clamp(1, 127)],
+        );
+    }
+
+    fn live_off(&self, key: u8) {
+        let mut state = self.state.lock().expect("the MIDI port's lock");
+        let at = usize::from(key & 127);
+        state.live[at] = false;
+        if !state.piece[at] {
+            self.send(&mut state, &[0x80 | CHANNEL, key & 127, 0]);
         }
-        if let Some((key, on)) = keys {
-            state.sounding[usize::from(key & 127)] = on;
+    }
+
+    fn send(&self, state: &mut State, message: &[u8]) {
+        if state.closed || self.is_lost() {
+            return;
         }
         if let Err(error) = state.wire.send(message) {
             eprintln!("gamme: MIDI out: {error}");
@@ -209,15 +272,35 @@ impl Link {
         }
     }
 
-    /// A note-off for each key that sounds, then All Notes Off for what a device kept of its own.
-    fn silence(&self) {
+    /// The piece's keys let go (a pause, a seek, its end): a note-off for each, then All Notes Off
+    /// for what a device kept of its own, unless the player holds a key, which it would cut.
+    fn release_piece(&self) {
         let mut state = self.state.lock().expect("the MIDI port's lock");
         for key in 0..128u8 {
-            if state.sounding[usize::from(key)] {
-                self.send_locked(&mut state, &[0x80 | CHANNEL, key, 0], Some((key, false)));
+            let at = usize::from(key);
+            if std::mem::take(&mut state.piece[at]) && !state.live[at] {
+                self.send(&mut state, &[0x80 | CHANNEL, key, 0]);
             }
         }
-        self.send_locked(&mut state, &[0xB0 | CHANNEL, 123, 0], None);
+        if !state.live.iter().any(|held| *held) {
+            self.send(&mut state, &[0xB0 | CHANNEL, 123, 0]);
+        }
+    }
+
+    /// The output closes: every key, the sustain pedal, All Sound Off and All Notes Off (a note
+    /// held by the pedal is not ended by All Notes Off), and nothing after.
+    fn close(&self) {
+        let mut state = self.state.lock().expect("the MIDI port's lock");
+        for key in 0..128u8 {
+            let at = usize::from(key);
+            if std::mem::take(&mut state.piece[at]) | std::mem::take(&mut state.live[at]) {
+                self.send(&mut state, &[0x80 | CHANNEL, key, 0]);
+            }
+        }
+        for (controller, value) in [(64, 0), (120, 0), (123, 0)] {
+            self.send(&mut state, &[0xB0 | CHANNEL, controller, value]);
+        }
+        state.closed = true;
     }
 }
 
@@ -234,7 +317,7 @@ impl Sink for MidiSink {
     }
 
     fn release_all(&mut self) {
-        self.0.silence();
+        self.0.release_piece();
     }
 
     fn render(&mut self, _: &mut [f32], _: &mut [f32]) {}
@@ -261,7 +344,7 @@ impl Live {
     )]
     pub fn note_on(&self, key: u8, velocity: u8) {
         if let Some(link) = self.link() {
-            link.note_on(key, velocity);
+            link.live_on(key, velocity);
         }
     }
 
@@ -271,7 +354,7 @@ impl Live {
     )]
     pub fn note_off(&self, key: u8) {
         if let Some(link) = self.link() {
-            link.note_off(key);
+            link.live_off(key);
         }
     }
 }
@@ -299,33 +382,46 @@ impl Pacer {
     }
 }
 
-/// The open output: the thread that paces the clock and sends the notes. Dropping it stops the
-/// thread, which lets every key go and closes the port.
+/// The open output: the thread that paces the clock and sends the notes, and the one that looks
+/// for the port in the list. Dropping it closes the port: the live keys are cut off first, then
+/// the threads end, the pacing one letting every key go.
 pub struct Output {
     stop: Option<Sender<()>>,
+    watch_stop: Option<Sender<()>>,
     thread: Option<JoinHandle<()>>,
+    watch: Option<JoinHandle<()>>,
     live: Live,
 }
 
 impl Drop for Output {
     fn drop(&mut self) {
+        // First: a key of the player's that comes now goes nowhere, and cannot sound after the
+        // silence and stay on.
+        self.live.set(None);
         self.stop.take();
-        if let Some(thread) = self.thread.take() {
+        self.watch_stop.take();
+        for thread in [self.thread.take(), self.watch.take()]
+            .into_iter()
+            .flatten()
+        {
             let _ = thread.join();
         }
-        self.live.set(None);
     }
 }
 
-/// What the thread looks for in the list of ports: its own.
-struct Watch {
-    ports: Arc<dyn Ports>,
-    port: PortInfo,
-}
-
-impl Watch {
-    fn present(&self) -> bool {
-        self.ports.outputs().contains(&self.port)
+/// Looks for the port in the list, on a thread of its own (the pacing one is not made to wait for
+/// the system), until it is gone or the output closes.
+fn watch(ports: &dyn Ports, port: &PortInfo, lost: &AtomicBool, stopped: &mpsc::Receiver<()>) {
+    while let Err(RecvTimeoutError::Timeout) = stopped.recv_timeout(WATCH_EVERY) {
+        if lost.load(Relaxed) {
+            return;
+        }
+        // Unknown is not gone.
+        if ports.present(port) == Some(false) {
+            eprintln!("gamme: MIDI out: “{}” is gone", port.name);
+            lost.store(true, Relaxed);
+            return;
+        }
     }
 }
 
@@ -333,7 +429,6 @@ fn drive(
     mut renderer: Renderer<MidiSink>,
     link: Arc<Link>,
     clock: Clock,
-    watch: Watch,
     stopped: mpsc::Receiver<()>,
 ) {
     // The sink renders nothing: these are only what the renderer is handed.
@@ -341,7 +436,7 @@ fn drive(
     let mut right = [0f32; MAX_CATCH_UP];
     let mut pacer = Pacer::default();
     let mut last = Instant::now();
-    let mut watched = last;
+    let mut was_playing = false;
     loop {
         let tick = if clock.playing() {
             PLAYING_TICK
@@ -353,10 +448,22 @@ fn drive(
             // Sent to, or dropped: either way it is over.
             Ok(()) | Err(RecvTimeoutError::Disconnected) => break,
         }
+        // A port that is gone renders no more, and claims the clock no more: the output that
+        // takes over is the one that drives it.
+        if link.is_lost() {
+            break;
+        }
         let now = Instant::now();
         let playing = clock.playing();
-        let frames = pacer.frames(now - last, playing);
+        // A play starts from now, not from the last look, which was a pause ago.
+        let elapsed = if was_playing {
+            now - last
+        } else {
+            Duration::ZERO
+        };
+        let frames = pacer.frames(elapsed, playing);
         last = now;
+        was_playing = playing;
         if playing {
             if frames > 0 {
                 renderer.render(&mut left[..frames], &mut right[..frames]);
@@ -365,15 +472,8 @@ fn drive(
             // Not playing renders nothing, and tells the renderer to let go of what sounds.
             renderer.render(&mut left[..1], &mut right[..1]);
         }
-        if now.duration_since(watched) >= WATCH_EVERY {
-            watched = now;
-            if !watch.present() {
-                eprintln!("gamme: MIDI out: “{}” is gone", watch.port.name);
-                link.lost.store(true, Relaxed);
-            }
-        }
     }
-    link.silence();
+    link.close();
 }
 
 /// MIDI out as the player's sound: the piece on the port the player chose.
@@ -427,20 +527,32 @@ impl Audio for MidiOut {
             hands.clone(),
             FRAME_RATE,
         );
-        let watch = Watch {
-            ports: self.ports.clone(),
-            port,
-        };
         let (stop, stopped) = mpsc::channel();
         let (clock, thread_link) = (clock.clone(), link.clone());
         let thread = std::thread::Builder::new()
             .name("gamme-midi".into())
-            .spawn(move || drive(renderer, thread_link, clock, watch, stopped))
+            .spawn(move || drive(renderer, thread_link, clock, stopped))
             .map_err(|e| format!("cannot start the MIDI thread: {e}"))?;
+        let (watch_stop, watch_stopped) = mpsc::channel();
+        let (ports, flag) = (self.ports.clone(), lost.clone());
+        let watcher = std::thread::Builder::new()
+            .name("gamme-midi-watch".into())
+            .spawn(move || watch(&*ports, &port, &flag, &watch_stopped));
+        let watcher = match watcher {
+            Ok(watcher) => watcher,
+            Err(error) => {
+                // The output is closed again, its port with it.
+                drop(stop);
+                let _ = thread.join();
+                return Err(format!("cannot start the MIDI thread: {error}"));
+            }
+        };
         self.live.set(Some(link));
         Ok(Box::new(Output {
             stop: Some(stop),
+            watch_stop: Some(watch_stop),
             thread: Some(thread),
+            watch: Some(watcher),
             live: self.live.clone(),
         }))
     }
@@ -471,6 +583,8 @@ pub mod testing {
         /// Whether the wires refuse what they are sent, as a port that went does.
         broken: Arc<AtomicBool>,
         connections: Mutex<u32>,
+        /// Whether the system cannot be asked which ports are there.
+        unknown: AtomicBool,
     }
 
     impl FakePorts {
@@ -481,7 +595,13 @@ pub mod testing {
                 sent: Arc::default(),
                 broken: Arc::default(),
                 connections: Mutex::new(0),
+                unknown: AtomicBool::new(false),
             }
+        }
+
+        /// The list of ports cannot be read from now on.
+        pub fn cannot_look(&self) {
+            self.unknown.store(true, Relaxed);
         }
 
         /// What was sent to the wires so far.
@@ -537,6 +657,13 @@ pub mod testing {
 
         fn inputs(&self) -> Vec<PortInfo> {
             infos(&self.inputs)
+        }
+
+        fn present(&self, port: &PortInfo) -> Option<bool> {
+            if self.unknown.load(Relaxed) {
+                return None;
+            }
+            Some(self.outputs().contains(port))
         }
 
         fn connect_output(&self, _: &PortInfo) -> Result<Box<dyn Wire>, String> {
@@ -797,6 +924,9 @@ mod tests {
         assert!(sent.iter().any(|m| m == &[NOTE_OFF, 60, 0]), "{sent:?}");
         assert!(sent.iter().any(|m| m == &[NOTE_OFF, 73, 0]), "{sent:?}");
         assert_eq!(sent.last().unwrap(), &ALL_NOTES_OFF);
+        // What a note held by the pedal needs: the pedal up, and All Sound Off.
+        assert!(sent.iter().any(|m| m == &[0xB0, 64, 0]), "{sent:?}");
+        assert!(sent.iter().any(|m| m == &[0xB0, 120, 0]), "{sent:?}");
         // The keys are sent nowhere once it is closed.
         let count = sent.len();
         live.note_on(74, 100);
@@ -810,6 +940,59 @@ mod tests {
         opened.clock.play();
         until("the output to be lost", || opened.lost.load(Relaxed));
         assert!(opened.sent().is_empty());
+    }
+
+    #[test]
+    fn a_key_the_player_holds_is_not_cut_by_a_pause_or_a_seek() {
+        let opened = opened();
+        let live = opened.midi.live();
+        opened.clock.play();
+        until("the note on", || opened.count(NOTE_ON, 60) == 1);
+        live.note_on(72, 100);
+        opened.clock.pause();
+        until("the piece's key to go", || opened.count(NOTE_OFF, 60) == 1);
+        std::thread::sleep(Duration::from_millis(120));
+        assert_eq!(opened.count(NOTE_OFF, 72), 0, "{:?}", opened.sent());
+        // All Notes Off would cut it too: it is not sent while a key is held.
+        assert!(!opened.silenced(), "{:?}", opened.sent());
+        opened.clock.seek_ms(12_000.);
+        std::thread::sleep(Duration::from_millis(120));
+        assert_eq!(opened.count(NOTE_OFF, 72), 0);
+        // Letting it go is the player's.
+        live.note_off(72);
+        assert_eq!(opened.count(NOTE_OFF, 72), 1);
+    }
+
+    #[test]
+    fn a_live_key_that_comes_late_after_the_close_sounds_nowhere() {
+        let opened = opened();
+        let live = opened.midi.live();
+        let Opened { ports, output, .. } = opened;
+        drop(output);
+        let count = ports.sent().len();
+        live.note_on(80, 100);
+        assert_eq!(ports.sent().len(), count);
+    }
+
+    #[test]
+    fn a_lost_output_renders_and_claims_the_clock_no_more() {
+        let opened = opened();
+        opened.ports.unplug();
+        until("the output to be lost", || opened.lost.load(Relaxed));
+        // The thread ends at its next look; what takes over is released the clock.
+        std::thread::sleep(Duration::from_millis(150));
+        opened.clock.release();
+        std::thread::sleep(Duration::from_millis(150));
+        assert!(!opened.clock.claimed());
+    }
+
+    #[test]
+    fn a_port_list_that_cannot_be_read_is_not_a_port_that_is_gone() {
+        let opened = opened();
+        opened.ports.unplug();
+        opened.ports.cannot_look();
+        std::thread::sleep(WATCH_EVERY * 2 + Duration::from_millis(300));
+        assert!(!opened.lost.load(Relaxed));
     }
 
     #[test]

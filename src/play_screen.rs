@@ -18,18 +18,19 @@ use std::sync::Arc;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 use gpui_design_system::{
-    Button, EmptyLine, Icon, PageHeader, Segmented, Skeleton, Type as _, palette, space,
+    Button, EmptyLine, Icon, PageHeader, Segmented, Skeleton, Toast, Type as _, palette, space,
+    toast,
 };
 use gpui_kit::*;
 
 use crate::clock::Clock;
-use crate::config;
+use crate::config::{self, Settings};
 use crate::engraver;
 use crate::falling::falling;
 use crate::icons;
 use crate::keyboard::{Keyboard, Lights};
 use crate::library::{Library, Piece};
-use crate::midi_out;
+use crate::midi_out::Ports;
 use crate::paths;
 use crate::player::Player;
 use crate::score::Score;
@@ -220,6 +221,10 @@ enum State {
 
 pub struct PlayScreen {
     opening: Opening,
+    /// The MIDI ports of the machine, for the output the settings choose.
+    ports: Arc<dyn Ports>,
+    /// What the settings chose, read with the piece (the defaults until then).
+    settings: Settings,
     title: SharedString,
     state: State,
     view: View,
@@ -235,7 +240,12 @@ pub struct PlayScreen {
 impl EventEmitter<Back> for PlayScreen {}
 
 impl PlayScreen {
-    pub fn new(opening: Opening, window: &mut Window, cx: &mut Context<Self>) -> Self {
+    pub fn new(
+        opening: Opening,
+        ports: Arc<dyn Ports>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Self {
         let focus = cx.focus_handle();
         window.focus(&focus, cx);
         let (piece, engraved) = (opening.piece.clone(), opening.engraved());
@@ -245,11 +255,20 @@ impl PlayScreen {
             .and_then(|(_, piece)| piece.hands.clone());
         cx.spawn(async move |this, cx| {
             let started = Instant::now();
-            let loaded = cx
+            // The kept settings are a file read: with the piece, off the main thread.
+            let (loaded, (settings, unreadable)) = cx
                 .background_executor()
-                .spawn(async move { load(&piece, engraved, hands.as_deref()) })
+                .spawn(async move { (load(&piece, engraved, hands.as_deref()), config::load()) })
                 .await;
             this.update(cx, |this, cx| {
+                this.settings = settings;
+                if let Some(why) = unreadable {
+                    toast(
+                        Toast::failure("The settings cannot be read")
+                            .detail(format!("{why}. The defaults are used.")),
+                        cx,
+                    );
+                }
                 timing(format_args!(
                     "opened the piece in {} ms",
                     started.elapsed().as_millis()
@@ -270,6 +289,8 @@ impl PlayScreen {
                 View::Falling
             },
             opening,
+            ports,
+            settings: Settings::default(),
             state: State::Loading,
             lights: Lights::default(),
             marked: false,
@@ -302,7 +323,7 @@ impl PlayScreen {
         });
         let keyboard = Keyboard::for_timeline(&loaded.timeline);
         // What the settings choose: the MIDI output if there is one, else the built-in piano.
-        let (audio, font) = config::load().audio(Arc::new(midi_out::Alsa));
+        let (audio, font) = self.settings.audio(self.ports.clone());
         let player = Player::new(
             loaded.timeline,
             data,

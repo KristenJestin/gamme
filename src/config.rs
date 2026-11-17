@@ -8,7 +8,7 @@
 //! Absent, or a key missing: the defaults (the small piano, no MIDI out, every input port).
 
 use std::io::Write as _;
-use std::os::unix::fs::{DirBuilderExt as _, OpenOptionsExt as _};
+use std::os::unix::fs::{DirBuilderExt as _, OpenOptionsExt as _, PermissionsExt as _};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -85,16 +85,20 @@ pub fn read(config: &Path) -> Result<Settings, String> {
     serde_json::from_slice(&bytes).map_err(|error| format!("settings.json: {error}"))
 }
 
-/// The settings kept, for a start: the defaults when none are kept, or when they cannot be read
-/// (which is said).
-pub fn load() -> Settings {
+/// The settings kept, for a start: the defaults when none are kept, or when they cannot be read,
+/// and then why, for the window to say (it is on the error output too). Reads a file: not for the
+/// main thread.
+pub fn load() -> (Settings, Option<String>) {
     let Some(config) = paths::config() else {
-        return Settings::default();
+        return (Settings::default(), None);
     };
-    read(&config).unwrap_or_else(|why| {
-        eprintln!("gamme: the kept settings cannot be read, the defaults are used: {why}");
-        Settings::default()
-    })
+    match read(&config) {
+        Ok(settings) => (settings, None),
+        Err(why) => {
+            eprintln!("gamme: the kept settings cannot be read, the defaults are used: {why}");
+            (Settings::default(), Some(why))
+        }
+    }
 }
 
 /// Keeps `settings`.
@@ -113,17 +117,26 @@ pub fn write_private(folder: &Path, name: &str, bytes: &[u8]) -> std::io::Result
         .recursive(true)
         .mode(0o700)
         .create(folder)?;
+    // A folder that was there already keeps the mode it had: it is made private.
+    std::fs::set_permissions(folder, std::fs::Permissions::from_mode(0o700))?;
     let path = folder.join(name);
     let temp = folder.join(format!("{name}.{}.tmp", std::process::id()));
-    let mut out = std::fs::OpenOptions::new()
-        .write(true)
-        .create(true)
-        .truncate(true)
-        .mode(0o600)
-        .open(&temp)?;
-    out.write_all(bytes)?;
-    out.sync_all()?;
-    std::fs::rename(&temp, &path)
+    let written = (|| {
+        let mut out = std::fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .mode(0o600)
+            .open(&temp)?;
+        out.write_all(bytes)?;
+        out.sync_all()?;
+        std::fs::rename(&temp, &path)
+    })();
+    if written.is_err() {
+        // Not left beside the file kept.
+        let _ = std::fs::remove_file(&temp);
+    }
+    written
 }
 
 #[cfg(test)]
@@ -150,7 +163,6 @@ mod tests {
     }
 
     fn mode(path: &Path) -> u32 {
-        use std::os::unix::fs::PermissionsExt as _;
         std::fs::metadata(path).unwrap().permissions().mode() & 0o777
     }
 
@@ -193,6 +205,28 @@ mod tests {
         save(&config.0.join("gamme"), &Settings::default()).unwrap();
         assert_eq!(mode(&config.0.join("gamme")), 0o700);
         assert_eq!(mode(&file(&config.0.join("gamme"))), 0o600);
+    }
+
+    #[test]
+    fn a_folder_that_was_there_with_another_mode_is_made_0700() {
+        let config = Temp::new("existing");
+        std::fs::create_dir_all(&config.0).unwrap();
+        std::fs::set_permissions(&config.0, std::fs::Permissions::from_mode(0o755)).unwrap();
+        save(&config.0, &Settings::default()).unwrap();
+        assert_eq!(mode(&config.0), 0o700);
+    }
+
+    #[test]
+    fn a_write_that_fails_leaves_no_temporary_file() {
+        let config = Temp::new("failed");
+        // The name is a folder: the rename onto it fails after the temporary file was written.
+        std::fs::create_dir_all(config.0.join("settings.json")).unwrap();
+        assert!(save(&config.0, &Settings::default()).is_err());
+        let names: Vec<_> = std::fs::read_dir(&config.0)
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name())
+            .collect();
+        assert_eq!(names, ["settings.json"]);
     }
 
     #[test]

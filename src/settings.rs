@@ -18,7 +18,7 @@ use gpui_design_system::{
 use gpui_kit::*;
 
 use crate::config::{self, Settings};
-use crate::midi_out::{self, Alsa, PortInfo, Ports};
+use crate::midi_out::{self, PortInfo, Ports};
 use crate::{appearance, paths, soundfont};
 
 /// Saves are numbered as they are asked for, so that one that comes late cannot be written
@@ -74,6 +74,9 @@ pub struct SettingsPage {
     ports: Arc<dyn Ports>,
     config: Option<PathBuf>,
     settings: Settings,
+    /// Whether the kept settings were read: nothing is chosen before, or the defaults shown
+    /// meanwhile would be kept over them.
+    read: bool,
     outputs: Vec<PortInfo>,
     inputs: Vec<PortInfo>,
     /// Whether the ports are being listed, and whether they have been once.
@@ -86,36 +89,55 @@ pub struct SettingsPage {
 impl EventEmitter<Back> for SettingsPage {}
 
 impl SettingsPage {
-    pub fn new(window: &mut Window, cx: &mut Context<Self>) -> Self {
+    pub fn new(ports: Arc<dyn Ports>, window: &mut Window, cx: &mut Context<Self>) -> Self {
         // For Escape.
         let focus = cx.focus_handle();
         window.focus(&focus, cx);
         let config = paths::config();
-        let settings = match config.as_deref().map(config::read) {
-            Some(Ok(settings)) => settings,
-            Some(Err(why)) => {
-                toast(
-                    Toast::failure("The settings cannot be read")
-                        .detail(format!("{why}. The defaults are shown.")),
-                    cx,
-                );
-                Settings::default()
-            }
-            None => Settings::default(),
-        };
         let mut page = Self {
             focus,
-            ports: Arc::new(Alsa),
+            ports,
             config,
-            settings,
+            settings: Settings::default(),
+            read: false,
             outputs: Vec::new(),
             inputs: Vec::new(),
             looking: false,
             listed: false,
             downloaded: Vec::new(),
         };
+        page.read_kept(cx);
         page.look(cx);
         page
+    }
+
+    /// Reads the kept settings, off the main thread; one that cannot be read is said, and the
+    /// defaults are shown.
+    fn read_kept(&mut self, cx: &mut Context<Self>) {
+        let Some(folder) = self.config.clone() else {
+            self.read = true;
+            return;
+        };
+        cx.spawn(async move |this, cx| {
+            let kept = cx
+                .background_executor()
+                .spawn(async move { config::read(&folder) })
+                .await;
+            this.update(cx, |this, cx| {
+                match kept {
+                    Ok(settings) => this.settings = settings,
+                    Err(why) => toast(
+                        Toast::failure("The settings cannot be read")
+                            .detail(format!("{why}. The defaults are shown.")),
+                        cx,
+                    ),
+                }
+                this.read = true;
+                cx.notify();
+            })
+            .ok();
+        })
+        .detach();
     }
 
     /// Lists the MIDI ports again, and looks at which pianos are downloaded.
@@ -162,21 +184,21 @@ impl SettingsPage {
     }
 
     fn choose_output(&mut self, port: Option<String>, cx: &mut Context<Self>) {
-        if self.settings.midi_out != port {
+        if self.read && self.settings.midi_out != port {
             self.settings.midi_out = port;
             self.keep(cx);
         }
     }
 
     fn choose_input(&mut self, port: Option<String>, cx: &mut Context<Self>) {
-        if self.settings.midi_in != port {
+        if self.read && self.settings.midi_in != port {
             self.settings.midi_in = port;
             self.keep(cx);
         }
     }
 
     fn choose_piano(&mut self, id: &str, cx: &mut Context<Self>) {
-        if self.settings.piano != id {
+        if self.read && self.settings.piano != id {
             self.settings.piano = id.to_owned();
             self.keep(cx);
         }
