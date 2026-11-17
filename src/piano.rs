@@ -9,6 +9,12 @@
 //! [`Renderer`] is the whole of the callback's logic, over a [`Sink`] instead of a synthesizer
 //! and a device, so that it is tested without either. [`start`] puts it on the output.
 //!
+//! Each buffer asks the clock where it goes ([`Clock::step`]) and plays exactly what that goes
+//! through: no further than a chord the player owes (the wait, `practice.rs`), and round the
+//! A–B loop, whose seam it plays at its own frame: the piece's notes let go at B's end, A's
+//! struck from the same frame, none twice. The computer strikes only its own hands (`Hands`);
+//! a note it did not strike, it does not end.
+//!
 //! The keys the player strikes on a MIDI keyboard (`midi_in.rs`), and his sustain pedal, reach
 //! the callback through [`LiveKeys`], a ring of atomics made once: the callback plays them at the
 //! start of its next buffer, so the output is opened with a small one (`LIVE_FRAMES`). They are
@@ -162,13 +168,6 @@ impl Hands {
         Self(Arc::new(AtomicU8::new(Self::RIGHT | Self::LEFT)))
     }
 
-    #[cfg_attr(
-        not(test),
-        expect(
-            dead_code,
-            reason = "the choice of hands comes with the hands setting (#15)"
-        )
-    )]
     pub fn set(&self, right: bool, left: bool) {
         let bits = (u8::from(right) * Self::RIGHT) | (u8::from(left) * Self::LEFT);
         self.0.store(bits, Relaxed);
@@ -326,6 +325,12 @@ impl<S: Sink> Renderer<S> {
         .following()
     }
 
+    /// What it plays on, for the tests to read.
+    #[cfg(test)]
+    pub fn sink(&self) -> &S {
+        &self.sink
+    }
+
     /// Sounds the keys the player strikes too, from now on, his pedal as he holds it now.
     pub fn with_live(mut self, live: LiveKeys) -> Self {
         live.discard();
@@ -394,42 +399,115 @@ impl<S: Sink> Renderer<S> {
         }
 
         let us_per_frame = 1e6 / self.sample_rate * snapshot.speed.factor();
-        let start = snapshot.position_us as f64 + self.carry;
-        let end = start + frames as f64 * us_per_frame;
+        let total = self.carry + frames as f64 * us_per_frame;
+        let whole = total.floor();
+        // Where the clock goes: no further than a chord the player owes, and on from the loop's
+        // start past its end. What is played is what it goes through, and nothing else.
+        let step = self.clock.step(&snapshot, whole as u64);
+        let carry = self.carry;
+        // The frame of a moment `offset` µs into the step.
+        let frame_of =
+            |offset: u64| (((offset as f64 - carry) / us_per_frame).max(0.) as usize).min(frames);
         let mut rendered = 0;
-        while let Some(event) = self.events.get(self.next)
-            && (event.at_us as f64) < end
-        {
-            let frame =
-                (((event.at_us as f64 - start) / us_per_frame).max(0.) as usize).min(frames);
-            if frame > rendered {
+        let first = |at: u64| frame_of(at.saturating_sub(step.from_us));
+        self.play_until(step.to_us, first, &mut rendered, left, right);
+        if let Some((start, to)) = step.wrapped {
+            // The seam of the loop: what the piece sounds is let go at B's end, and the notes
+            // from A's start are struck from the same frame on, none twice.
+            let seam = frame_of(step.to_us - step.from_us);
+            if seam > rendered {
                 self.sink
-                    .render(&mut left[rendered..frame], &mut right[rendered..frame]);
-                rendered = frame;
+                    .render(&mut left[rendered..seam], &mut right[rendered..seam]);
+                rendered = seam;
             }
-            let held = &mut self.held[usize::from(event.key & 127)];
-            let struck = &mut self.struck[event.note as usize];
-            if event.velocity == 0 {
-                if std::mem::take(struck) {
-                    *held = held.saturating_sub(1);
-                    if *held == 0 {
-                        self.sink.note_off(event.key);
-                    }
-                }
-            } else if self.hands.plays(event.hand) {
-                *struck = true;
-                *held = held.saturating_add(1);
-                self.sink.note_on(event.key, event.velocity);
-            }
-            self.next += 1;
+            self.release_all();
+            self.next = self.events.partition_point(|event| event.at_us < start);
+            let before = step.to_us - step.from_us;
+            let after = |at: u64| frame_of(before + at.saturating_sub(start));
+            self.play_until(to, after, &mut rendered, left, right);
+        }
+        let held = step.moved_us < whole as u64;
+        if held {
+            // The clock stands on a chord owed: the computer's notes that end there end now,
+            // not when the chord is struck (they come first at that instant, before any start).
+            let stop = frame_of(step.moved_us);
+            self.end_at(step.position_us(), stop, &mut rendered, left, right);
         }
         self.sink
             .render(&mut left[rendered..], &mut right[rendered..]);
 
-        let total = self.carry + frames as f64 * us_per_frame;
-        let whole = total.floor();
-        self.carry = total - whole;
-        self.clock.advance(&snapshot, whole as u64);
+        // Held by a chord, the clock stands: nothing of this buffer is owed to the next one.
+        self.carry = if held { 0. } else { total - whole };
+        if self.clock.commit(&snapshot, &step) {
+            // The loop's wrap is a seek this renderer made itself and followed already.
+            self.seeks = step.seeks;
+        }
+    }
+
+    /// Plays the events before `until` (µs of the piece), each at the frame `frame_of` gives it,
+    /// rendering the frames between them.
+    fn play_until(
+        &mut self,
+        until: u64,
+        frame_of: impl Fn(u64) -> usize,
+        rendered: &mut usize,
+        left: &mut [f32],
+        right: &mut [f32],
+    ) {
+        while let Some(&event) = self.events.get(self.next)
+            && event.at_us < until
+        {
+            let frame = frame_of(event.at_us);
+            if frame > *rendered {
+                self.sink
+                    .render(&mut left[*rendered..frame], &mut right[*rendered..frame]);
+                *rendered = frame;
+            }
+            self.play(event);
+            self.next += 1;
+        }
+    }
+
+    /// Plays the ends of notes at exactly `at` (µs of the piece), at frame `frame`.
+    fn end_at(
+        &mut self,
+        at: u64,
+        frame: usize,
+        rendered: &mut usize,
+        left: &mut [f32],
+        right: &mut [f32],
+    ) {
+        while let Some(&event) = self.events.get(self.next)
+            && event.at_us == at
+            && event.velocity == 0
+        {
+            if frame > *rendered {
+                self.sink
+                    .render(&mut left[*rendered..frame], &mut right[*rendered..frame]);
+                *rendered = frame;
+            }
+            self.play(event);
+            self.next += 1;
+        }
+    }
+
+    /// Strikes or releases what `event` says, if it is the computer's to.
+    fn play(&mut self, event: Event) {
+        let held = &mut self.held[usize::from(event.key & 127)];
+        let struck = &mut self.struck[event.note as usize];
+        if event.velocity == 0 {
+            // The end of a note the computer did not strike (the player's hand) is not its own.
+            if std::mem::take(struck) {
+                *held = held.saturating_sub(1);
+                if *held == 0 {
+                    self.sink.note_off(event.key);
+                }
+            }
+        } else if self.hands.plays(event.hand) {
+            *struck = true;
+            *held = held.saturating_add(1);
+            self.sink.note_on(event.key, event.velocity);
+        }
     }
 }
 

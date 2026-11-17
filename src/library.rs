@@ -10,12 +10,15 @@ use std::fmt;
 use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
+use std::sync::Mutex;
+use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
 use sha2::{Digest as _, Sha256};
 
 use crate::piece_file::{self, Kind};
+use crate::practice::Choice;
 use crate::timeline::PartHand;
 
 const METADATA: &str = "piece.json";
@@ -38,6 +41,10 @@ pub struct Piece {
     /// them: `None` until they do, and the timeline's guess holds.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub hands: Option<Vec<PartHand>>,
+    /// The hands the player plays and whether the clock waits for them (`practice.rs`), as he
+    /// left them: `None` until he chooses, and he listens.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub practice: Option<Choice>,
 }
 
 /// Why a file was not imported, as a sentence the player can read.
@@ -135,6 +142,7 @@ impl Library {
             imported_at: now(),
             last_played: None,
             hands: None,
+            practice: None,
         };
         self.keep(&piece, &bytes)
             .map_err(|error| refuse(format!("could not be kept in the library ({error})")))?;
@@ -192,12 +200,19 @@ impl Library {
         self.change(id, |piece| piece.hands = Some(hands.to_vec()))
     }
 
+    /// Keeps the hands the player plays a piece with, and the wait.
+    pub fn set_practice(&self, id: &str, choice: Choice) -> io::Result<()> {
+        self.change(id, |piece| piece.practice = Some(choice))
+    }
+
     /// The score's file of a piece.
     pub fn file(&self, piece: &Piece) -> PathBuf {
         self.root.join(&piece.id).join(&piece.file)
     }
 
-    /// Reads a piece's metadata, changes it and writes it again.
+    /// Reads a piece's metadata, changes it and writes it again. One change at a time in the
+    /// process: two at once (the hands and the practice kept off the main thread, a piece marked
+    /// played) would each write what it read, and the one written last lose the other's.
     fn change(&self, id: &str, change: impl FnOnce(&mut Piece)) -> io::Result<()> {
         if !is_id(id) {
             return Err(io::Error::new(
@@ -205,6 +220,9 @@ impl Library {
                 format!("{id:?} is not a piece's id"),
             ));
         }
+        let _turn = CHANGES
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         let folder = self.root.join(id);
         let mut piece = read_piece(&folder)
             .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "no such piece"))?;
@@ -233,12 +251,24 @@ fn read_piece(folder: &Path) -> Option<Piece> {
     }
 }
 
-/// Written aside and renamed, so that a metadata file is never half there.
+/// The changes of pieces' metadata take turns ([`Library::change`]).
+static CHANGES: Mutex<()> = Mutex::new(());
+
+/// Written aside and renamed, so that a metadata file is never half there. The file aside is
+/// this write's own: another write, of another process even, never renames it half written.
 fn write_metadata(folder: &Path, piece: &Piece) -> io::Result<()> {
+    static WRITES: AtomicU64 = AtomicU64::new(0);
     let json = serde_json::to_vec_pretty(piece).map_err(io::Error::other)?;
-    let aside = folder.join(format!("{METADATA}.new"));
-    fs::write(&aside, json)?;
-    fs::rename(aside, folder.join(METADATA))
+    let aside = folder.join(format!(
+        ".{METADATA}.{}.{}.new",
+        std::process::id(),
+        WRITES.fetch_add(1, Relaxed)
+    ));
+    let written = fs::write(&aside, json).and_then(|()| fs::rename(&aside, folder.join(METADATA)));
+    if written.is_err() {
+        fs::remove_file(&aside).ok();
+    }
+    written
 }
 
 /// The file's name without its extension: the title of a score that names none.
@@ -424,6 +454,62 @@ mod tests {
             library.root.join(&tune.id).join("score.mid")
         );
         assert!(library.set_hands("../keep", &hands).is_err());
+    }
+
+    #[test]
+    fn the_practice_chosen_is_kept_with_the_piece_and_read_again() {
+        use crate::practice::Playing;
+        let (home, library) = library();
+        let dance = library.import(&fixture("short-dance.mei")).unwrap();
+        assert_eq!(dance.practice, None);
+        let json = fs::read_to_string(library.root.join(&dance.id).join(METADATA)).unwrap();
+        assert!(!json.contains("practice"), "{json}");
+
+        let choice = Choice {
+            playing: Playing::Right,
+            wait: true,
+        };
+        library.set_practice(&dance.id, choice).unwrap();
+        let again = Library::at(home.path().join("data/gamme/library")).list();
+        assert_eq!(again[0].practice, Some(choice));
+        assert_eq!(again[0].title, dance.title, "the rest stays");
+        assert!(library.set_practice("../keep", choice).is_err());
+    }
+
+    #[test]
+    fn changes_made_at_once_from_several_threads_lose_nothing() {
+        use crate::practice::Playing;
+        let (_home, library) = library();
+        let tune = library.import(&fixture("a-tune.mid")).unwrap();
+        let choice = Choice {
+            playing: Playing::Left,
+            wait: true,
+        };
+        let hands = [PartHand::Left];
+        std::thread::scope(|scope| {
+            for thread in 0..3 {
+                let (library, id) = (&library, &tune.id);
+                scope.spawn(move || {
+                    for n in 0..30 {
+                        match thread {
+                            0 => library.set_hands(id, &hands).unwrap(),
+                            1 => library.set_practice(id, choice).unwrap(),
+                            _ => library.mark_played(id, n + 1).unwrap(),
+                        }
+                    }
+                });
+            }
+        });
+        let again = library.list();
+        assert_eq!(again.len(), 1, "the piece is still there");
+        assert_eq!(again[0].hands.as_deref(), Some(&hands[..]));
+        assert_eq!(again[0].practice, Some(choice));
+        assert_eq!(again[0].last_played, Some(30));
+        let left: Vec<_> = fs::read_dir(library.root.join(&tune.id))
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name())
+            .collect();
+        assert_eq!(left.len(), 2, "the score and its metadata only: {left:?}");
     }
 
     #[test]

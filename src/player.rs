@@ -28,6 +28,7 @@ use rustysynth::SoundFont as RustySoundFont;
 
 use crate::clock::{Clock, Speed};
 use crate::piano::{self, Hands};
+use crate::practice::Chords;
 use crate::soundfont::{self, Fetcher, Font, Progress};
 use crate::timeline::Timeline;
 
@@ -148,9 +149,13 @@ struct Shared {
 }
 
 pub struct Player {
+    /// Made with the piece's measures and the player's chords, for the loop and the wait.
     pub clock: Clock,
     pub timeline: Arc<Timeline>,
+    /// The hands the computer plays.
     pub hands: Hands,
+    /// The player's chords, the clock's to wait at and the window's to judge.
+    pub chords: Arc<Chords>,
     data: PathBuf,
     font: Font,
     fetcher: Arc<dyn Fetcher>,
@@ -170,10 +175,12 @@ impl Player {
         fetcher: Arc<dyn Fetcher>,
         audio: Arc<dyn Audio>,
     ) -> Self {
+        let chords = Chords::of(&timeline);
         Self {
-            clock: Clock::new(timeline.duration_ms()),
+            clock: Clock::with_marks(timeline.duration_ms(), &chords.marks(&timeline)),
             timeline: Arc::new(timeline),
             hands: Hands::both(),
+            chords: Arc::new(chords),
             data,
             font,
             fetcher,

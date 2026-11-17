@@ -349,6 +349,11 @@ impl MidiIn {
         }
     }
 
+    /// Whether a keyboard is listened to now: the wait has someone to wait for.
+    pub fn listening_to_any(&self) -> bool {
+        !lock(&self.0.hub).connections.is_empty()
+    }
+
     /// The ports listened to now.
     #[cfg(test)]
     fn listening(&self) -> Vec<String> {
@@ -626,6 +631,17 @@ mod tests {
         ports.plug_input(KEYSTATION, "40:0");
         listening(&midi, &[KEYSTATION, VMPK]);
         assert_eq!(ports.input_connections(), 3);
+    }
+
+    #[test]
+    fn it_says_whether_a_keyboard_is_listened_to() {
+        let ports = Arc::new(FakePorts::new(&[], &[]));
+        let midi = start(&ports, None);
+        assert!(!midi.listening_to_any());
+        ports.plug_input(KEYSTATION, "40:0");
+        until("a keyboard", || midi.listening_to_any());
+        ports.unplug_input(KEYSTATION);
+        until("none", || !midi.listening_to_any());
     }
 
     #[test]
