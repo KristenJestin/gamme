@@ -27,7 +27,8 @@ impl WallClock {
         self.tick_at(clock, Instant::now());
     }
 
-    fn tick_at(&mut self, clock: &Clock, now: Instant) {
+    /// [`WallClock::tick`] at `now`: the tests choose their instants.
+    pub(crate) fn tick_at(&mut self, clock: &Clock, now: Instant) {
         let snapshot = clock.snapshot();
         if !snapshot.playing || clock.claimed() {
             self.forget();

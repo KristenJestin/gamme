@@ -836,23 +836,30 @@ mod tests {
 
     #[test]
     fn the_wall_clock_goes_round_the_loop_too() {
-        let clock = four_measures(Default::default());
+        let clock = four_measures([vec![1500.], vec![], vec![]]);
         clock.set_loop(Some((1, 1)));
         clock.seek_ms(1000.);
         clock.play();
+        let before = clock.snapshot().seeks;
         let mut wall = crate::wall_clock::WallClock::default();
-        // Its ticks are the real time's: tick until the clock went round once.
-        let started = Instant::now();
-        let mut laps = clock.snapshot().seeks;
-        while clock.snapshot().seeks == laps {
-            assert!(started.elapsed() < Duration::from_secs(5), "no wrap");
-            wall.tick(&clock);
-            std::thread::sleep(Duration::from_millis(5));
+        let start = Instant::now();
+        let at = |ms: u64| start + Duration::from_millis(ms);
+        // A tick each 100 ms: the first one starts it, the tenth reaches B's end, the eleventh
+        // is 100 ms into the next pass.
+        for tick in 0..=11 {
+            wall.tick_at(&clock, at(100 * tick));
         }
-        laps = clock.snapshot().seeks;
-        let position = clock.snapshot().position_us;
-        assert!((1_000_000..1_200_000).contains(&position), "{position}");
-        assert_ne!(laps, 0);
+        assert_eq!(clock.snapshot().position_us, 1_100_000);
+        assert_ne!(clock.snapshot().seeks, before, "the wrap counts as a seek");
+        assert!(clock.playing());
+
+        // The wait holds the wall clock as it does the audio.
+        clock.set_wait(Wait::Right);
+        for tick in 12..=20 {
+            wall.tick_at(&clock, at(100 * tick));
+        }
+        assert_eq!(clock.snapshot().position_us, 1_500_000);
+        assert!(clock.held());
     }
 
     #[test]
