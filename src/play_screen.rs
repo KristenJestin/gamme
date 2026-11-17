@@ -545,7 +545,17 @@ impl PlayScreen {
         let latency_ms = self.settings.latency_ms;
         let transport =
             cx.new(|cx| Transport::new(player, names, practice, midi_in, latency_ms, cx));
-        let observe = cx.observe(&transport, |_, _, cx| cx.notify());
+        // The score is drawn again with the screen: a view is drawn only when told to, and it
+        // asks for its own frames only once it sees the clock move or a judgement fade.
+        let observe = cx.observe(&transport, |this, _, cx| {
+            if let State::Ready(Ready {
+                score: Some(score), ..
+            }) = &this.state
+            {
+                score.update(cx, |_, cx| cx.notify());
+            }
+            cx.notify();
+        });
         let keep = cx.subscribe(&transport, |this, _, choice: &Choice, cx| {
             this.keep_practice(*choice, cx);
         });
