@@ -195,7 +195,13 @@ The **settings page** (the Settings button of the home screen) chooses:
 - **MIDI**: the output the piece sounds on (the built-in piano until a port is chosen) and the
   input the keys are read from (every port, or one; the change applies at once), as ALSA lists
   them, with **Look again** to list a piano plugged in meanwhile. A port is kept by its name, not
-  by the numbers ALSA changes at each start;
+  by the numbers ALSA changes at each start. Two identical devices (the same name once the numbers
+  are gone) are both listed: the first by ALSA's numbers keeps the name, the next ones are
+  *Name (2)*, *Name (3)*, and each can be chosen, for the output and the input alike. A name kept
+  by an older version still chooses the first. The choice holds across a restart and a replug as
+  long as the devices come in the same order, whatever numbers ALSA gives them; ALSA gives a device
+  nothing of its own to tell it by, so when the first of two is unplugged the one left is listed
+  under the first's name, and *Name (2)* shows as not connected until both are there;
 - **Sound**: which piano the built-in one plays (the table above), and the **touch** of your keys
   on it: *Light* (the default: soft keys sound louder), *Normal* (the velocity as you play it),
   *Heavy* (a firmer touch is needed) or *Fixed* (every key at one volume). It shapes the keys you
@@ -214,6 +220,11 @@ The **settings page** (the Settings button of the home screen) chooses:
 The choices apply at once and are kept in `$XDG_CONFIG_HOME/gamme/settings.json` (`~/.config/gamme`,
 the folder `0700`, the file `0600`, written atomically), except the colours, which stay in the state
 folder. `gamme play` uses them too.
+
+Saving never loses what this version does not understand: a key it does not know (one a newer
+Gamme wrote) is written back as it was, a `touch` or `latency_ms` it cannot read stays as the file
+had it until you change that setting, and a file it cannot read at all (broken JSON, a port of the
+wrong type) is kept as `settings.json.unreadable` before a choice replaces it with the defaults.
 
 ## Brand
 
