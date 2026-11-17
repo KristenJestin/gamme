@@ -426,15 +426,18 @@ impl<S: Sink> Renderer<S> {
             let after = |at: u64| frame_of(before + at.saturating_sub(start));
             self.play_until(to, after, &mut rendered, left, right);
         }
+        let held = step.moved_us < whole as u64;
+        if held {
+            // The clock stands on a chord owed: the computer's notes that end there end now,
+            // not when the chord is struck (they come first at that instant, before any start).
+            let stop = frame_of(step.moved_us);
+            self.end_at(step.position_us(), stop, &mut rendered, left, right);
+        }
         self.sink
             .render(&mut left[rendered..], &mut right[rendered..]);
 
         // Held by a chord, the clock stands: nothing of this buffer is owed to the next one.
-        self.carry = if step.moved_us < whole as u64 {
-            0.
-        } else {
-            total - whole
-        };
+        self.carry = if held { 0. } else { total - whole };
         if self.clock.commit(&snapshot, &step) {
             // The loop's wrap is a seek this renderer made itself and followed already.
             self.seeks = step.seeks;
@@ -455,6 +458,29 @@ impl<S: Sink> Renderer<S> {
             && event.at_us < until
         {
             let frame = frame_of(event.at_us);
+            if frame > *rendered {
+                self.sink
+                    .render(&mut left[*rendered..frame], &mut right[*rendered..frame]);
+                *rendered = frame;
+            }
+            self.play(event);
+            self.next += 1;
+        }
+    }
+
+    /// Plays the ends of notes at exactly `at` (µs of the piece), at frame `frame`.
+    fn end_at(
+        &mut self,
+        at: u64,
+        frame: usize,
+        rendered: &mut usize,
+        left: &mut [f32],
+        right: &mut [f32],
+    ) {
+        while let Some(&event) = self.events.get(self.next)
+            && event.at_us == at
+            && event.velocity == 0
+        {
             if frame > *rendered {
                 self.sink
                     .render(&mut left[*rendered..frame], &mut right[*rendered..frame]);

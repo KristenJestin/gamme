@@ -554,6 +554,29 @@ mod tests {
     }
 
     #[test]
+    fn a_note_of_the_computer_that_ends_on_the_chord_owed_does_not_ring_through_the_wait() {
+        let mut rig = rig(
+            vec![
+                note(48, 500., 1000., Hand::Left),
+                note(64, 1000., 1500., Hand::Right),
+            ],
+            vec![0.],
+            2000.,
+        );
+        rig.right_hand_waits();
+        rig.clock.play();
+        rig.run(15, 100);
+        assert!(rig.clock.held());
+        // Its end is the chord's instant: played as the clock stands there, not after the wait.
+        assert_eq!(rig.calls(), [Call::On(48, 500), Call::Off(48, 1000)]);
+        // Ended once: the chord struck does not end it again.
+        let mut waiter = Waiter::new(rig.chords.clone());
+        assert!(waiter.key(64, 90, &rig.clock));
+        rig.run(3, 100);
+        assert_eq!(rig.calls().len(), 2);
+    }
+
+    #[test]
     fn a_pause_while_waiting_lets_the_computers_notes_go() {
         let mut rig = rig(
             vec![
