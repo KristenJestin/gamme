@@ -1,16 +1,19 @@
 //! The latency of the player's keys (design §6), measured in the settings: Gamme plays a click
 //! every [`CLICK_EVERY_MS`], on the output the piece plays on, the player strikes a key with each,
-//! and the mean of how far his keys land from the clicks is kept (`config.rs`, `latency_ms`). The
-//! judge takes it away from each key (`judge.rs`).
+//! and the mean of how far his keys land from the clicks, early or late, is kept (`config.rs`,
+//! `latency_ms`). The judge takes it away from each key (`judge.rs`).
 //!
-//! It holds all that comes between a note of the clock and the key that answers it: the sound on
-//! its way to the speakers, the ear and the hand, the key on its way back over MIDI. The keys are
+//! It is the player's own offset: all that comes between a note of the clock and the key that
+//! answers it, the sound on its way to the speakers, the ear and the hand (a player tapping along
+//! often leads the beat by a few tens of ms, which makes it negative), the key on its way back
+//! over MIDI. The keys are
 //! placed on the clicks' clock as the play screen places them on a piece's
 //! (`Clock::position_at`), so what is measured is what the judge meets.
 //!
 //! The first [`COUNT_IN`] clicks give the beat and are not measured. Each click counts once, with
 //! the key nearest it within half a beat; keys further than [`OUTLIER_MS`] from the median are
-//! slips, left out. Fewer than [`ENOUGH`] keys measure nothing.
+//! slips, left out. Fewer than [`ENOUGH`] keys measure nothing. Since a key counts within half a
+//! beat of its click, no measure goes beyond ±300 ms; what is kept is held within ±[`LIMIT_MS`].
 
 use crate::timeline::{Hand, Note, Timeline};
 
@@ -24,8 +27,9 @@ pub const CLICKS: usize = 16;
 pub const ENOUGH: usize = 6;
 /// The furthest a key may land from the median of the others and still count, in ms.
 pub const OUTLIER_MS: f64 = 100.;
-/// The largest latency kept, either way, in ms: beyond it something else is wrong.
-pub const LIMIT_MS: i32 = 500;
+/// The largest latency kept, either way, in ms: a key counts within half a beat of its click
+/// (300 ms), and more than this is a player not playing along rather than a latency.
+pub const LIMIT_MS: i32 = 250;
 
 /// The click's key: high on the piano, short, clear of the middle of a speaker's sound.
 const CLICK_KEY: u8 = 96;
@@ -154,6 +158,12 @@ mod tests {
     }
 
     #[test]
+    fn a_measure_beyond_the_limit_is_held_to_it() {
+        assert_eq!(measure(&counted(), &struck(285.)), Some(LIMIT_MS));
+        assert_eq!(measure(&counted(), &struck(-285.)), Some(-LIMIT_MS));
+    }
+
+    #[test]
     fn too_few_keys_measure_nothing() {
         let keys = struck(40.);
         assert_eq!(measure(&counted(), &keys[..ENOUGH - 1]), None);
@@ -178,12 +188,15 @@ mod tests {
             ms,
             speed: 1.,
             wait: false,
+            playing: true,
         };
         let grade = |latency: f64| {
             let mut judge = Judge::new(vec![note], vec![0.], 5000., Windows::DEFAULT, latency);
             judge.at(moment(0.));
             // A key on time, which arrives as late as the calibration measured.
-            judge.strike(60, moment(1000. + f64::from(measured) + 10.))
+            judge
+                .strike(60, moment(1000. + f64::from(measured) + 10.))
+                .unwrap()
         };
         let uncalibrated = grade(0.);
         let calibrated = grade(f64::from(measured));

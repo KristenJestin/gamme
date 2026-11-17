@@ -360,12 +360,24 @@ impl SettingsPage {
             .lock()
             .expect("the strikes' lock")
             .clone();
+        // What was measured is that output's: the one chosen, or the built-in piano that took
+        // its place (and why).
+        let output = player
+            .output_label()
+            .unwrap_or_else(|| "built-in piano".to_owned());
+        let notice = player
+            .notice()
+            .map(|notice| format!(" {notice}"))
+            .unwrap_or_default();
         // Its output is closed with it.
         self.calibration = None;
         let counted = &latency::clicks()[latency::COUNT_IN..];
         match latency::measure(counted, &struck) {
             Some(ms) => {
-                self.calibrated = Some(format!("Measured {}, and kept.", latency_text(ms)));
+                self.calibrated = Some(format!(
+                    "Measured {} on the {output}, and kept.{notice}",
+                    latency_text(ms)
+                ));
                 if self.settings.latency_ms != ms {
                     self.settings.latency_ms = ms;
                     self.keep(cx);
@@ -374,7 +386,7 @@ impl SettingsPage {
             None => {
                 self.calibrated = Some(format!(
                     "Too few keys struck with the clicks (at least {} are needed): the latency \
-                     is as it was.",
+                     is as it was.{notice}",
                     latency::ENOUGH
                 ));
             }
@@ -385,9 +397,15 @@ impl SettingsPage {
     /// What the latency's row says under it.
     fn latency_hint(&self) -> String {
         let Some(calibration) = &self.calibration else {
+            if !self.midi_in.listening_to_any() {
+                return "Plug in a MIDI keyboard, then press Look again: the calibration listens \
+                        to it."
+                    .to_owned();
+            }
             return self.calibrated.clone().unwrap_or_else(|| {
-                "Strike any key with each click: the judge takes away how late your keys land. \
-                 Measure it again when you change your keyboard, your output or your speakers."
+                "Strike any key with each click. Your own offset, early or late (the sound, \
+                 your hand, the keyboard), is taken away when your keys are judged. Measure it \
+                 again when you change your keyboard, your output or your speakers."
                     .to_owned()
             });
         };
@@ -557,7 +575,7 @@ impl Render for SettingsPage {
                 "Calibrate"
             },
         )
-        .disabled(!self.read)
+        .disabled(!self.read || (self.calibration.is_none() && !self.midi_in.listening_to_any()))
         .on_click(cx.listener(|this, _, _, cx| this.calibrate(cx)));
         let latency_hint = self.latency_hint();
 
@@ -636,7 +654,10 @@ impl Render for SettingsPage {
                     )
                     .child(
                         Section::new("settings-latency", "Latency")
-                            .sentence("How late your keys land, taken away when they are judged.")
+                            .sentence(
+                                "Your own offset from the beat, taken away when your keys are \
+                                 judged.",
+                            )
                             .action(calibrate)
                             .child(
                                 div()

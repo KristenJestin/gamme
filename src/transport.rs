@@ -109,7 +109,12 @@ impl Transport {
         })
         .detach();
         let latency_ms = f64::from(latency_ms);
-        let judge = Live::new(&player.timeline, practice.choice().playing, latency_ms);
+        let judge = Live::new(
+            &player.timeline,
+            practice.choice().playing,
+            latency_ms,
+            &player.clock,
+        );
         Self {
             player,
             names,
@@ -138,9 +143,9 @@ impl Transport {
             .judge
             .as_mut()
             .and_then(|judge| judge.key(played, &self.player.clock));
-        let released = self
-            .practice
-            .key(played.key, played.velocity, &self.player.clock);
+        let released =
+            self.practice
+                .key(played.key, played.velocity, played.at, &self.player.clock);
         if judged.is_some() || released {
             cx.notify();
         }
@@ -148,8 +153,13 @@ impl Transport {
 
     pub fn set_playing(&mut self, playing: Playing, cx: &mut Context<Self>) {
         self.practice.set_playing(playing, &self.player);
-        // Other notes owed: another run.
-        self.judge = Live::new(&self.player.timeline, playing, self.latency_ms);
+        // Other notes owed: another run, from where the piece stands.
+        self.judge = Live::new(
+            &self.player.timeline,
+            playing,
+            self.latency_ms,
+            &self.player.clock,
+        );
         cx.emit(self.practice.choice());
         cx.notify();
     }
