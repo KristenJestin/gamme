@@ -24,6 +24,7 @@ mod settings;
 mod soundfont;
 mod theme;
 mod timeline;
+mod touch;
 mod transport;
 mod update;
 mod wall_clock;

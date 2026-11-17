@@ -155,7 +155,11 @@ The **settings page** (the Settings button of the home screen) chooses:
   input the keys are read from (every port, or one; the change applies at once), as ALSA lists
   them, with **Look again** to list a piano plugged in meanwhile. A port is kept by its name, not
   by the numbers ALSA changes at each start;
-- **Sound**: which piano the built-in one plays (the table above);
+- **Sound**: which piano the built-in one plays (the table above), and the **touch** of your keys
+  on it: *Light* (the default: soft keys sound louder), *Normal* (the velocity as you play it),
+  *Heavy* (a firmer touch is needed) or *Fixed* (every key at one volume). It shapes the keys you
+  strike on the built-in piano, not the piece and not a MIDI output, whose own touch setting
+  applies; a value this version does not know reads as *Light*;
 - **Colours**: Gamme's Nocturne or Omarchy's theme (see Brand).
 
 The choices apply at once and are kept in `$XDG_CONFIG_HOME/gamme/settings.json` (`~/.config/gamme`,

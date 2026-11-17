@@ -1,5 +1,5 @@
 //! The settings page: MIDI (the output the piece sounds on, the input the keys come from), sound
-//! (which piano the built-in one plays) and colours (Omarchy's or Gamme's), from the kit's
+//! (which piano the built-in one plays, and the touch of your keys on it) and colours (Omarchy's or Gamme's), from the kit's
 //! components. Opened from the home screen's header (`screens.rs`), which it replaces until "Back"
 //! (or Escape).
 //!
@@ -20,6 +20,7 @@ use gpui_kit::*;
 use crate::config::{self, Settings};
 use crate::midi_in::MidiIn;
 use crate::midi_out::{self, PortInfo, Ports};
+use crate::touch::Touch;
 use crate::{appearance, paths, soundfont};
 
 /// Saves are numbered as they are asked for, so that one that comes late cannot be written
@@ -214,6 +215,13 @@ impl SettingsPage {
         }
     }
 
+    fn choose_touch(&mut self, touch: Touch, cx: &mut Context<Self>) {
+        if self.read && self.settings.touch != touch {
+            self.settings.touch = touch;
+            self.keep(cx);
+        }
+    }
+
     /// Keeps the settings, off the main thread; a failure is said.
     fn keep(&mut self, cx: &mut Context<Self>) {
         cx.notify();
@@ -338,6 +346,24 @@ impl Render for SettingsPage {
             "The built-in piano's sound. A piano is downloaded once, then kept."
         };
 
+        let touches = Touch::ALL
+            .iter()
+            .map(|touch| SelectOption::new(touch.id(), touch.name()).line(touch.line()));
+        let chosen = Touch::ALL
+            .iter()
+            .position(|touch| *touch == self.settings.touch)
+            .unwrap_or(0);
+        let this = cx.entity().downgrade();
+        let touch =
+            Select::new("settings-touch", touches, chosen).on_choose(move |index, _, cx| {
+                let touch = Touch::ALL[index];
+                this.update(cx, |this, cx| this.choose_touch(touch, cx))
+                    .ok();
+            });
+        let touch_hint = "How hard your keys sound on the built-in piano: Light lifts soft keys, \
+             Heavy asks for a firmer touch, Fixed plays every key at one volume. It does not \
+             change the piece, nor a MIDI output, whose own touch setting applies.";
+
         let back = {
             let this = cx.entity().downgrade();
             Button::quiet("settings-back", "Pieces")
@@ -406,7 +432,9 @@ impl Render for SettingsPage {
                                     .flex_col()
                                     .gap(space::LG)
                                     .child(Field::new("settings-piano-field", "Piano", piano))
-                                    .child(hint(piano_hint.to_owned())),
+                                    .child(hint(piano_hint.to_owned()))
+                                    .child(Field::new("settings-touch-field", "Touch", touch))
+                                    .child(hint(touch_hint.to_owned())),
                             ),
                     )
                     .child(

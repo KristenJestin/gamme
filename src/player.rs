@@ -31,6 +31,7 @@ use crate::piano::{self, Hands};
 use crate::practice::Chords;
 use crate::soundfont::{self, Fetcher, Font, Progress};
 use crate::timeline::Timeline;
+use crate::touch::Touch;
 
 /// How long a player that goes waits for its output to be closed: a port that does not answer
 /// must not hold the window.
@@ -88,6 +89,17 @@ pub trait Audio: Send + Sync {
 pub struct Builtin {
     /// The player's keys, read by the output each one opens.
     keys: piano::LiveKeys,
+    /// How the player's keys are struck (the settings'): the piece's notes are not touched by it.
+    touch: Touch,
+}
+
+impl Builtin {
+    pub fn new(touch: Touch) -> Self {
+        Self {
+            keys: piano::LiveKeys::default(),
+            touch,
+        }
+    }
 }
 
 impl Audio for Builtin {
@@ -107,7 +119,8 @@ impl Audio for Builtin {
     }
 
     fn live(&self, key: u8, velocity: u8, _from: &str) {
-        self.keys.push(key, velocity);
+        // On MIDI's thread, before the ring: the audio callback only plays what it finds.
+        self.keys.push(key, self.touch.velocity(velocity));
     }
 
     fn live_pedal(&self, value: u8, _from: &str) {
@@ -498,6 +511,24 @@ mod tests {
     use super::*;
     use crate::soundfont::{Archive, Error};
     use crate::timeline::{Hand, Note};
+
+    #[test]
+    fn the_built_in_piano_shapes_the_players_keys_by_the_touch_before_the_ring() {
+        let strike = |touch: Touch| {
+            let piano = Builtin::new(touch);
+            piano.live(60, 30, "20:0");
+            piano.live(60, 0, "20:0");
+            piano.live_pedal(127, "20:0");
+            piano.keys.take_keys()
+        };
+        assert_eq!(strike(Touch::Normal), [(60, 30), (60, 0)]);
+        // A soft key lifted, a key let go still a release.
+        assert_eq!(strike(Touch::Light), [(60, 62), (60, 0)]);
+        assert_eq!(strike(Touch::Heavy), [(60, 15), (60, 0)]);
+        assert_eq!(strike(Touch::Fixed), [(60, 100), (60, 0)]);
+        // The settings' default.
+        assert_eq!(strike(Builtin::default().touch), strike(Touch::Light));
+    }
 
     /// A fetcher that writes a "SoundFont" of its own and waits to be let go.
     struct Gate {
